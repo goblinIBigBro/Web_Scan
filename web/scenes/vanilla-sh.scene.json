@@ -1,0 +1,19 @@
+{
+  "version": "0.1.0",
+  "sceneId": "vanilla-sh-template",
+  "title": "Vanilla SH Template",
+  "renderer": "sh",
+  "representation": "sh",
+  "source": {
+    "url": "../MEGS-2-main/WebGL_viewer/bicycle_30000.ply",
+    "format": "ply"
+  },
+  "algorithm": {
+    "family": "vanilla-3dgs",
+    "name": "Vanilla 3DGS"
+  },
+  "metadata": {
+    "appearanceModel": "sh",
+    "notes": "Replace the URL with the actual SH PLY file."
+  }
+}

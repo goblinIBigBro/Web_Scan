@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Web-GSC</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+
+<body>
+  <header class="global-header">Web-GSC</header>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <p class="eyebrow">Gaussian Encoding</p>
+        <h1>Realtime Control</h1>
+        <p class="summary">
+          Web-GSC is a unified Gaussian-encoding visualization and real-time rendering platform. It supports scene and
+          manifest loading (PLY and manifest formats) with SH/SG viewers, camera capture and streamed uploads,
+          configurable capture-to-pipeline workflows, algorithm job scheduling with runtime checks and live metrics
+          (FPS, loss, PSNR), and shareable scene exports for easy result inspection.
+        </p>
+      </div>
+
+      <section class="panel panel-primary">
+        <h2>Guided Workflow</h2>
+        <ol class="workflow-list">
+          <li class="workflow-item">
+            <span class="workflow-label">Step 1: Runtime Check</span>
+            <span id="step-pill-api" class="step-pill locked">Locked</span>
+          </li>
+          <li class="workflow-item">
+            <span class="workflow-label">Step 2: Adapter Capability</span>
+            <span id="step-pill-adapter" class="step-pill locked">Locked</span>
+          </li>
+          <li class="workflow-item">
+            <span class="workflow-label">Step 3: Capture First Frame</span>
+            <span id="step-pill-capture" class="step-pill locked">Locked</span>
+          </li>
+          <li class="workflow-item">
+            <span class="workflow-label">Step 4: SSH Remote Check</span>
+            <span id="step-pill-session" class="step-pill locked">Locked</span>
+          </li>
+          <li class="workflow-item">
+            <span class="workflow-label">Step 5: Start Remote Job</span>
+            <span id="step-pill-job" class="step-pill locked">Locked</span>
+          </li>
+        </ol>
+        <p id="workflow-hint" class="workflow-hint">Please complete Step 1: Check Runtime.</p>
+
+        <details class="flow-block" id="flow-runtime">
+          <summary>
+            <h3>Runtime Config</h3>
+            <p class="flow-copy">Step 1-2. Check web runtime, then validate adapter capability.</p>
+          </summary>
+          <div class="flow-body">
+            <label>
+              API Base URL
+              <input id="api-base-url" type="text" placeholder="http://127.0.0.1:8080" />
+            </label>
+            <label>
+              Algorithm Family
+              <select id="algorithm-family"></select>
+            </label>
+            <label>
+              Repo Path
+              <input id="server-repo-path" type="text" placeholder="/abs/path/to/repo" />
+            </label>
+            <label>
+              Default CWD
+              <input id="server-default-cwd" type="text" placeholder="/abs/path/to/repo" />
+            </label>
+            <div class="button-row">
+              <button id="check-api" type="button">Check Runtime</button>
+              <button id="validate-adapter" type="button">Validate Adapter</button>
+            </div>
+            <div class="button-row">
+              <button id="save-adapter" type="button">Save Adapter</button>
+              <span></span>
+            </div>
+            <details class="runtime-advanced">
+              <summary>Advanced Runtime</summary>
+              <label>
+                Representation
+                <select id="representation"></select>
+              </label>
+              <label>
+                Operation
+                <select id="algorithm-operation"></select>
+              </label>
+              <label>
+                Input Path
+                <input id="server-input-path" type="text" placeholder="/abs/path/to/input" />
+              </label>
+              <label>
+                Output Dir
+                <input id="server-output-dir" type="text" placeholder="/abs/path/to/output" />
+              </label>
+              <label>
+                Scene ID
+                <input id="server-scene-id" type="text" placeholder="garden_megs2" />
+              </label>
+              <label>
+                Extra Args (JSON)
+                <textarea id="server-extra-args" rows="6" placeholder='{"checkpoint_path":"","workspace":""}'></textarea>
+              </label>
+            </details>
+            <div class="step-result-grid">
+              <div id="step-result-step1" class="step-result idle"></div>
+              <div id="step-result-step2" class="step-result idle"></div>
+            </div>
+          </div>
+        </details>
+
+        <details class="flow-block" id="flow-capture">
+          <summary>
+            <h3>Capture</h3>
+            <p class="flow-copy">Step 3. Upload/capture at least one frame for remote training.</p>
+          </summary>
+          <div class="flow-body">
+            <label>
+              Stream Session ID
+              <input id="stream-session-id" type="text" placeholder="session-demo" />
+            </label>
+            <label>
+              Capture Batch ID
+              <div class="inline-input-row">
+                <input id="capture-batch-id" type="text" placeholder="capture-20240418-01" />
+                <button id="new-capture-batch" type="button">New Batch</button>
+              </div>
+            </label>
+            <label>
+              Capture Interval (ms)
+              <input id="stream-interval-ms" type="number" min="100" step="100" value="1000" />
+            </label>
+            <label>
+              Upload Image
+              <input id="stream-image-file" type="file" accept="image/*" />
+            </label>
+            <div class="button-row">
+              <button id="start-camera" type="button">Start Camera</button>
+              <button id="stop-camera" type="button">Stop Camera</button>
+            </div>
+            <div class="button-row">
+              <button id="send-frame" type="button">Send Frame</button>
+              <button id="toggle-stream" type="button">Start Stream</button>
+            </div>
+            <div id="step-result-step3" class="step-result idle"></div>
+          </div>
+        </details>
+
+        <details class="flow-block" id="flow-remote-config">
+          <summary>
+            <h3>Remote Training Config</h3>
+            <p class="flow-copy">Step 4. Fill remote credentials/paths and verify SSH connectivity.</p>
+          </summary>
+          <div class="flow-body">
+            <label>
+              Remote Host
+              <input id="remote-host" type="text" placeholder="192.168.1.20" />
+            </label>
+            <label>
+              Remote Port
+              <input id="remote-port" type="number" min="1" max="65535" step="1" value="22" />
+            </label>
+            <label>
+              Remote Username
+              <input id="remote-username" type="text" placeholder="ubuntu" />
+            </label>
+            <label>
+              Remote Password
+              <input id="remote-password" type="password" placeholder="password" />
+            </label>
+            <label>
+              Remote Repo Path
+              <input id="remote-repo-path" type="text" placeholder="/home/ubuntu/HAC-plus-main" />
+            </label>
+            <label>
+              Remote Workspace Root
+              <input id="remote-workspace-root" type="text" placeholder="/tmp/web_scan/workspaces" />
+            </label>
+            <label>
+              Remote Output Root
+              <input id="remote-output-root" type="text" placeholder="/tmp/web_scan/outputs" />
+            </label>
+            <label>
+              Remote Python
+              <input id="remote-python" type="text" placeholder="python3" />
+            </label>
+            <label>
+              Remote Activate Command
+              <input id="remote-activate-cmd" type="text" placeholder="source ~/.bashrc && conda activate HAC_env" />
+            </label>
+            <label>
+              Existing Remote Dataset
+              <select id="remote-dataset-select">
+                <option value="">Upload a new capture and run COLMAP</option>
+              </select>
+            </label>
+            <label>
+              Custom Remote Dataset Path (optional)
+              <input id="remote-dataset-path" type="text" placeholder="/tmp/web_scan/workspaces/datasets/hac-plus-main/demo" />
+            </label>
+            <label class="inline-check">
+              <input id="use-existing-remote-dataset" type="checkbox" />
+              Use existing remote dataset (skip upload and COLMAP)
+            </label>
+            <p id="remote-dataset-summary" class="field-note">Run Check SSH to load remote dataset history.</p>
+            <div class="button-row">
+              <button id="check-remote-ssh" type="button">Check SSH</button>
+              <span></span>
+            </div>
+            <div id="step-result-step4" class="step-result idle"></div>
+          </div>
+        </details>
+
+        <details class="flow-block" id="flow-remote-run">
+          <summary>
+            <h3>Remote Run</h3>
+            <p class="flow-copy">Step 5. Start remote job and inspect queued/running status.</p>
+          </summary>
+          <div class="flow-body">
+            <label>
+              Dataset Name (new upload mode)
+              <input id="dataset-name" type="text" placeholder="office-apr18" />
+            </label>
+            <label class="inline-check">
+              <input id="auto-colmap" type="checkbox" checked />
+              Auto-run COLMAP on remote before training
+            </label>
+            <div class="button-row">
+              <button id="one-click-remote-train" type="button">One-click Upload and Remote Train</button>
+              <button id="refresh-jobs" type="button">Refresh Jobs</button>
+            </div>
+            <div class="button-row">
+              <button id="export-package" type="button">Export Package</button>
+              <span></span>
+            </div>
+            <div id="step-result-step5" class="step-result idle"></div>
+          </div>
+        </details>
+
+        <details class="flow-block flow-local-debug" id="flow-local-debug">
+          <summary>
+            <h3>Local Debug (Optional)</h3>
+            <p class="flow-copy">Local pipeline tools are kept for debugging and fallback only.</p>
+          </summary>
+          <div class="flow-body">
+            <section class="flow-subsection">
+              <h4>Session Tools</h4>
+              <div class="button-row">
+                <button id="materialize-session" type="button">Materialize Session</button>
+                <button id="use-session-workspace" type="button">Use Session Workspace</button>
+              </div>
+              <div class="button-row">
+                <button id="prepare-colmap-workspace" type="button">Prepare COLMAP</button>
+                <button id="use-colmap-workspace" type="button">Use COLMAP Workspace</button>
+              </div>
+            </section>
+            <section class="flow-subsection">
+              <h4>Local Job Tools</h4>
+              <div class="button-row">
+                <button id="submit-algorithm-job" type="button">Submit Job</button>
+                <button id="run-capture-pipeline" type="button">Run Pipeline</button>
+              </div>
+            </section>
+          </div>
+        </details>
+      </section>
+    </aside>
+
+    <main class="viewer-shell">
+      <header class="viewer-header">
+        <div>
+          <p class="eyebrow">Unified Viewer</p>
+          <h2 id="viewer-title">Waiting for scene</h2>
+        </div>
+        <p id="viewer-subtitle" class="viewer-subtitle">
+          Follow the guided steps on the left to configure, capture, materialize sessions and start jobs.
+        </p>
+      </header>
+
+      <div class="viewer-stage">
+        <div id="viewer-overlay" class="viewer-overlay">
+          <p>No scene loaded</p>
+          <p class="overlay-copy">Supports PLY and manifest-based scene loading.</p>
+        </div>
+        <iframe id="viewer-frame" title="Gaussian Viewer" class="viewer-frame" loading="eager"></iframe>
+      </div>
+
+      <section class="panel inline-panel primary-workspace">
+        <h2>Realtime Workspace</h2>
+        <div class="stream-grid workspace-grid">
+          <div class="stream-card">
+            <p class="eyebrow">Local Camera</p>
+            <video id="local-stream" class="stream-media" autoplay playsinline muted></video>
+          </div>
+          <div class="stream-card">
+            <p class="eyebrow">Processed Result</p>
+            <div class="result-stage">
+              <div id="processed-placeholder" class="result-placeholder">
+                <p>Waiting for server response</p>
+                <p class="overlay-copy">Prefer rotating structural viewer; fall back to result image if unavailable.</p>
+              </div>
+              <iframe id="processed-viewer-frame" title="Processed Viewer"
+                class="viewer-frame result-viewer-frame hidden" loading="eager"></iframe>
+              <img id="processed-frame" class="stream-media hidden" alt="processed frame" />
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel inline-panel secondary-drawer">
+        <details class="drawer-root" id="system-board">
+          <summary>
+            <div class="drawer-title-row">
+              <h2>System Board</h2>
+              <p class="panel-copy">Grouped status, execution observability and outputs to reduce clutter.</p>
+            </div>
+          </summary>
+
+          <div class="drawer-groups">
+            <section class="drawer-group">
+              <h3 class="drawer-group-title">Runtime Status</h3>
+              <div class="drawer-stack">
+                <details class="drawer-item" id="job-monitor-panel">
+                  <summary>
+                    <h3>Status</h3>
+                  </summary>
+                  <dl class="status-grid">
+                    <div>
+                      <dt>Renderer</dt>
+                      <dd id="status-renderer">-</dd>
+                    </div>
+                    <div>
+                      <dt>Algorithm</dt>
+                      <dd id="status-algorithm">-</dd>
+                    </div>
+                    <div>
+                      <dt>Scene</dt>
+                      <dd id="status-scene">-</dd>
+                    </div>
+                    <div>
+                      <dt>Source</dt>
+                      <dd id="status-source">-</dd>
+                    </div>
+                    <div>
+                      <dt>FPS</dt>
+                      <dd id="status-fps">-</dd>
+                    </div>
+                    <div>
+                      <dt>Vertices</dt>
+                      <dd id="status-vertices">-</dd>
+                    </div>
+                    <div>
+                      <dt>Progress</dt>
+                      <dd id="status-progress">-</dd>
+                    </div>
+                    <div>
+                      <dt>Viewer</dt>
+                      <dd id="status-viewer">idle</dd>
+                    </div>
+                    <div>
+                      <dt>Job</dt>
+                      <dd id="status-job">-</dd>
+                    </div>
+                    <div>
+                      <dt>Web URL</dt>
+                      <dd id="status-web-url">-</dd>
+                    </div>
+                    <div>
+                      <dt>Algo FPS</dt>
+                      <dd id="status-algo-fps">-</dd>
+                    </div>
+                    <div>
+                      <dt>Loss</dt>
+                      <dd id="status-loss">-</dd>
+                    </div>
+                    <div>
+                      <dt>PSNR</dt>
+                      <dd id="status-psnr">-</dd>
+                    </div>
+                    <div>
+                      <dt>Iter</dt>
+                      <dd id="status-iter">-</dd>
+                    </div>
+                  </dl>
+                </details>
+
+                <details class="drawer-item" id="runtime-env-panel">
+                  <summary>
+                    <h3>Environment Check</h3>
+                  </summary>
+                  <div id="environment-check" class="method-card"></div>
+                </details>
+              </div>
+            </section>
+
+            <section class="drawer-group">
+              <h3 class="drawer-group-title">Execution Monitor</h3>
+              <div class="drawer-stack">
+                <details class="drawer-item" id="job-monitor-panel">
+                  <summary>
+                    <h3>Job Monitor</h3>
+                  </summary>
+                  <div id="job-list" class="job-list"></div>
+                </details>
+
+                <details class="drawer-item" id="job-logs-panel">
+                  <summary>
+                    <h3>Job Logs and Metrics</h3>
+                  </summary>
+                  <div class="job-logs-toolbar">
+                    <label class="job-log-selector">
+                      Select Job
+                      <select id="log-job-id"></select>
+                    </label>
+                    <button id="refresh-job-log" type="button">Refresh Log</button>
+                  </div>
+                  <div class="job-logs-actions">
+                    <a id="download-job-log" class="button-link" href="#" download>Download .log</a>
+                    <a id="download-job-csv" class="button-link" href="#" download>Download metrics.csv</a>
+                    <button id="copy-job-log" type="button">Copy Raw Log</button>
+                  </div>
+                  <p id="job-log-meta" class="panel-copy job-log-meta">No job selected.</p>
+                  <div class="job-logs-layout">
+                    <section class="job-log-metrics-panel">
+                      <div class="job-log-section-head">
+                        <h4>Metrics Table</h4>
+                        <p id="job-metrics-page" class="panel-copy">Page 1 / 1</p>
+                      </div>
+                      <div class="table-scroll job-metrics-scroll">
+                        <table class="metrics-table">
+                          <thead>
+                            <tr>
+                              <th>Timestamp</th>
+                              <th>Channel</th>
+                              <th>Iter</th>
+                              <th>Loss</th>
+                              <th>PSNR</th>
+                              <th>SSIM</th>
+                              <th>LPIPS</th>
+                              <th>FPS</th>
+                            </tr>
+                          </thead>
+                          <tbody id="job-metrics-rows">
+                            <tr>
+                              <td colspan="8">No metrics yet.</td>
+                            </tr>
+                          </tbody>
+                        </table>
+                      </div>
+                      <div class="button-row job-metrics-pager">
+                        <button id="job-metrics-prev" type="button">Prev</button>
+                        <button id="job-metrics-next" type="button">Next</button>
+                      </div>
+                    </section>
+
+                    <section class="job-log-tail-panel">
+                      <div class="job-log-section-head">
+                        <h4>Raw Log Tail</h4>
+                        <label class="job-log-tail-lines">
+                          Tail Lines
+                          <select id="job-log-tail-lines">
+                            <option value="80">80</option>
+                            <option value="120" selected>120</option>
+                            <option value="200">200</option>
+                            <option value="400">400</option>
+                          </select>
+                        </label>
+                      </div>
+                      <textarea id="job-log-tail" rows="12" readonly></textarea>
+                    </section>
+                  </div>
+                </details>
+
+                <details class="drawer-item">
+                  <summary>
+                    <h3>Recent Scenes</h3>
+                  </summary>
+                  <div id="recent-scenes" class="job-list"></div>
+                </details>
+              </div>
+            </section>
+
+            <section class="drawer-group">
+              <h3 class="drawer-group-title">Output & Reference</h3>
+              <div class="drawer-stack">
+                <details class="drawer-item">
+                  <summary>
+                    <h3>Share URL</h3>
+                  </summary>
+                  <label>
+                    Current Scene URL
+                    <input id="share-url" type="text" readonly />
+                  </label>
+                </details>
+
+                <details class="drawer-item">
+                  <summary>
+                    <h3>Manifest Schema</h3>
+                  </summary>
+                  <div id="schema-preview" class="schema-preview"></div>
+                </details>
+
+                <details class="drawer-item">
+                  <summary>
+                    <h3>Adapter Detail</h3>
+                  </summary>
+                  <div id="adapter-detail" class="method-card"></div>
+                </details>
+              </div>
+            </section>
+          </div>
+        </details>
+      </section>
+
+      <section class="deps-vault" hidden>
+        <label>
+          Preset Scenes
+          <select id="preset-scene"></select>
+        </label>
+        <label>
+          Manifest URL
+          <input id="manifest-url" type="text" placeholder="./scenes/megs2-sg.scene.json" />
+        </label>
+        <button id="load-manifest" type="button">Load Manifest</button>
+        <label>
+          Model URL
+          <input id="source-url" type="text" placeholder="../MEGS-2-main/WebGL_viewer/point_cloud.ply" />
+        </label>
+        <button id="load-direct" type="button">Load Direct</button>
+        <label>
+          Viewer Backend
+          <select id="viewer-backend">
+            <option value="webgl2">WebGL2</option>
+            <option value="webgpu">WebGPU</option>
+          </select>
+        </label>
+        <label>
+          Dataset Parser
+          <select id="preprocess-parser">
+            <option value="colmap">COLMAP</option>
+            <option value="blender">Blender</option>
+            <option value="nerfstudio">Nerfstudio</option>
+            <option value="custom">Custom</option>
+          </select>
+        </label>
+        <input id="preprocess-downsample" type="number" min="1" step="1" value="1" />
+        <input id="preprocess-mask-path" type="text" placeholder="/abs/path/to/masks" />
+        <label class="inline-check">
+          <input id="preprocess-reorient" type="checkbox" checked />
+          Auto reorient coordinates
+        </label>
+        <label class="inline-check">
+          <input id="preprocess-image-uint8" type="checkbox" />
+          Cache images as uint8
+        </label>
+        <label class="inline-check">
+          <input id="preprocess-async-caching" type="checkbox" />
+          Enable async caching
+        </label>
+        <input id="edit-translation" type="text" placeholder="0,0,0" />
+        <input id="edit-rotation" type="text" placeholder="0,0,0" />
+        <input id="edit-scale" type="text" placeholder="1,1,1" />
+        <select id="edit-background">
+          <option value="black">black</option>
+          <option value="white">white</option>
+          <option value="transparent">transparent</option>
+        </select>
+        <div id="method-registry" class="method-registry"></div>
+      </section>
+    </main>
+  </div>
+
+  <script type="module" src="./src/core/app.js"></script>
+</body>
+
+</html>

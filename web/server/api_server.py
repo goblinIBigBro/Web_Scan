@@ -1,0 +1,2285 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import base64
+import csv
+import importlib.util
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from collections import deque
+from datetime import datetime, timezone
+from http import HTTPStatus
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from shutil import which
+from typing import Any, Dict
+from urllib.parse import parse_qs, urlparse
+
+ROOT_DIR = Path(__file__).resolve().parents[2]
+WEB_DIR = ROOT_DIR / "web"
+STREAM_DIR = WEB_DIR / "generated" / "streams"
+DATASET_DIR = WEB_DIR / "generated" / "datasets"
+WORKSPACE_DIR = WEB_DIR / "generated" / "workspaces"
+JOB_LOG_DIR = WEB_DIR / "generated" / "job_logs"
+if str(ROOT_DIR) not in sys.path:
+  sys.path.insert(0, str(ROOT_DIR))
+
+from web.server.adapter_registry import (
+  get_adapter,
+  list_adapters,
+  supported_operations,
+  update_adapter_override,
+  validate_adapter,
+)
+from web.server.remote_executor import (
+  RemoteExecutionError,
+  remote_preflight_check,
+  run_remote_algorithm,
+  sanitize_remote_config,
+  sanitize_formatted_command,
+  validate_remote_config,
+)
+from web.tools.export_scene_package import build_scene_package
+
+JOBS: Dict[str, Dict[str, Any]] = {}
+JOB_LOG_LOCKS: Dict[str, threading.Lock] = {}
+MAX_JOB_HISTORY = 300
+MAX_PROCESS_FRAME_COMPLETED_HISTORY = 80
+MAX_METRICS_HISTORY = 5000
+
+MANUAL_ZH_URL = "/web/WEB_TRAINING_MANUAL_ZH.md"
+
+
+def extract_job_metrics(text: str) -> Dict[str, Any]:
+  import re
+
+  metrics: Dict[str, Any] = {}
+  patterns = {
+    "fps": [
+      r"(?i)\b([0-9]+(?:\.[0-9]+)?)[ \t]*fps\b",
+      r"(?i)\bfps[:=]\s*([0-9]+(?:\.[0-9]+)?)\b",
+      r"(?i)\bfps\s+([0-9]+(?:\.[0-9]+)?)\b",
+    ],
+    "iter": [
+      r"(?i)\biter(?:ation)?[:=\s]+([0-9]+)\b",
+      r"(?i)\b([0-9]+)\s*/\s*[0-9]+\b",
+    ],
+    "loss": [
+      r"(?i)\bloss[:=\s]+([0-9]+(?:\.[0-9]+)?)\b",
+    ],
+    "psnr": [
+      r"(?i)\bpsnr[:=\s]+([0-9]+(?:\.[0-9]+)?)\b",
+    ],
+    "ssim": [
+      r"(?i)\bssim[:=\s]+([0-9]+(?:\.[0-9]+)?)\b",
+    ],
+    "lpips": [
+      r"(?i)\blpips[:=\s]+([0-9]+(?:\.[0-9]+)?)\b",
+    ],
+  }
+
+  for key, regexes in patterns.items():
+    for regex in regexes:
+      matches = re.findall(regex, text)
+      if matches:
+        metrics[key] = matches[-1]
+        break
+  return metrics
+
+
+METRICS_CSV_COLUMNS = ["timestamp", "channel", "iter", "loss", "psnr", "ssim", "lpips", "fps"]
+
+
+def utc_timestamp_text(now: float | None = None) -> str:
+  moment = datetime.fromtimestamp(now or time.time(), tz=timezone.utc)
+  return moment.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def ensure_job_logging(job: Dict[str, Any]) -> None:
+  job_id = str(job.get("id", "")).strip()
+  if not job_id:
+    return
+
+  JOB_LOG_DIR.mkdir(parents=True, exist_ok=True)
+  job_dir = (JOB_LOG_DIR / job_id).resolve()
+  job_dir.mkdir(parents=True, exist_ok=True)
+
+  log_file = job_dir / "runtime.log"
+  metrics_csv = job_dir / "metrics.csv"
+
+  if not log_file.exists():
+    log_file.write_text("", encoding="utf-8")
+
+  if not metrics_csv.exists():
+    with metrics_csv.open("w", newline="", encoding="utf-8") as handle:
+      writer = csv.DictWriter(handle, fieldnames=METRICS_CSV_COLUMNS)
+      writer.writeheader()
+
+  history = job.get("metrics_history")
+  if not isinstance(history, list):
+    history = []
+  job["metrics_history"] = history[-MAX_METRICS_HISTORY:]
+
+  job["log_dir"] = str(job_dir)
+  job["log_file"] = str(log_file)
+  job["metrics_csv_file"] = str(metrics_csv)
+  job["logs_api_url"] = f"/api/jobs/{job_id}/logs"
+  job["logs_download_url"] = f"/api/jobs/{job_id}/logs/download"
+  job["metrics_csv_url"] = f"/api/jobs/{job_id}/metrics.csv"
+
+  if job_id not in JOB_LOG_LOCKS:
+    JOB_LOG_LOCKS[job_id] = threading.Lock()
+
+
+def append_job_log_line(job: Dict[str, Any], channel: str, line: str) -> None:
+  if not line:
+    return
+
+  ensure_job_logging(job)
+  job_id = str(job.get("id", "")).strip()
+  if not job_id:
+    return
+
+  target_key = "stdout" if channel == "stdout" else "stderr"
+  normalized = line if line.endswith("\n") else f"{line}\n"
+  job[target_key] = (job.get(target_key, "") + normalized)[-12000:]
+
+  timestamp = utc_timestamp_text()
+  lock = JOB_LOG_LOCKS.setdefault(job_id, threading.Lock())
+  log_file_value = str(job.get("log_file", "")).strip()
+  if log_file_value:
+    log_path = Path(log_file_value)
+    with lock:
+      with log_path.open("a", encoding="utf-8", errors="replace") as handle:
+        handle.write(f"[{timestamp}] [{channel.upper()}] {normalized}")
+
+  metrics_update = extract_job_metrics(normalized)
+  if not metrics_update:
+    return
+
+  job["metrics"] = {
+    **job.get("metrics", {}),
+    **metrics_update,
+  }
+
+  entry = {
+    "timestamp": timestamp,
+    "channel": channel.upper(),
+    "iter": metrics_update.get("iter", ""),
+    "loss": metrics_update.get("loss", ""),
+    "psnr": metrics_update.get("psnr", ""),
+    "ssim": metrics_update.get("ssim", ""),
+    "lpips": metrics_update.get("lpips", ""),
+    "fps": metrics_update.get("fps", ""),
+  }
+  history = job.setdefault("metrics_history", [])
+  history.append(entry)
+  if len(history) > MAX_METRICS_HISTORY:
+    del history[: len(history) - MAX_METRICS_HISTORY]
+
+  csv_file_value = str(job.get("metrics_csv_file", "")).strip()
+  if csv_file_value:
+    csv_path = Path(csv_file_value)
+    with lock:
+      with csv_path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=METRICS_CSV_COLUMNS)
+        writer.writerow(entry)
+
+
+def read_job_log_tail_lines(job: Dict[str, Any], limit: int) -> list[str]:
+  ensure_job_logging(job)
+  log_file_value = str(job.get("log_file", "")).strip()
+  if not log_file_value:
+    return []
+  log_file = Path(log_file_value)
+  if not log_file.exists():
+    return []
+
+  safe_limit = max(1, min(limit, 3000))
+  with log_file.open("r", encoding="utf-8", errors="replace") as handle:
+    return list(deque(handle, maxlen=safe_limit))
+
+
+def build_metrics_page(job: Dict[str, Any], page: int, page_size: int) -> Dict[str, Any]:
+  history = list(job.get("metrics_history", []))
+  history.reverse()
+
+  safe_page_size = max(1, min(page_size, 200))
+  total = len(history)
+  total_pages = max(1, (total + safe_page_size - 1) // safe_page_size)
+  safe_page = max(1, min(page, total_pages))
+  start = (safe_page - 1) * safe_page_size
+  end = start + safe_page_size
+
+  return {
+    "page": safe_page,
+    "page_size": safe_page_size,
+    "total": total,
+    "total_pages": total_pages,
+    "rows": history[start:end],
+  }
+
+
+def _normalize_slug(value: str, *, fallback: str) -> str:
+  text = str(value or "").strip().lower()
+  if not text:
+    return fallback
+  normalized = "".join(ch if (ch.isalnum() or ch in {"-", "_"}) else "-" for ch in text)
+  while "--" in normalized:
+    normalized = normalized.replace("--", "-")
+  normalized = normalized.strip("-_")
+  return normalized[:48] or fallback
+
+
+def _generate_capture_id() -> str:
+  return f"capture-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
+
+
+def _resolve_capture_input_dir(session_dir: Path, capture_id: str = "") -> tuple[str, Path]:
+  captures_root = session_dir / "captures"
+  desired_capture = str(capture_id or "").strip()
+
+  if desired_capture:
+    desired_input_dir = (captures_root / desired_capture / "input").resolve()
+    if desired_input_dir.exists() and desired_input_dir.is_dir():
+      return desired_capture, desired_input_dir
+    raise FileNotFoundError(f"Capture input directory does not exist: {desired_input_dir}")
+
+  if captures_root.exists() and captures_root.is_dir():
+    candidates = []
+    for child in captures_root.iterdir():
+      if not child.is_dir():
+        continue
+      input_dir = child / "input"
+      if not input_dir.exists() or not input_dir.is_dir():
+        continue
+      try:
+        score = input_dir.stat().st_mtime
+      except OSError:
+        score = 0
+      candidates.append((score, child.name, input_dir))
+    if candidates:
+      candidates.sort(key=lambda item: item[0], reverse=True)
+      _, selected_capture_id, selected_input_dir = candidates[0]
+      return selected_capture_id, selected_input_dir.resolve()
+
+  legacy_input_dir = (session_dir / "input").resolve()
+  if legacy_input_dir.exists() and legacy_input_dir.is_dir():
+    return "legacy", legacy_input_dir
+
+  raise FileNotFoundError(f"No capture input directory found under session: {session_dir}")
+
+
+def save_stream_frame(session_id: str, image_data: str, filename: str, capture_id: str = "") -> Dict[str, str]:
+  session_dir = STREAM_DIR / session_id
+  resolved_capture_id = str(capture_id or "").strip() or _generate_capture_id()
+  input_dir = session_dir / "captures" / resolved_capture_id / "input"
+  output_dir = session_dir / "output"
+  input_dir.mkdir(parents=True, exist_ok=True)
+  output_dir.mkdir(parents=True, exist_ok=True)
+
+  if "," in image_data:
+    _, encoded = image_data.split(",", 1)
+  else:
+    encoded = image_data
+  binary = base64.b64decode(encoded)
+
+  input_path = input_dir / filename
+  input_path.write_bytes(binary)
+
+  # Default fallback preview: mirror the latest input frame until an algorithm writes output.
+  mirrored_output = output_dir / "latest.png"
+  mirrored_output.write_bytes(binary)
+
+  return {
+    "capture_id": resolved_capture_id,
+    "capture_input_dir": str(input_dir.resolve()),
+    "input_path": str(input_path.resolve()),
+    "output_path": str(mirrored_output.resolve()),
+    "input_url": "/" + str(input_path.relative_to(ROOT_DIR)).replace("\\", "/"),
+    "output_url": "/" + str(mirrored_output.relative_to(ROOT_DIR)).replace("\\", "/"),
+  }
+
+
+def materialize_stream_session(
+  session_id: str,
+  title: str | None = None,
+  *,
+  capture_id: str = "",
+  dataset_name: str = "",
+) -> Dict[str, Any]:
+  session_dir = (STREAM_DIR / session_id).resolve()
+  resolved_capture_id, input_dir = _resolve_capture_input_dir(session_dir, capture_id)
+
+  frame_paths = sorted([path for path in input_dir.iterdir() if path.is_file()])
+  if not frame_paths:
+    raise FileNotFoundError(f"No captured frames found in: {input_dir}")
+
+  resolved_dataset_name = str(dataset_name or "").strip() or title or f"capture-{session_id}"
+  dataset_slug = _normalize_slug(resolved_dataset_name, fallback="dataset")
+  dataset_id = f"{dataset_slug}-{int(time.time())}-{uuid.uuid4().hex[:6]}"
+
+  dataset_root = (DATASET_DIR / session_id / "datasets" / dataset_id).resolve()
+  images_dir = dataset_root / "images"
+  input_copy_dir = dataset_root / "input"
+  images_dir.mkdir(parents=True, exist_ok=True)
+  input_copy_dir.mkdir(parents=True, exist_ok=True)
+
+  copied_frames: list[str] = []
+  for index, frame_path in enumerate(frame_paths, start=1):
+    suffix = frame_path.suffix.lower() or ".png"
+    target_name = f"{index:05d}{suffix}"
+    images_target = images_dir / target_name
+    input_target = input_copy_dir / target_name
+    shutil.copyfile(frame_path, images_target)
+    shutil.copyfile(frame_path, input_target)
+    copied_frames.append("/" + str(images_target.relative_to(ROOT_DIR)).replace("\\", "/"))
+
+  dataset_manifest = {
+    "version": "0.1.0",
+    "session_id": session_id,
+    "capture_id": resolved_capture_id,
+    "dataset_id": dataset_id,
+    "dataset_name": resolved_dataset_name,
+    "title": title or f"capture-{session_id}",
+    "frame_count": len(frame_paths),
+    "dataset_root": str(dataset_root),
+    "capture_input_dir": str(input_dir),
+    "images_dir": str(images_dir),
+    "input_dir": str(input_copy_dir),
+    "source_hint": "This is a multi-frame capture workspace. Current local Gaussian repos still require COLMAP/Blender scene conversion before training.",
+    "generated_at": time.time(),
+    "frames": copied_frames,
+  }
+  manifest_path = dataset_root / "capture_session.json"
+  manifest_path.write_text(json.dumps(dataset_manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+
+  return {
+    "session_id": session_id,
+    "capture_id": resolved_capture_id,
+    "dataset_id": dataset_id,
+    "dataset_name": resolved_dataset_name,
+    "frame_count": len(frame_paths),
+    "dataset_root": str(dataset_root),
+    "images_dir": str(images_dir),
+    "input_dir": str(input_copy_dir),
+    "manifest_path": str(manifest_path),
+    "manifest_url": "/" + str(manifest_path.relative_to(ROOT_DIR)).replace("\\", "/"),
+    "source_hint": dataset_manifest["source_hint"],
+  }
+
+
+def prepare_colmap_workspace(
+  session_id: str,
+  family: str,
+  repo_path: str | None = None,
+  *,
+  capture_id: str = "",
+  dataset_name: str = "",
+) -> Dict[str, Any]:
+  dataset_info = materialize_stream_session(
+    session_id,
+    session_id,
+    capture_id=capture_id,
+    dataset_name=dataset_name,
+  )
+  dataset_root = Path(dataset_info["dataset_root"]).resolve()
+  dataset_id = str(dataset_info.get("dataset_id", "dataset")).strip() or "dataset"
+  workspace_root = (WORKSPACE_DIR / session_id / family / dataset_id).resolve()
+  input_dir = workspace_root / "input"
+  images_dir = workspace_root / "images"
+  sparse_dir = workspace_root / "sparse" / "0"
+  distorted_sparse_dir = workspace_root / "distorted" / "sparse"
+  input_dir.mkdir(parents=True, exist_ok=True)
+  images_dir.mkdir(parents=True, exist_ok=True)
+  sparse_dir.mkdir(parents=True, exist_ok=True)
+  distorted_sparse_dir.mkdir(parents=True, exist_ok=True)
+
+  copied_frames: list[str] = []
+  for image_path in sorted((dataset_root / "images").iterdir()):
+    if not image_path.is_file():
+      continue
+    input_target = input_dir / image_path.name
+    images_target = images_dir / image_path.name
+    shutil.copyfile(image_path, input_target)
+    shutil.copyfile(image_path, images_target)
+    copied_frames.append(str(input_target))
+
+  resolved_repo = resolve_workspace_path(repo_path)
+  repo_root = Path(resolved_repo) if resolved_repo else None
+  convert_script = repo_root / "convert.py" if repo_root else None
+  if convert_script and convert_script.exists():
+    suggested_command = f"python {convert_script} -s {workspace_root}"
+  else:
+    suggested_command = (
+      "colmap feature_extractor --database_path "
+      f"{workspace_root / 'distorted' / 'database.db'} --image_path {input_dir} "
+      "--ImageReader.single_camera 1 --ImageReader.camera_model OPENCV"
+    )
+
+  manifest = {
+    "version": "0.1.0",
+    "session_id": session_id,
+    "family": family,
+    "workspace_root": str(workspace_root),
+    "input_dir": str(input_dir),
+    "images_dir": str(images_dir),
+    "sparse_dir": str(sparse_dir),
+    "distorted_sparse_dir": str(distorted_sparse_dir),
+    "frame_count": len(copied_frames),
+    "suggested_command": suggested_command,
+    "generated_at": time.time(),
+  }
+  manifest_path = workspace_root / "workspace_manifest.json"
+  manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+  run_script = workspace_root / "run_colmap_prepare.sh"
+  run_script.write_text("#!/usr/bin/env bash\n" + suggested_command + "\n", encoding="utf-8")
+
+  return {
+    "session_id": session_id,
+    "capture_id": dataset_info.get("capture_id", ""),
+    "dataset_id": dataset_info.get("dataset_id", ""),
+    "dataset_name": dataset_info.get("dataset_name", ""),
+    "family": family,
+    "workspace_root": str(workspace_root),
+    "input_dir": str(input_dir),
+    "images_dir": str(images_dir),
+    "sparse_dir": str(sparse_dir),
+    "manifest_path": str(manifest_path),
+    "manifest_url": "/" + str(manifest_path.relative_to(ROOT_DIR)).replace("\\", "/"),
+    "suggested_command": suggested_command,
+    "run_script": str(run_script),
+    "frame_count": len(copied_frames),
+  }
+
+
+def format_operation_command(
+  adapter: Dict[str, Any],
+  operation: str,
+  *,
+  input_path: str = "",
+  output_dir: str = "",
+  workspace: str = "",
+  checkpoint_path: str = "",
+  repo_path: str = "",
+) -> str | None:
+  operation_config = adapter.get("operations", {}).get(operation, {})
+  command_template = operation_config.get("template")
+  if not operation_config.get("enabled") or not command_template:
+    return None
+  format_args = {
+    "input_path": input_path,
+    "output_dir": output_dir,
+    "workspace": workspace,
+    "checkpoint_path": checkpoint_path,
+    "repo_path": repo_path or adapter.get("repo_path", ""),
+    "source": input_path or workspace,
+  }
+  return command_template.format(**format_args)
+
+
+def resolve_workspace_path(path_value: str | None) -> str:
+  if not path_value:
+    return ""
+  raw = str(path_value).strip().strip('"').strip("'")
+  if not raw:
+    return ""
+
+  candidate = Path(raw)
+  if candidate.is_absolute():
+    return str(candidate.resolve())
+
+  # Prefer web-relative resolution first because existing adapter JSON uses paths like ../MEGS-2-main.
+  web_relative = (WEB_DIR / raw).resolve()
+  root_relative = (ROOT_DIR / raw).resolve()
+  if web_relative.exists():
+    return str(web_relative)
+  if root_relative.exists():
+    return str(root_relative)
+  return str(web_relative)
+
+
+def resolve_project_path(path_value: str | None) -> str:
+  if not path_value:
+    return ""
+  raw = str(path_value).strip().strip('"').strip("'")
+  if not raw:
+    return ""
+
+  if raw.startswith("/web/"):
+    return str((ROOT_DIR / raw.lstrip("/")).resolve())
+  if raw.startswith("web/"):
+    return str((ROOT_DIR / raw).resolve())
+
+  return resolve_workspace_path(raw)
+
+
+def default_run_output_dir(session_id: str, family: str) -> str:
+  return str((WEB_DIR / "generated" / "runs" / session_id / family).resolve())
+
+
+def strip_empty_repo_path_flag(command: str, repo_path: str) -> str:
+  if repo_path:
+    return command
+  cleaned = command
+  for needle in (' --repo-path ""', " --repo-path ''", " --repo-path"):
+    cleaned = cleaned.replace(needle, "")
+  return cleaned.strip()
+
+
+def adapter_requirement_spec(adapter: Dict[str, Any]) -> Dict[str, Any]:
+  requirements = adapter.get("requirements", {}) or {}
+  python_modules = [
+    str(name).strip()
+    for name in requirements.get("python_modules", [])
+    if str(name).strip()
+  ]
+  install_commands = requirements.get("install_commands", {}) or {}
+
+  if adapter.get("family") == "gaussian-splatting-lightning":
+    if not python_modules:
+      python_modules = [
+        "torch",
+        "lightning",
+        "jsonargparse",
+        "wandb",
+        "viser",
+        "plyfile",
+        "diff_gaussian_rasterization",
+        "simple_knn",
+      ]
+    if not install_commands:
+      install_commands = {
+        "cuda121": [
+          "python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121",
+          "python -m pip install lightning",
+          "python -m pip install jsonargparse",
+          "python -m pip install wandb plyfile==0.8.1 viser==0.2.3",
+          "python -m pip install --no-build-isolation git+https://github.com/graphdeco-inria/diff-gaussian-rasterization.git@59f5f77e3ddbac3ed9db93ec2cfe99ed6c5d121d",
+          "python -m pip install --no-build-isolation git+https://github.com/yzslab/simple-knn.git@44f764299fa305faf6ec5ebd99939e0508331503",
+        ],
+        "cpu": [
+          "python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu",
+          "python -m pip install lightning",
+          "python -m pip install jsonargparse",
+          "python -m pip install wandb plyfile==0.8.1 viser==0.2.3",
+        ],
+      }
+
+  return {
+    "python_modules": python_modules,
+    "install_commands": install_commands,
+  }
+
+
+def find_missing_python_modules(module_names: list[str]) -> list[str]:
+  missing: list[str] = []
+  for module_name in module_names:
+    if not module_name:
+      continue
+    try:
+      if importlib.util.find_spec(module_name) is None:
+        missing.append(module_name)
+    except Exception:
+      missing.append(module_name)
+  return missing
+
+
+def missing_template_fields(command_template: str, format_args: Dict[str, Any]) -> list[str]:
+  required_keys = ("workspace", "input_path", "output_dir", "checkpoint_path", "source")
+  missing: list[str] = []
+  for key in required_keys:
+    if f"{{{key}}}" in command_template and not str(format_args.get(key, "")).strip():
+      missing.append(key)
+  return missing
+
+
+def extract_missing_module_from_stderr(stderr_text: str) -> str:
+  import re
+
+  match = re.search(r"ModuleNotFoundError:\\s+No module named ['\"]([^'\"]+)['\"]", stderr_text or "")
+  return match.group(1) if match else ""
+
+
+def build_dependency_hint(adapter: Dict[str, Any], missing_module: str) -> str:
+  requirement_spec = adapter_requirement_spec(adapter)
+  install_commands = requirement_spec.get("install_commands", {})
+
+  lines = [
+    f"[DependencyHint] Missing module: {missing_module}",
+    f"[DependencyHint] Python executable: {sys.executable}",
+  ]
+
+  cuda121_commands = install_commands.get("cuda121", [])
+  cpu_commands = install_commands.get("cpu", [])
+  if cuda121_commands:
+    lines.append("[DependencyHint] Install commands (CUDA 12.1):")
+    lines.extend(f"  {command}" for command in cuda121_commands)
+  if cpu_commands:
+    lines.append("[DependencyHint] Install commands (CPU-only):")
+    lines.extend(f"  {command}" for command in cpu_commands)
+
+  if missing_module in {"diff_gaussian_rasterization", "simple_knn"}:
+    cuda_toolkit = detect_cuda_toolkit()
+    lines.append("[DependencyHint] This module is a CUDA extension and requires CUDA Toolkit (nvcc).")
+    lines.append(f"[DependencyHint] CUDA_HOME: {cuda_toolkit.get('cuda_home') or '(not set)'}")
+    lines.append(f"[DependencyHint] nvcc: {cuda_toolkit.get('nvcc_path') or '(not found)'}")
+
+  return "\n".join(lines)
+
+
+def detect_cuda_toolkit() -> Dict[str, Any]:
+  cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH") or ""
+  nvcc_path = which("nvcc") or ""
+
+  if cuda_home:
+    try:
+      cuda_home = str(Path(cuda_home).resolve())
+    except Exception:
+      cuda_home = str(cuda_home)
+
+  if cuda_home and not nvcc_path:
+    nvcc_candidate = Path(cuda_home) / "bin" / ("nvcc.exe" if os.name == "nt" else "nvcc")
+    if nvcc_candidate.exists():
+      nvcc_path = str(nvcc_candidate.resolve())
+
+  if not cuda_home and os.name == "nt":
+    for candidate in (
+      Path(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.1"),
+      Path(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"),
+      Path(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8"),
+    ):
+      if candidate.exists():
+        cuda_home = str(candidate.resolve())
+        if not nvcc_path:
+          nvcc_candidate = candidate / "bin" / "nvcc.exe"
+          if nvcc_candidate.exists():
+            nvcc_path = str(nvcc_candidate.resolve())
+        break
+
+  cuda_home_exists = bool(cuda_home and Path(cuda_home).exists())
+  toolkit_ready = bool(cuda_home_exists and nvcc_path)
+  return {
+    "cuda_home": cuda_home,
+    "cuda_home_exists": cuda_home_exists,
+    "nvcc_path": nvcc_path,
+    "toolkit_ready": toolkit_ready,
+  }
+
+
+def _write_probe(path: Path) -> tuple[bool, str]:
+  probe = path / f".wgsc_write_probe_{uuid.uuid4().hex}"
+  try:
+    path.mkdir(parents=True, exist_ok=True)
+    probe.write_text("ok", encoding="utf-8")
+    probe.unlink(missing_ok=True)
+    return True, ""
+  except Exception as exc:
+    return False, str(exc)
+
+
+def _runtime_check_item(name: str, ok: bool, *, required: bool, message: str, hint: str = "", details: Dict[str, Any] | None = None) -> Dict[str, Any]:
+  return {
+    "name": name,
+    "ok": ok,
+    "required": required,
+    "message": message,
+    "hint": hint,
+    "details": details or {},
+  }
+
+
+def environment_check(family: str | None = None) -> Dict[str, Any]:
+  checks: list[Dict[str, Any]] = []
+  warnings: list[str] = []
+
+  web_index = WEB_DIR / "index.html"
+  viewer_sh = WEB_DIR / "viewers" / "sh.html"
+  viewer_sg = WEB_DIR / "viewers" / "sg.html"
+  generated_dir = WEB_DIR / "generated"
+
+  checks.append(_runtime_check_item(
+    "api_runtime",
+    True,
+    required=True,
+    message="API service runtime is active.",
+    details={"python_executable": sys.executable},
+  ))
+
+  web_index_ok = web_index.exists()
+  checks.append(_runtime_check_item(
+    "web_index",
+    web_index_ok,
+    required=True,
+    message="Web index page exists." if web_index_ok else "Missing web/index.html.",
+    hint="Ensure the web assets are present under /web.",
+    details={"path": str(web_index)},
+  ))
+
+  viewer_assets_ok = viewer_sh.exists() and viewer_sg.exists()
+  checks.append(_runtime_check_item(
+    "viewer_assets",
+    viewer_assets_ok,
+    required=True,
+    message="Viewer pages are available." if viewer_assets_ok else "Missing viewer pages (sh.html/sg.html).",
+    hint="Check /web/viewers/sh.html and /web/viewers/sg.html.",
+    details={"sh": str(viewer_sh), "sg": str(viewer_sg)},
+  ))
+
+  generated_writable, generated_error = _write_probe(generated_dir)
+  checks.append(_runtime_check_item(
+    "generated_dir_writable",
+    generated_writable,
+    required=True,
+    message="web/generated is writable." if generated_writable else "web/generated is not writable.",
+    hint="Grant write permission to web/generated for runtime artifacts.",
+    details={"path": str(generated_dir), "error": generated_error},
+  ))
+
+  python3_path = which("python3")
+  python3_ok = bool(python3_path)
+  checks.append(_runtime_check_item(
+    "python3_command",
+    python3_ok,
+    required=False,
+    message="python3 command is available." if python3_ok else "python3 command was not found in PATH.",
+    hint="Install python3 or adjust PATH when using shell helpers.",
+    details={"path": python3_path or ""},
+  ))
+  if not python3_ok:
+    warnings.append("python3 is not in PATH; some shell-based operations may fail.")
+
+  paramiko_available = importlib.util.find_spec("paramiko") is not None
+  checks.append(_runtime_check_item(
+    "paramiko_dependency",
+    paramiko_available,
+    required=False,
+    message="paramiko is installed." if paramiko_available else "paramiko is not installed.",
+    hint="Install with `python -m pip install paramiko` before remote SSH checks.",
+  ))
+  if not paramiko_available:
+    warnings.append("Remote SSH features are unavailable until paramiko is installed.")
+
+  required_checks_ok = all(item["ok"] for item in checks if item["required"])
+  runtime_ready = required_checks_ok
+  remote_ready = runtime_ready and paramiko_available
+
+  summary = "Web runtime checks passed."
+  if not runtime_ready:
+    summary = "Web runtime checks failed. Fix required items before continuing."
+  elif not remote_ready:
+    summary = "Web runtime is ready, but remote SSH checks require paramiko."
+
+  return {
+    "family": family or "",
+    "runtime_ready": runtime_ready,
+    "remote_ready": remote_ready,
+    "checks": checks,
+    "warnings": warnings,
+    "summary": summary,
+    # Backward-compatible fields used by previous UI versions.
+    "web_runnable": runtime_ready,
+    "pipeline_ready": runtime_ready,
+    "repo_exists": True,
+    "gpu_visible": bool(which("nvidia-smi")),
+    "python_executable": sys.executable,
+    "python_modules": [],
+    "missing_python_modules": [],
+    "install_commands": {},
+    "cuda_toolkit": detect_cuda_toolkit(),
+    "commands": {
+      "python3": {"found": python3_ok, "path": python3_path},
+      "paramiko": {"found": paramiko_available, "path": "python module" if paramiko_available else ""},
+      "nvidia-smi": {"found": bool(which("nvidia-smi")), "path": which("nvidia-smi")},
+    },
+    "scripts": {
+      "index.html": {"exists": web_index_ok, "path": str(web_index)},
+      "viewers/sh.html": {"exists": viewer_sh.exists(), "path": str(viewer_sh)},
+      "viewers/sg.html": {"exists": viewer_sg.exists(), "path": str(viewer_sg)},
+    },
+  }
+
+
+def build_capture_pipeline(
+  session_id: str,
+  family: str,
+  *,
+  output_dir: str,
+  repo_path: str = "",
+  checkpoint_path: str = "",
+) -> Dict[str, Any]:
+  adapter = get_adapter(family)
+  if not adapter:
+    raise ValueError(f"Unknown algorithm family: {family}")
+
+  resolved_repo = resolve_workspace_path(repo_path or adapter.get("repo_path", ""))
+  workspace_result = prepare_colmap_workspace(session_id, family, resolved_repo)
+  workspace_root = workspace_result["workspace_root"]
+  resolved_output_dir = output_dir or str((WEB_DIR / "generated" / "runs" / session_id / family).resolve())
+
+  commands: list[dict[str, str]] = []
+  convert_command = workspace_result.get("suggested_command")
+  if convert_command:
+    commands.append({"name": "prepare_colmap", "command": convert_command})
+
+  for operation in ("train", "render"):
+    command = format_operation_command(
+      adapter,
+      operation,
+      input_path=workspace_result["input_dir"],
+      output_dir=resolved_output_dir,
+      workspace=workspace_root,
+      checkpoint_path=checkpoint_path,
+      repo_path=resolved_repo,
+    )
+    if command:
+      commands.append({"name": operation, "command": command})
+
+  resolved_cwd = resolve_workspace_path(adapter.get("default_cwd") or resolved_repo)
+  requires_repo_main = any("python main.py" in item["command"] for item in commands)
+  if requires_repo_main and not resolved_cwd:
+    raise ValueError(
+      f"{family} capture pipeline requires repo_path/default_cwd because train/render use 'python main.py'."
+    )
+
+  pipeline_script = Path(workspace_root) / "run_capture_pipeline.sh"
+  script_lines = ["#!/usr/bin/env bash", "set -e"]
+  script_lines.extend(item["command"] for item in commands)
+  pipeline_script.write_text("\n".join(script_lines) + "\n", encoding="utf-8")
+
+  pipeline_script_cmd = Path(workspace_root) / "run_capture_pipeline.cmd"
+  cmd_lines = ["@echo off", "setlocal"]
+  for item in commands:
+    cmd_lines.append(item["command"])
+    cmd_lines.append("if errorlevel 1 exit /b %errorlevel%")
+  cmd_lines.append("exit /b 0")
+  pipeline_script_cmd.write_text("\r\n".join(cmd_lines) + "\r\n", encoding="utf-8")
+
+  return {
+    "session_id": session_id,
+    "family": family,
+    "workspace": workspace_result,
+    "output_dir": resolved_output_dir,
+    "repo_path": resolved_repo,
+    "checkpoint_path": checkpoint_path,
+    "commands": commands,
+    "script_path": str(pipeline_script),
+    "script_path_cmd": str(pipeline_script_cmd),
+  }
+
+
+def build_viewer_url(relative_url: str, representation: str | None = None) -> str:
+  renderer = "sg" if (representation or "").lower() == "sg" else "sh"
+  return f"/web/viewers/{renderer}.html?url={relative_url}"
+
+
+def newest_iteration_ply(directory: Path) -> Path | None:
+  point_cloud_dir = directory / "point_cloud"
+  if not point_cloud_dir.exists():
+    return None
+  candidates: list[tuple[int, Path]] = []
+  for child in point_cloud_dir.iterdir():
+    if not child.is_dir() or not child.name.startswith("iteration_"):
+      continue
+    try:
+      iteration = int(child.name.split("_")[-1])
+    except ValueError:
+      continue
+    ply_path = child / "point_cloud.ply"
+    if ply_path.exists():
+      candidates.append((iteration, ply_path))
+  if not candidates:
+    return None
+  candidates.sort(key=lambda item: item[0], reverse=True)
+  return candidates[0][1]
+
+
+def newest_render_image(directory: Path) -> Path | None:
+  render_roots = [
+    directory / "test",
+    directory / "train",
+  ]
+  candidates: list[tuple[float, Path]] = []
+  for root in render_roots:
+    if not root.exists():
+      continue
+    for image_path in root.glob("ours_*/renders/*.png"):
+      try:
+        score = image_path.stat().st_mtime
+      except OSError:
+        continue
+      candidates.append((score, image_path))
+  if not candidates:
+    return None
+  candidates.sort(key=lambda item: item[0], reverse=True)
+  return candidates[0][1]
+
+
+def read_runtime_artifacts(output_dir: str | None, representation: str | None = None) -> Dict[str, Any]:
+  if not output_dir:
+    return {}
+  directory = Path(output_dir).resolve()
+  metrics_path = directory / "metrics.json"
+  latest_image = directory / "latest.png"
+  scene_manifest = directory / "scene_manifest.json"
+  point_cloud_candidates = [
+    directory / "point_cloud.ply",
+    directory / "latest.ply",
+    directory / "scene.ply",
+  ]
+  latest_model_ply = newest_iteration_ply(directory)
+  if latest_model_ply is not None:
+    point_cloud_candidates.append(latest_model_ply)
+  latest_render = newest_render_image(directory)
+  payload: Dict[str, Any] = {}
+  if metrics_path.exists():
+    try:
+      payload["metrics"] = json.loads(metrics_path.read_text(encoding="utf-8"))
+    except Exception:
+      pass
+  if scene_manifest.exists() and ROOT_DIR in scene_manifest.parents:
+    manifest_url = "/" + str(scene_manifest.relative_to(ROOT_DIR)).replace("\\", "/")
+    payload["manifest_url"] = manifest_url
+    payload["viewer_url"] = f"/web/?manifest={manifest_url}"
+  for candidate in point_cloud_candidates:
+    if candidate.exists() and ROOT_DIR in candidate.parents:
+      point_cloud_url = "/" + str(candidate.relative_to(ROOT_DIR)).replace("\\", "/")
+      payload["point_cloud_url"] = point_cloud_url
+      payload["viewer_url"] = build_viewer_url(point_cloud_url, representation)
+      break
+  if latest_image.exists() and ROOT_DIR in latest_image.parents:
+    payload["result_url"] = "/" + str(latest_image.relative_to(ROOT_DIR)).replace("\\", "/")
+  elif latest_render is not None and ROOT_DIR in latest_render.parents:
+    payload["result_url"] = "/" + str(latest_render.relative_to(ROOT_DIR)).replace("\\", "/")
+  return payload
+
+
+def json_response(handler: "ApiHandler", payload: Dict[str, Any], status: int = 200) -> None:
+  body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+  handler.send_response(status)
+  handler.send_header("Content-Type", "application/json; charset=utf-8")
+  handler.send_header("Content-Length", str(len(body)))
+  handler.send_header("Access-Control-Allow-Origin", "*")
+  handler.send_header("Access-Control-Allow-Headers", "Content-Type")
+  handler.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+  handler.end_headers()
+  handler.wfile.write(body)
+
+
+def build_error_payload(
+  *,
+  code: str,
+  step: str,
+  message: str,
+  reason: str = "",
+  details: Dict[str, Any] | None = None,
+  manual_anchor: str = "",
+  next_action: str = "",
+) -> Dict[str, Any]:
+  return {
+    "ok": False,
+    "error": message,
+    "code": code,
+    "step": step,
+    "message": message,
+    "reason": reason or message,
+    "details": details or {},
+    "manual_url": MANUAL_ZH_URL,
+    "manual_anchor": manual_anchor,
+    "next_action": next_action,
+  }
+
+
+def error_response(
+  handler: "ApiHandler",
+  *,
+  code: str,
+  step: str,
+  message: str,
+  status: int = 400,
+  reason: str = "",
+  details: Dict[str, Any] | None = None,
+  manual_anchor: str = "",
+  next_action: str = "",
+) -> None:
+  json_response(
+    handler,
+    build_error_payload(
+      code=code,
+      step=step,
+      message=message,
+      reason=reason,
+      details=details,
+      manual_anchor=manual_anchor,
+      next_action=next_action,
+    ),
+    status=status,
+  )
+
+
+def extract_remote_config_input(payload: Dict[str, Any]) -> Dict[str, Any]:
+  remote_payload = payload.get("remote", {}) if isinstance(payload.get("remote"), dict) else {}
+  return {
+    "host": remote_payload.get("host", payload.get("remote_host", "")),
+    "port": remote_payload.get("port", payload.get("remote_port", 22)),
+    "username": remote_payload.get("username", payload.get("remote_username", "")),
+    "password": remote_payload.get("password", payload.get("remote_password", "")),
+    "repo_path": remote_payload.get("repo_path", payload.get("remote_repo_path", "")),
+    "workspace_root": remote_payload.get("workspace_root", payload.get("remote_workspace_root", "")),
+    "output_root": remote_payload.get("output_root", payload.get("remote_output_root", "")),
+    "python": remote_payload.get("python", payload.get("remote_python", "python3")),
+    "activate_cmd": remote_payload.get("activate_cmd", payload.get("remote_activate_cmd", "")),
+  }
+
+
+def validate_path_confirmation_payload(
+  payload: Dict[str, Any],
+  *,
+  command_template: str,
+  expected_checkpoint_path: str,
+  expected_output_dir: str,
+) -> tuple[bool, str, Dict[str, Any]]:
+  confirmation = payload.get("path_confirmation")
+  if not isinstance(confirmation, dict):
+    return (
+      False,
+      "Missing path_confirmation. Please confirm checkpoint_path/output_dir in UI before submit.",
+      {
+        "required": {
+          "path_confirmation.confirmed": True,
+          "path_confirmation.checkpoint_path": "string",
+          "path_confirmation.output_dir": "string",
+        },
+      },
+    )
+
+  if confirmation.get("confirmed") is not True:
+    return (
+      False,
+      "path_confirmation.confirmed must be true.",
+      {"path_confirmation": confirmation},
+    )
+
+  requires_checkpoint = "{checkpoint_path}" in command_template
+  requires_output = "{output_dir}" in command_template
+
+  confirmed_checkpoint = str(confirmation.get("checkpoint_path", "")).strip()
+  confirmed_output_raw = str(confirmation.get("output_dir", "")).strip()
+
+  expected_checkpoint = str(expected_checkpoint_path or "").strip()
+  expected_output = str(expected_output_dir or "").strip()
+  resolved_confirmed_output = resolve_project_path(confirmed_output_raw) if confirmed_output_raw else ""
+
+  mismatches: Dict[str, Any] = {}
+  if requires_checkpoint and confirmed_checkpoint != expected_checkpoint:
+    mismatches["checkpoint_path"] = {
+      "confirmed": confirmed_checkpoint,
+      "expected": expected_checkpoint,
+    }
+
+  if requires_output:
+    if not expected_output:
+      mismatches["output_dir"] = {
+        "confirmed": confirmed_output_raw,
+        "expected": "<non-empty>",
+      }
+    elif confirmed_output_raw != expected_output and resolved_confirmed_output != expected_output:
+      mismatches["output_dir"] = {
+        "confirmed": confirmed_output_raw,
+        "confirmed_resolved": resolved_confirmed_output,
+        "expected": expected_output,
+      }
+
+  if mismatches:
+    return (
+      False,
+      "Path confirmation mismatch. Please re-confirm checkpoint_path/output_dir in UI and retry.",
+      {
+        "required_fields": {
+          "checkpoint_path": requires_checkpoint,
+          "output_dir": requires_output,
+        },
+        "mismatches": mismatches,
+      },
+    )
+
+  return (
+    True,
+    "",
+    {
+      "required_fields": {
+        "checkpoint_path": requires_checkpoint,
+        "output_dir": requires_output,
+      },
+      "confirmed_at": confirmation.get("confirmed_at", ""),
+    },
+  )
+
+
+def operation_command_template(adapter: Dict[str, Any], operation: str) -> str:
+  operation_config = adapter.get("operations", {}).get(operation, {})
+  if not operation_config.get("enabled"):
+    raise ValueError(f"Operation {operation} is not enabled for {adapter.get('family', 'unknown')}")
+  command_template = operation_config.get("template")
+  if not command_template:
+    raise ValueError(f"Operation {operation} does not define command template")
+  return command_template
+
+
+def safe_int(raw_value: Any, default: int, *, minimum: int, maximum: int) -> int:
+  try:
+    value = int(raw_value)
+  except Exception:
+    value = default
+  return max(minimum, min(maximum, value))
+
+
+def file_download_response(
+  handler: "ApiHandler",
+  file_path: Path,
+  *,
+  content_type: str,
+  download_name: str,
+) -> None:
+  if not file_path.exists() or not file_path.is_file():
+    json_response(handler, {"error": f"File not found: {file_path}"}, status=404)
+    return
+
+  body = file_path.read_bytes()
+  handler.send_response(HTTPStatus.OK)
+  handler.send_header("Content-Type", content_type)
+  handler.send_header("Content-Length", str(len(body)))
+  handler.send_header("Content-Disposition", f'attachment; filename="{download_name}"')
+  handler.send_header("Access-Control-Allow-Origin", "*")
+  handler.send_header("Access-Control-Allow-Headers", "Content-Type")
+  handler.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+  handler.end_headers()
+  handler.wfile.write(body)
+
+
+def enrich_job(job: Dict[str, Any]) -> Dict[str, Any]:
+  ensure_job_logging(job)
+  enriched = dict(job)
+  artifacts = read_runtime_artifacts(enriched.get("output_dir"), enriched.get("representation"))
+  if artifacts.get("metrics"):
+    enriched["metrics"] = {
+      **enriched.get("metrics", {}),
+      **artifacts["metrics"],
+    }
+  for key in ("manifest_url", "viewer_url", "point_cloud_url", "result_url"):
+    if artifacts.get(key):
+      enriched[key] = artifacts[key]
+  job_id = str(enriched.get("id", "")).strip()
+  if job_id:
+    enriched["logs_api_url"] = f"/api/jobs/{job_id}/logs"
+    enriched["logs_download_url"] = f"/api/jobs/{job_id}/logs/download"
+    enriched["metrics_csv_url"] = f"/api/jobs/{job_id}/metrics.csv"
+  if isinstance(enriched.get("metrics_history"), list):
+    enriched["metrics_history_count"] = len(enriched["metrics_history"])
+    enriched.pop("metrics_history", None)
+  for private_field in ("log_dir", "log_file", "metrics_csv_file"):
+    enriched.pop(private_field, None)
+  return enriched
+
+
+def prune_job_history() -> None:
+  ordered_jobs = sorted(JOBS.values(), key=lambda item: item.get("created_at", 0), reverse=True)
+  keep_ids: set[str] = set()
+  completed_process_frame_count = 0
+
+  for job in ordered_jobs:
+    job_id = job.get("id")
+    if not job_id:
+      continue
+    if job.get("operation") == "process_frame" and job.get("status") == "completed":
+      if completed_process_frame_count >= MAX_PROCESS_FRAME_COMPLETED_HISTORY:
+        continue
+      completed_process_frame_count += 1
+    keep_ids.add(job_id)
+    if len(keep_ids) >= MAX_JOB_HISTORY:
+      break
+
+  for job_id in list(JOBS.keys()):
+    if job_id not in keep_ids:
+      del JOBS[job_id]
+      JOB_LOG_LOCKS.pop(job_id, None)
+
+
+def start_job_thread(job: Dict[str, Any], command: str, cwd: str | None = None) -> None:
+  def runner() -> None:
+    ensure_job_logging(job)
+    job["status"] = "running"
+    job["started_at"] = time.time()
+    job["metrics"] = {}
+    job["stdout"] = ""
+    job["stderr"] = ""
+    combined_log: list[str] = []
+
+    def consume_stream(stream, channel: str) -> None:
+      for line in iter(stream.readline, ""):
+        if not line:
+          break
+        append_job_log_line(job, channel, line)
+        combined_log.append(line)
+        job["metrics"] = extract_job_metrics("".join(combined_log[-2000:]))
+        artifacts = read_runtime_artifacts(job.get("output_dir"), job.get("representation"))
+        if artifacts.get("metrics"):
+          job["metrics"] = {
+            **job.get("metrics", {}),
+            **artifacts["metrics"],
+          }
+        if artifacts.get("result_url"):
+          job["result_url"] = artifacts["result_url"]
+        if artifacts.get("viewer_url"):
+          job["viewer_url"] = artifacts["viewer_url"]
+      stream.close()
+
+    try:
+      effective_cwd = resolve_workspace_path(cwd) or None
+      args = shlex.split(command, posix=not sys.platform.startswith("win"))
+      if args and args[0] == "python":
+        args[0] = sys.executable
+      # Remove any empty trailing arguments or literal empty quotes that shlex on posix=False might leave
+      args = [a.strip('"').strip("'") if a in ('""', "''") else a for a in args]
+      cleaned_args: list[str] = []
+      idx = 0
+      while idx < len(args):
+        token = args[idx]
+        if token == "--repo-path" and (idx + 1 >= len(args) or args[idx + 1].startswith("--")):
+          idx += 1
+          continue
+        cleaned_args.append(token)
+        idx += 1
+      args = cleaned_args
+      if len(args) >= 2 and args[1].lower().endswith(".py"):
+        script_arg = args[1].strip('"').strip("'")
+        script_path = Path(script_arg)
+        if not script_path.is_absolute():
+          base_dir = Path(effective_cwd) if effective_cwd else ROOT_DIR
+          candidate = (base_dir / script_path).resolve()
+          if not candidate.exists() and script_arg.replace("\\", "/").startswith("../web/"):
+            candidate = (ROOT_DIR / script_arg.replace("\\", "/")[3:]).resolve()
+          if candidate.exists():
+            args[1] = str(candidate)
+      process = subprocess.Popen(
+        args,
+        cwd=effective_cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+      )
+      stdout_thread = threading.Thread(target=consume_stream, args=(process.stdout, "stdout"), daemon=True)
+      stderr_thread = threading.Thread(target=consume_stream, args=(process.stderr, "stderr"), daemon=True)
+      stdout_thread.start()
+      stderr_thread.start()
+      return_code = process.wait()
+      stdout_thread.join(timeout=1)
+      stderr_thread.join(timeout=1)
+      artifacts = read_runtime_artifacts(job.get("output_dir"), job.get("representation"))
+      if artifacts.get("metrics"):
+        job["metrics"] = {
+          **job.get("metrics", {}),
+          **artifacts["metrics"],
+        }
+      if artifacts.get("result_url"):
+        job["result_url"] = artifacts["result_url"]
+      if artifacts.get("viewer_url"):
+        job["viewer_url"] = artifacts["viewer_url"]
+      job["return_code"] = return_code
+      if return_code != 0:
+        missing_module = extract_missing_module_from_stderr(job.get("stderr", ""))
+        if missing_module:
+          adapter = get_adapter(job.get("algorithm_family", "")) or {}
+          hint_text = build_dependency_hint(adapter, missing_module)
+          if hint_text:
+            append_job_log_line(job, "stderr", hint_text)
+            merged_stderr = f"{job.get('stderr', '').rstrip()}\n\n{hint_text}".strip()
+            job["stderr"] = merged_stderr[-12000:]
+      job["status"] = "completed" if return_code == 0 else "failed"
+    except Exception as exc:  # pragma: no cover
+      job["status"] = "failed"
+      append_job_log_line(job, "stderr", str(exc))
+      job["stderr"] = str(exc)
+    finally:
+      job["finished_at"] = time.time()
+
+  threading.Thread(target=runner, daemon=True).start()
+
+
+def start_remote_job_thread(
+  job: Dict[str, Any],
+  *,
+  remote_config: Dict[str, Any],
+  local_workspace_dir: str | None,
+  local_output_dir: str,
+  command_template: str,
+  checkpoint_path: str,
+  input_path: str,
+  source_path: str,
+  session_id: str,
+  auto_colmap: bool,
+  dataset_name: str,
+  remote_dataset_id: str,
+  remote_dataset_path: str,
+  use_existing_remote_dataset: bool,
+) -> None:
+  def runner() -> None:
+    ensure_job_logging(job)
+    job["status"] = "running"
+    job["started_at"] = time.time()
+    job["metrics"] = {}
+    job["stdout"] = ""
+    job["stderr"] = ""
+    job["remote_stage"] = "queued"
+    combined_log: list[str] = []
+
+    def update_artifacts() -> None:
+      artifacts = read_runtime_artifacts(job.get("output_dir"), job.get("representation"))
+      if artifacts.get("metrics"):
+        job["metrics"] = {
+          **job.get("metrics", {}),
+          **artifacts["metrics"],
+        }
+      for key in ("manifest_url", "viewer_url", "point_cloud_url", "result_url"):
+        if artifacts.get(key):
+          job[key] = artifacts[key]
+
+    def on_log(channel: str, line: str) -> None:
+      append_job_log_line(job, channel, line)
+      combined_log.append(line)
+      job["metrics"] = extract_job_metrics("".join(combined_log[-2000:]))
+      update_artifacts()
+
+    def on_stage(stage: str) -> None:
+      job["remote_stage"] = stage
+
+    try:
+      result = run_remote_algorithm(
+        remote_config=remote_config,
+        local_workspace_dir=local_workspace_dir or "",
+        local_output_dir=local_output_dir,
+        session_id=session_id,
+        family=job.get("algorithm_family", "unknown"),
+        job_id=job.get("id", "remote-job"),
+        command_template=command_template,
+        checkpoint_path=checkpoint_path,
+        input_path=input_path,
+        source_path=source_path,
+        auto_colmap=auto_colmap,
+        dataset_name=dataset_name,
+        remote_dataset_id=remote_dataset_id,
+        remote_dataset_path=remote_dataset_path,
+        use_existing_remote_dataset=use_existing_remote_dataset,
+        log_callback=on_log,
+        stage_callback=on_stage,
+      )
+      job["return_code"] = result.get("return_code", 1)
+      job["remote_result"] = {
+        "remote_workspace_dir": result.get("remote_workspace_dir", ""),
+        "remote_output_dir": result.get("remote_output_dir", ""),
+        "remote_dataset_id": result.get("remote_dataset_id", ""),
+        "remote_dataset_name": result.get("remote_dataset_name", ""),
+        "remote_dataset_workspace": result.get("remote_dataset_workspace", ""),
+        "upload": result.get("upload", {}),
+        "download": result.get("download", {}),
+      }
+      update_artifacts()
+      job["status"] = "completed" if job["return_code"] == 0 else "failed"
+    except Exception as exc:  # pragma: no cover - network/runtime dependent
+      job["status"] = "failed"
+      append_job_log_line(job, "stderr", str(exc))
+      merged_stderr = f"{job.get('stderr', '').rstrip()}\n{exc}".strip()
+      job["stderr"] = merged_stderr[-12000:]
+    finally:
+      job["finished_at"] = time.time()
+
+  threading.Thread(target=runner, daemon=True).start()
+
+
+class ApiHandler(SimpleHTTPRequestHandler):
+  def __init__(self, *args, **kwargs):
+    super().__init__(*args, directory=str(ROOT_DIR), **kwargs)
+
+  def end_headers(self) -> None:
+    self.send_header("Access-Control-Allow-Origin", "*")
+    super().end_headers()
+
+  def do_OPTIONS(self) -> None:
+    self.send_response(HTTPStatus.NO_CONTENT)
+    self.send_header("Access-Control-Allow-Origin", "*")
+    self.send_header("Access-Control-Allow-Headers", "Content-Type")
+    self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+    self.end_headers()
+
+  def do_GET(self) -> None:
+    parsed = urlparse(self.path)
+    query = parse_qs(parsed.query)
+    if parsed.path == "/api/health":
+      json_response(self, {
+        "ok": True,
+        "root_dir": str(ROOT_DIR),
+        "web_dir": str(WEB_DIR),
+      })
+      return
+    if parsed.path == "/api/algorithms":
+      algorithms = list_adapters()
+      json_response(self, {"algorithms": algorithms, "validation": [validate_adapter(item) for item in algorithms]})
+      return
+    if parsed.path.startswith("/api/algorithms/"):
+      family = parsed.path.split("/")[-1]
+      adapter = get_adapter(family)
+      if not adapter:
+        json_response(self, {"error": f"Unknown algorithm family: {family}"}, status=404)
+        return
+      json_response(self, {"algorithm": adapter, "operations": supported_operations(adapter), "validation": validate_adapter(adapter)})
+      return
+    if parsed.path == "/api/jobs":
+      json_response(self, {"jobs": [enrich_job(job) for job in JOBS.values()]})
+      return
+    if parsed.path.startswith("/api/jobs/"):
+      parts = parsed.path.strip("/").split("/")
+      if len(parts) < 3:
+        json_response(self, {"error": f"Unsupported endpoint: {parsed.path}"}, status=404)
+        return
+      job_id = parts[2]
+      job = JOBS.get(job_id)
+      if not job:
+        json_response(self, {"error": f"Unknown job: {job_id}"}, status=404)
+        return
+
+      ensure_job_logging(job)
+
+      if len(parts) == 3:
+        json_response(self, enrich_job(job))
+        return
+
+      if len(parts) == 4 and parts[3] == "logs":
+        page = safe_int(query.get("page", ["1"])[0], 1, minimum=1, maximum=100000)
+        page_size = safe_int(query.get("page_size", ["20"])[0], 20, minimum=1, maximum=200)
+        tail_lines = safe_int(query.get("tail_lines", ["120"])[0], 120, minimum=1, maximum=3000)
+        metrics_page = build_metrics_page(job, page, page_size)
+        log_tail = read_job_log_tail_lines(job, tail_lines)
+        json_response(self, {
+          "ok": True,
+          "job_id": job_id,
+          "status": job.get("status", "-"),
+          "metrics_page": metrics_page,
+          "log_tail_lines": log_tail,
+          "logs_download_url": f"/api/jobs/{job_id}/logs/download",
+          "metrics_csv_url": f"/api/jobs/{job_id}/metrics.csv",
+        })
+        return
+
+      if len(parts) == 5 and parts[3] == "logs" and parts[4] == "download":
+        log_file_value = str(job.get("log_file", "")).strip()
+        if not log_file_value:
+          json_response(self, {"error": f"No log file for job: {job_id}"}, status=404)
+          return
+        file_download_response(
+          self,
+          Path(log_file_value),
+          content_type="text/plain; charset=utf-8",
+          download_name=f"{job_id}.runtime.log",
+        )
+        return
+
+      if len(parts) == 4 and parts[3] == "metrics.csv":
+        csv_file_value = str(job.get("metrics_csv_file", "")).strip()
+        if not csv_file_value:
+          json_response(self, {"error": f"No metrics csv for job: {job_id}"}, status=404)
+          return
+        file_download_response(
+          self,
+          Path(csv_file_value),
+          content_type="text/csv; charset=utf-8",
+          download_name=f"{job_id}.metrics.csv",
+        )
+        return
+
+      json_response(self, {"error": f"Unsupported endpoint: {parsed.path}"}, status=404)
+      return
+    super().do_GET()
+
+  def do_POST(self) -> None:
+    parsed = urlparse(self.path)
+    length = int(self.headers.get("Content-Length", "0"))
+    raw = self.rfile.read(length) if length else b"{}"
+    try:
+      payload = json.loads(raw.decode("utf-8") or "{}")
+    except Exception as exc:
+      error_response(
+        self,
+        code="WGSC-REQUEST-JSON-001",
+        step="request",
+        message="Invalid JSON payload.",
+        reason=str(exc),
+        status=400,
+        manual_anchor="#9-%E5%B8%B8%E8%A7%81%E9%94%99%E8%AF%AF%E7%A0%81%E4%B8%8E%E8%A7%A3%E5%86%B3%E6%96%B9%E6%A1%88",
+      )
+      return
+
+    if parsed.path == "/api/jobs/clear":
+      before = len(JOBS)
+      operation_filter = payload.get("operation", "")
+      if operation_filter:
+        remove_ids = [job_id for job_id, job in JOBS.items() if job.get("operation") == operation_filter]
+        for job_id in remove_ids:
+          JOBS.pop(job_id, None)
+          JOB_LOG_LOCKS.pop(job_id, None)
+      else:
+        JOBS.clear()
+        JOB_LOG_LOCKS.clear()
+      json_response(self, {"ok": True, "cleared": before - len(JOBS), "remaining": len(JOBS)})
+      return
+
+    if parsed.path == "/api/export-scene":
+      try:
+        result = build_scene_package(
+          input_path=payload["input_path"],
+          output_dir=payload["output_dir"],
+          scene_id=payload["scene_id"],
+          title=payload.get("title", payload["scene_id"]),
+          representation=payload["representation"],
+          algorithm_family=payload.get("algorithm_family", "unknown"),
+          extra_metadata={
+            "preprocess": payload.get("preprocess", {}),
+            "editor": payload.get("editor", {}),
+            "viewerBackend": payload.get("viewer_backend", "webgl2"),
+          },
+        )
+        manifest_path = Path(result["manifest_path"])
+        if ROOT_DIR in manifest_path.parents or manifest_path == ROOT_DIR:
+          web_manifest_path = "/" + str(manifest_path.relative_to(ROOT_DIR)).replace("\\", "/")
+        else:
+          web_manifest_path = str(manifest_path)
+        share_url = f"{payload.get('web_base_url', '')}/web/?manifest={web_manifest_path}" if payload.get("web_base_url") else web_manifest_path
+        json_response(self, {
+          "ok": True,
+          "result": result,
+          "manifest_url": web_manifest_path,
+          "share_url": share_url,
+        })
+      except Exception as exc:
+        json_response(self, {"error": str(exc)}, status=400)
+      return
+
+    if parsed.path == "/api/adapters/update":
+      family = payload.get("family")
+      if not family:
+        json_response(self, {"error": "family is required"}, status=400)
+        return
+      adapter = get_adapter(family)
+      if not adapter:
+        json_response(self, {"error": f"Unknown algorithm family: {family}"}, status=404)
+        return
+      updated = update_adapter_override(
+        family,
+        {
+          "repo_path": payload.get("repo_path"),
+          "default_cwd": payload.get("default_cwd"),
+          "repo_url": payload.get("repo_url"),
+        },
+      )
+      json_response(self, {"ok": True, "adapter": updated, "validation": validate_adapter(updated)})
+      return
+
+    if parsed.path == "/api/adapters/validate":
+      family = payload.get("family")
+      adapter = get_adapter(family) if family else None
+      if not adapter:
+        error_response(
+          self,
+          code="WGSC-STEP2-ADAPTER-404",
+          step="step2",
+          message=f"Unknown algorithm family: {family}",
+          status=404,
+          manual_anchor="#5-%E4%B8%80%E9%94%AE%E6%B5%81%E7%A8%8B%E6%8E%A8%E8%8D%90",
+          next_action="Select a valid algorithm family from the dropdown and retry.",
+        )
+        return
+      json_response(self, {
+        "ok": True,
+        "code": "WGSC-STEP2-ADAPTER-OK",
+        "step": "step2",
+        "validation": validate_adapter(adapter),
+      })
+      return
+
+    if parsed.path == "/api/environment-check":
+      family = payload.get("family", "")
+      report = environment_check(family or None)
+      json_response(self, {
+        "ok": True,
+        "code": "WGSC-STEP1-RUNTIME-OK" if report.get("runtime_ready") else "WGSC-STEP1-RUNTIME-FAIL",
+        "step": "step1",
+        "report": report,
+      })
+      return
+
+    if parsed.path == "/api/remote-check":
+      try:
+        remote_config_input = extract_remote_config_input(payload)
+        family = str(payload.get("algorithm_family", "")).strip()
+        check_colmap_required = bool(payload.get("check_colmap_required", False))
+        result = remote_preflight_check(
+          remote_config=remote_config_input,
+          timeout_seconds=int(payload.get("timeout_seconds", 20) or 20),
+          family=family,
+          include_datasets=True,
+          check_colmap_required=check_colmap_required,
+        )
+      except RemoteExecutionError as exc:
+        error_response(
+          self,
+          code=exc.code_hint or "WGSC-STEP4-SSH-UNKNOWN-001",
+          step="step4",
+          message=str(exc),
+          reason=f"stage={exc.stage or 'unknown'}",
+          status=400,
+          details={"stage": exc.stage or "unknown"},
+          manual_anchor="#9-%E5%B8%B8%E8%A7%81%E9%94%99%E8%AF%AF%E7%A0%81%E4%B8%8E%E8%A7%A3%E5%86%B3%E6%96%B9%E6%A1%88",
+          next_action="Fix the remote configuration or SSH connectivity and run 'Check SSH' again.",
+        )
+        return
+      except Exception as exc:
+        error_response(
+          self,
+          code="WGSC-STEP4-SSH-UNKNOWN-001",
+          step="step4",
+          message=f"Remote SSH preflight failed: {exc}",
+          status=400,
+          manual_anchor="#9-%E5%B8%B8%E8%A7%81%E9%94%99%E8%AF%AF%E7%A0%81%E4%B8%8E%E8%A7%A3%E5%86%B3%E6%96%B9%E6%A1%88",
+        )
+        return
+
+      json_response(self, {
+        "ok": True,
+        "code": "WGSC-STEP4-SSH-OK",
+        "step": "step4",
+        "result": result,
+      })
+      return
+
+    if parsed.path == "/api/run-remote-algorithm":
+      family = payload.get("algorithm_family", "")
+      if not family:
+        error_response(
+          self,
+          code="WGSC-STEP5-PAYLOAD-001",
+          step="step5",
+          message="algorithm_family is required",
+          status=400,
+          manual_anchor="#5-%E4%B8%80%E9%94%AE%E6%B5%81%E7%A8%8B%E6%8E%A8%E8%8D%90",
+        )
+        return
+
+      definition = get_adapter(family)
+      if not definition:
+        error_response(
+          self,
+          code="WGSC-STEP5-ADAPTER-404",
+          step="step5",
+          message=f"Unknown algorithm family: {family}",
+          status=400,
+          manual_anchor="#5-%E4%B8%80%E9%94%AE%E6%B5%81%E7%A8%8B%E6%8E%A8%E8%8D%90",
+        )
+        return
+
+      operation = payload.get("operation", "train")
+      try:
+        command_template = operation_command_template(definition, operation)
+      except ValueError as exc:
+        error_response(
+          self,
+          code="WGSC-STEP5-OP-UNSUPPORTED-001",
+          step="step5",
+          message=str(exc),
+          status=400,
+          details={"family": family, "operation": operation},
+          manual_anchor="#9-%E5%B8%B8%E8%A7%81%E9%94%99%E8%AF%AF%E7%A0%81%E4%B8%8E%E8%A7%A3%E5%86%B3%E6%96%B9%E6%A1%88",
+          next_action="Switch operation/family or update adapter template and retry.",
+        )
+        return
+
+      session_id = str(payload.get("session_id", "default-session"))
+      capture_id = str(payload.get("capture_id", "")).strip()
+      dataset_name = str(payload.get("dataset_name", "")).strip()
+      auto_materialize = bool(payload.get("auto_materialize", True))
+      auto_colmap = bool(payload.get("auto_colmap", True))
+      use_existing_remote_dataset = bool(payload.get("use_existing_remote_dataset", False))
+      remote_dataset_id = str(payload.get("remote_dataset_id", "")).strip()
+      remote_dataset_path = str(payload.get("remote_dataset_path", "")).strip()
+      workspace_input = str(payload.get("workspace", "")).strip()
+      materialized_result = None
+      workspace_path: Path | None = None
+
+      if use_existing_remote_dataset:
+        if not remote_dataset_id and not remote_dataset_path:
+          error_response(
+            self,
+            code="WGSC-STEP5-DATASET-SELECT-001",
+            step="step5",
+            message="Choose an existing remote dataset or provide remote_dataset_path before running Step 5.",
+            status=400,
+            manual_anchor="#5-%E4%B8%80%E9%94%AE%E6%B5%81%E7%A8%8B%E6%8E%A8%E8%8D%90",
+          )
+          return
+        auto_materialize = False
+      else:
+        if auto_materialize and not workspace_input:
+          try:
+            materialized_result = materialize_stream_session(
+              session_id,
+              payload.get("title", session_id),
+              capture_id=capture_id,
+              dataset_name=dataset_name or str(payload.get("title", "")).strip() or session_id,
+            )
+            workspace_input = materialized_result["dataset_root"]
+            dataset_name = dataset_name or str(materialized_result.get("dataset_name", "")).strip()
+            capture_id = capture_id or str(materialized_result.get("capture_id", "")).strip()
+          except Exception as exc:
+            error_response(
+              self,
+              code="WGSC-STEP3-MATERIALIZE-001",
+              step="step3",
+              message=f"Failed to materialize session {session_id}: {exc}",
+              status=400,
+              manual_anchor="#6-%E5%88%86%E6%AD%A5%E6%B5%81%E7%A8%8B%E8%B0%83%E8%AF%95%E5%85%9C%E5%BA%95",
+            )
+            return
+
+        resolved_workspace = resolve_project_path(workspace_input)
+        if not resolved_workspace:
+          error_response(
+            self,
+            code="WGSC-STEP5-WORKSPACE-001",
+            step="step5",
+            message="workspace is required (or enable auto_materialize, or choose existing remote dataset)",
+            status=400,
+            manual_anchor="#5-%E4%B8%80%E9%94%AE%E6%B5%81%E7%A8%8B%E6%8E%A8%E8%8D%90",
+          )
+          return
+
+        workspace_path = Path(resolved_workspace).resolve()
+        if not workspace_path.exists() or not workspace_path.is_dir():
+          error_response(
+            self,
+            code="WGSC-STEP5-WORKSPACE-002",
+            step="step5",
+            message=f"workspace directory not found: {workspace_path}",
+            status=400,
+            manual_anchor="#9-%E5%B8%B8%E8%A7%81%E9%94%99%E8%AF%AF%E7%A0%81%E4%B8%8E%E8%A7%A3%E5%86%B3%E6%96%B9%E6%A1%88",
+          )
+          return
+
+      requested_output_dir = payload.get("output_dir", "")
+      resolved_output_dir = resolve_project_path(requested_output_dir)
+      if not resolved_output_dir:
+        resolved_output_dir = default_run_output_dir(session_id, family)
+      Path(resolved_output_dir).mkdir(parents=True, exist_ok=True)
+
+      remote_config_input = extract_remote_config_input(payload)
+
+      try:
+        validated_remote = validate_remote_config(remote_config_input)
+      except RemoteExecutionError as exc:
+        error_response(
+          self,
+          code=exc.code_hint or "WGSC-STEP4-CONFIG-001",
+          step="step4",
+          message=str(exc),
+          reason=f"stage={exc.stage or 'config'}",
+          status=400,
+          details={"stage": exc.stage or "config"},
+          manual_anchor="#4.3-Remote-Training-Config",
+        )
+        return
+
+      require_preflight = bool(payload.get("require_remote_check", True))
+      preflight_report = None
+      if require_preflight:
+        try:
+          preflight_report = remote_preflight_check(
+            remote_config=validated_remote,
+            timeout_seconds=20,
+            family=family,
+            include_datasets=True,
+            check_colmap_required=(not use_existing_remote_dataset and auto_colmap),
+          )
+        except RemoteExecutionError as exc:
+          error_response(
+            self,
+            code=exc.code_hint or "WGSC-STEP4-SSH-UNKNOWN-001",
+            step="step4",
+            message=str(exc),
+            reason=f"stage={exc.stage or 'unknown'}",
+            status=400,
+            details={"stage": exc.stage or "unknown"},
+            manual_anchor="#9-%E5%B8%B8%E8%A7%81%E9%94%99%E8%AF%AF%E7%A0%81%E4%B8%8E%E8%A7%A3%E5%86%B3%E6%96%B9%E6%A1%88",
+            next_action="Run Step 4 SSH check, fix the issue, then retry Step 5.",
+          )
+          return
+
+      remote_checkpoint_path = str(payload.get("remote_checkpoint_path", payload.get("checkpoint_path", "")))
+      input_path = str(payload.get("input_path", ""))
+      source_path = str(payload.get("source", ""))
+      workspace_for_template = (
+        str(workspace_path)
+        if workspace_path
+        else (remote_dataset_path or (f"remote-dataset/{remote_dataset_id}" if remote_dataset_id else ""))
+      )
+
+      remote_format_args = {
+        "input_path": input_path,
+        "output_dir": resolved_output_dir,
+        "workspace": workspace_for_template,
+        "checkpoint_path": remote_checkpoint_path,
+        "source": source_path or workspace_for_template,
+      }
+
+      confirmed_ok, confirmed_message, confirmed_details = validate_path_confirmation_payload(
+        payload,
+        command_template=command_template,
+        expected_checkpoint_path=remote_checkpoint_path,
+        expected_output_dir=resolved_output_dir,
+      )
+      if not confirmed_ok:
+        error_response(
+          self,
+          code="WGSC-STEP5-CONFIRM-001",
+          step="step5",
+          message=confirmed_message,
+          status=400,
+          details=confirmed_details,
+          manual_anchor="#5-%E4%B8%80%E9%94%AE%E6%B5%81%E7%A8%8B%E6%8E%A8%E8%8D%90",
+          next_action="Confirm checkpoint_path/output_dir in UI and retry Step 5.",
+        )
+        return
+
+      missing_inputs = missing_template_fields(command_template, remote_format_args)
+      if missing_inputs:
+        error_response(
+          self,
+          code="WGSC-STEP5-TEMPLATE-001",
+          step="step5",
+          message=(
+            f"{family} operation {operation} is missing required inputs: "
+            + ", ".join(missing_inputs)
+          ),
+          status=400,
+          details={"missing_fields": missing_inputs, "command_template": command_template},
+          manual_anchor="#9-%E5%B8%B8%E8%A7%81%E9%94%99%E8%AF%AF%E7%A0%81%E4%B8%8E%E8%A7%A3%E5%86%B3%E6%96%B9%E6%A1%88",
+        )
+        return
+
+      job_id = str(uuid.uuid4())
+      job = {
+        "id": job_id,
+        "status": "queued",
+        "algorithm_family": family,
+        "representation": definition.get("representation", "sh"),
+        "operation": "remote_train",
+        "requested_operation": operation,
+        "command": command_template,
+        "created_at": time.time(),
+        "workspace": workspace_for_template,
+        "output_dir": resolved_output_dir,
+        "session_id": session_id,
+        "capture_id": capture_id,
+        "dataset_name": dataset_name,
+        "use_existing_remote_dataset": use_existing_remote_dataset,
+        "remote_dataset_id": remote_dataset_id,
+        "remote_dataset_path": remote_dataset_path,
+        "repo_path": definition.get("repo_path", ""),
+        "cwd": definition.get("default_cwd", ""),
+        "remote": sanitize_remote_config(validated_remote),
+        "remote_stage": "queued",
+        "metrics": {},
+        "step_result": {
+          "step": "step5",
+          "code": "WGSC-STEP5-QUEUED",
+          "message": "Remote job queued.",
+        },
+      }
+      ensure_job_logging(job)
+      JOBS[job_id] = job
+      prune_job_history()
+
+      start_remote_job_thread(
+        job,
+        remote_config=validated_remote,
+        local_workspace_dir=str(workspace_path) if workspace_path else None,
+        local_output_dir=resolved_output_dir,
+        command_template=command_template,
+        checkpoint_path=remote_checkpoint_path,
+        input_path=input_path,
+        source_path=source_path,
+        session_id=session_id,
+        auto_colmap=auto_colmap,
+        dataset_name=dataset_name,
+        remote_dataset_id=remote_dataset_id,
+        remote_dataset_path=remote_dataset_path,
+        use_existing_remote_dataset=use_existing_remote_dataset,
+      )
+      json_response(
+        self,
+        {
+          "ok": True,
+          "code": "WGSC-STEP5-QUEUED",
+          "step": "step5",
+          "job": enrich_job(job),
+          "materialized": materialized_result,
+          "remote_check": preflight_report,
+        },
+        status=202,
+      )
+      return
+
+    if parsed.path == "/api/run-algorithm":
+      family = payload["algorithm_family"]
+      definition = get_adapter(family)
+      if not definition:
+        json_response(self, {"error": f"Unknown algorithm family: {family}"}, status=400)
+        return
+
+      operation = payload.get("operation", "train")
+      operation_config = definition.get("operations", {}).get(operation, {})
+      command_template = operation_config.get("template")
+      if not operation_config.get("enabled"):
+        json_response(self, {"error": f"Operation {operation} is not enabled for {family}"}, status=400)
+        return
+      if not command_template:
+        json_response(self, {"error": f"Algorithm {family} operation {operation} does not have a command template"}, status=400)
+        return
+
+      resolved_repo = resolve_workspace_path(payload.get("repo_path") or definition.get("repo_path", ""))
+      resolved_cwd = resolve_workspace_path(payload.get("cwd") or definition.get("default_cwd") or resolved_repo)
+      if "python main.py" in command_template and not resolved_cwd:
+        json_response(
+          self,
+          {
+            "error": (
+              f"{family} requires repo_path/default_cwd for operation {operation}. "
+              "Current command is python main.py, but no working directory was configured."
+            )
+          },
+          status=400,
+        )
+        return
+
+      format_args = {
+        "input_path": payload.get("input_path", ""),
+        "output_dir": payload.get("output_dir", ""),
+        "workspace": payload.get("workspace", ""),
+        "checkpoint_path": payload.get("checkpoint_path", ""),
+        "repo_path": resolved_repo,
+        "source": payload.get("source", payload.get("workspace", "")),
+      }
+
+      confirmed_ok, confirmed_message, confirmed_details = validate_path_confirmation_payload(
+        payload,
+        command_template=command_template,
+        expected_checkpoint_path=str(format_args.get("checkpoint_path", "")),
+        expected_output_dir=str(format_args.get("output_dir", "")),
+      )
+      if not confirmed_ok:
+        error_response(
+          self,
+          code="WGSC-STEP5-CONFIRM-001",
+          step="step5",
+          message=confirmed_message,
+          status=400,
+          details=confirmed_details,
+          manual_anchor="#5-%E4%B8%80%E9%94%AE%E6%B5%81%E7%A8%8B%E6%8E%A8%E8%8D%90",
+          next_action="Confirm checkpoint_path/output_dir in UI and retry.",
+        )
+        return
+
+      missing_inputs = missing_template_fields(command_template, format_args)
+      if missing_inputs:
+        json_response(
+          self,
+          {
+            "error": (
+              f"{family} operation {operation} is missing required inputs: "
+              + ", ".join(missing_inputs)
+            ),
+            "missing_fields": missing_inputs,
+            "command_template": command_template,
+          },
+          status=400,
+        )
+        return
+
+      requirement_spec = adapter_requirement_spec(definition)
+      missing_modules = find_missing_python_modules(requirement_spec.get("python_modules", []))
+      if missing_modules:
+        cuda_toolkit = detect_cuda_toolkit()
+        dependency_hint = ""
+        if any(module in missing_modules for module in ("diff_gaussian_rasterization", "simple_knn")) and not cuda_toolkit.get("toolkit_ready"):
+          dependency_hint = (
+            "Missing CUDA Toolkit (nvcc/CUDA_HOME). "
+            "Install CUDA Toolkit, set CUDA_HOME, and then reinstall extension modules."
+          )
+        json_response(
+          self,
+          {
+            "error": f"Missing Python dependencies for {family}: {', '.join(missing_modules)}",
+            "missing_modules": missing_modules,
+            "python_executable": sys.executable,
+            "install_commands": requirement_spec.get("install_commands", {}),
+            "cuda_toolkit": cuda_toolkit,
+            "hint": dependency_hint,
+          },
+          status=400,
+        )
+        return
+
+      command = strip_empty_repo_path_flag(command_template.format(**format_args), resolved_repo)
+      try:
+        command = sanitize_formatted_command(command_template, command, format_args)
+      except Exception:
+        pass
+      job_id = str(uuid.uuid4())
+      job = {
+        "id": job_id,
+        "status": "queued",
+        "algorithm_family": family,
+        "representation": definition["representation"],
+        "operation": operation,
+        "command": command,
+        "cwd": resolved_cwd,
+        "created_at": time.time(),
+        "repo_path": resolved_repo,
+        "output_dir": payload.get("output_dir", ""),
+        "preprocess": payload.get("preprocess", {}),
+        "editor": payload.get("editor", {}),
+        "viewer_backend": payload.get("viewer_backend", "webgl2"),
+        "metrics": {},
+      }
+      ensure_job_logging(job)
+      JOBS[job_id] = job
+      prune_job_history()
+      start_job_thread(job, command=command, cwd=job["cwd"])
+      json_response(self, {"ok": True, "job": enrich_job(job)}, status=202)
+      return
+
+    if parsed.path == "/api/stream-frame":
+      session_id = payload.get("session_id", "default-session")
+      capture_id = str(payload.get("capture_id", "")).strip()
+      family = payload.get("algorithm_family", "")
+      if not payload.get("image_data"):
+        error_response(
+          self,
+          code="WGSC-STEP3-PAYLOAD-001",
+          step="step3",
+          message="image_data is required",
+          status=400,
+          manual_anchor="#6-%E5%88%86%E6%AD%A5%E6%B5%81%E7%A8%8B%E8%B0%83%E8%AF%95%E5%85%9C%E5%BA%95",
+        )
+        return
+      try:
+        frame_info = save_stream_frame(
+          session_id=session_id,
+          image_data=payload["image_data"],
+          filename=payload.get("filename", f"{int(time.time() * 1000)}.png"),
+          capture_id=capture_id,
+        )
+      except Exception as exc:
+        error_response(
+          self,
+          code="WGSC-STEP3-FRAME-SAVE-001",
+          step="step3",
+          message=f"Failed to save frame: {exc}",
+          status=400,
+          manual_anchor="#9-%E5%B8%B8%E8%A7%81%E9%94%99%E8%AF%AF%E7%A0%81%E4%B8%8E%E8%A7%A3%E5%86%B3%E6%96%B9%E6%A1%88",
+        )
+        return
+
+      job = None
+      adapter = get_adapter(family) if family else None
+      if adapter:
+        resolved_repo = resolve_workspace_path(payload.get("repo_path") or adapter.get("repo_path", ""))
+        resolved_cwd = resolve_workspace_path(payload.get("cwd") or adapter.get("default_cwd") or resolved_repo)
+        operation = "process_frame"
+        operation_config = adapter.get("operations", {}).get(operation, {})
+        command_template = operation_config.get("template")
+        if operation_config.get("enabled") and command_template:
+          job_id = str(uuid.uuid4())
+          command = command_template.format(
+            input_path=frame_info["input_path"],
+            output_dir=str((STREAM_DIR / session_id / "output").resolve()),
+            workspace=payload.get("workspace", ""),
+            checkpoint_path=payload.get("checkpoint_path", ""),
+            repo_path=resolved_repo,
+            source=frame_info["input_path"],
+          )
+          command = strip_empty_repo_path_flag(command, resolved_repo)
+          try:
+            command = sanitize_formatted_command(command_template, command, {
+              "input_path": frame_info["input_path"],
+              "output_dir": str((STREAM_DIR / session_id / "output").resolve()),
+              "workspace": payload.get("workspace", ""),
+              "checkpoint_path": payload.get("checkpoint_path", ""),
+              "repo_path": resolved_repo,
+              "source": frame_info["input_path"],
+            })
+          except Exception:
+            pass
+          job = {
+            "id": job_id,
+            "status": "queued",
+            "algorithm_family": family,
+            "representation": adapter["representation"],
+            "operation": operation,
+            "command": command,
+            "cwd": resolved_cwd,
+            "created_at": time.time(),
+            "repo_path": resolved_repo,
+            "metrics": {},
+            "stream_session_id": session_id,
+            "output_dir": str((STREAM_DIR / session_id / "output").resolve()),
+            "result_url": frame_info["output_url"],
+          }
+          ensure_job_logging(job)
+          JOBS[job_id] = job
+          prune_job_history()
+          start_job_thread(job, command=command, cwd=job["cwd"])
+
+      stream_artifacts = read_runtime_artifacts(str((STREAM_DIR / session_id / "output").resolve()), adapter.get("representation") if adapter else None)
+
+      json_response(self, {
+        "ok": True,
+        "session_id": session_id,
+        "capture_id": frame_info.get("capture_id", capture_id),
+        "input_url": frame_info["input_url"],
+        "output_url": stream_artifacts.get("result_url", frame_info["output_url"]),
+        "viewer_url": stream_artifacts.get("viewer_url"),
+        "job": enrich_job(job) if job else None,
+      }, status=202 if job else 200)
+      return
+
+    if parsed.path == "/api/materialize-session":
+      session_id = payload.get("session_id", "default-session")
+      try:
+        result = materialize_stream_session(
+          session_id,
+          payload.get("title"),
+          capture_id=str(payload.get("capture_id", "")).strip(),
+          dataset_name=str(payload.get("dataset_name", "")).strip(),
+        )
+        json_response(self, {"ok": True, "code": "WGSC-STEP3-MATERIALIZE-OK", "step": "step3", "result": result})
+      except Exception as exc:
+        error_response(
+          self,
+          code="WGSC-STEP3-MATERIALIZE-001",
+          step="step3",
+          message=str(exc),
+          status=400,
+          manual_anchor="#6-%E5%88%86%E6%AD%A5%E6%B5%81%E7%A8%8B%E8%B0%83%E8%AF%95%E5%85%9C%E5%BA%95",
+        )
+      return
+
+    if parsed.path == "/api/prepare-colmap-workspace":
+      session_id = payload.get("session_id", "default-session")
+      family = payload.get("algorithm_family", "vanilla-3dgs")
+      try:
+        result = prepare_colmap_workspace(
+          session_id,
+          family,
+          payload.get("repo_path"),
+          capture_id=str(payload.get("capture_id", "")).strip(),
+          dataset_name=str(payload.get("dataset_name", "")).strip(),
+        )
+        json_response(self, {"ok": True, "code": "WGSC-STEP3-WORKSPACE-OK", "step": "step3", "result": result})
+      except Exception as exc:
+        error_response(
+          self,
+          code="WGSC-STEP3-WORKSPACE-001",
+          step="step3",
+          message=str(exc),
+          status=400,
+          manual_anchor="#6-%E5%88%86%E6%AD%A5%E6%B5%81%E7%A8%8B%E8%B0%83%E8%AF%95%E5%85%9C%E5%BA%95",
+        )
+      return
+
+    if parsed.path == "/api/run-capture-pipeline":
+      session_id = payload.get("session_id", "default-session")
+      family = payload.get("algorithm_family", "vanilla-3dgs")
+      output_dir = payload.get("output_dir", "")
+      repo_path = resolve_workspace_path(payload.get("repo_path", ""))
+      checkpoint_path = payload.get("checkpoint_path", "")
+      execute = bool(payload.get("execute_immediately", True))
+      try:
+        pipeline = build_capture_pipeline(
+          session_id,
+          family,
+          output_dir=output_dir,
+          repo_path=repo_path,
+          checkpoint_path=checkpoint_path,
+        )
+        job = None
+        if execute:
+          adapter = get_adapter(family)
+          job_id = str(uuid.uuid4())
+          pipeline_command = (
+            f'cmd /c "{pipeline["script_path_cmd"]}"'
+            if os.name == "nt"
+            else f"bash {pipeline['script_path']}"
+          )
+          job = {
+            "id": job_id,
+            "status": "queued",
+            "algorithm_family": family,
+            "representation": adapter.get("representation", "sh") if adapter else "sh",
+            "operation": "capture_pipeline",
+            "command": pipeline_command,
+            "cwd": pipeline["repo_path"] or resolve_workspace_path(adapter.get("default_cwd") if adapter else "") or pipeline["workspace"]["workspace_root"],
+            "created_at": time.time(),
+            "repo_path": pipeline["repo_path"],
+            "output_dir": pipeline["output_dir"],
+            "workspace": pipeline["workspace"]["workspace_root"],
+            "metrics": {},
+            "pipeline": pipeline,
+          }
+          ensure_job_logging(job)
+          JOBS[job_id] = job
+          prune_job_history()
+          start_job_thread(job, command=job["command"], cwd=job["cwd"])
+        json_response(self, {"ok": True, "pipeline": pipeline, "job": enrich_job(job) if job else None}, status=202 if job else 200)
+      except Exception as exc:
+        error_response(
+          self,
+          code="WGSC-STEP5-PIPELINE-001",
+          step="step5",
+          message=str(exc),
+          status=400,
+          manual_anchor="#6-%E5%88%86%E6%AD%A5%E6%B5%81%E7%A8%8B%E8%B0%83%E8%AF%95%E5%85%9C%E5%BA%95",
+        )
+      return
+
+    json_response(self, {"error": f"Unsupported endpoint: {parsed.path}"}, status=404)
+
+
+def main() -> None:
+  parser = argparse.ArgumentParser(description="Run the Gaussian Encoding web server.")
+  parser.add_argument("--host", default="127.0.0.1")
+  parser.add_argument("--port", type=int, default=8080)
+  args = parser.parse_args()
+
+  server = ThreadingHTTPServer((args.host, args.port), ApiHandler)
+  print(f"Serving web app at http://{args.host}:{args.port}/web/")
+  server.serve_forever()
+
+
+if __name__ == "__main__":
+  main()

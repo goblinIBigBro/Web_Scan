@@ -1,0 +1,20 @@
+{
+  "version": "0.1.0",
+  "sceneId": "megs2-sg-template",
+  "title": "MEGS2 SG Template",
+  "renderer": "sg",
+  "representation": "sg",
+  "source": {
+    "url": "../MEGS-2-main/WebGL_viewer/point_cloud.ply",
+    "format": "ply"
+  },
+  "algorithm": {
+    "family": "megs2",
+    "name": "MEGS2"
+  },
+  "metadata": {
+    "appearanceModel": "sg",
+    "variableSgBands": true,
+    "notes": "Replace the URL with the actual SG PLY file."
+  }
+}

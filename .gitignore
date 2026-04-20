@@ -1,0 +1,36 @@
+# 先忽略所有
+*
+
+# 保留 gitignore 自己
+!.gitignore
+
+# 保留主目录下的 change.md
+!/change.md
+
+# 保留 web 文件夹及其全部内容
+!/web/
+!/web/**
+
+# 忽略 web 里的数据、缓存、日志和备份
+/web/_backup/
+/web/generated/
+/web/test1/
+/web/**/__pycache__/
+/web/**/*.py[co]
+/web/**/*.log
+/web/**/*.csv
+/web/**/*.png
+/web/**/*.jpg
+/web/**/*.jpeg
+/web/**/*.webp
+/web/**/*.gif
+/web/**/*.bmp
+/web/**/*.ply
+/web/**/*.bin
+/web/**/*.db
+/web/**/*.sqlite
+/web/**/*.sqlite3
+/web/**/*.tmp
+/web/**/*.bak
+/web/**/*.DS_Store
+

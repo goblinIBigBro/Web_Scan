@@ -1,0 +1,543 @@
+{
+  "version": "0.2.0",
+  "adapters": [
+    {
+      "family": "vanilla-3dgs",
+      "label": "Vanilla 3DGS",
+      "category": "baseline",
+      "representation": "sh",
+      "compatibility": "viewer-ready",
+      "repo_type": "external",
+      "repo_path": "",
+      "repo_url": "",
+      "default_cwd": "",
+      "operations": {
+        "train": {
+          "enabled": false,
+          "template": ""
+        },
+        "export_scene": {
+          "enabled": true,
+          "input_kind": "ply"
+        }
+      },
+      "notes": ""
+    },
+    {
+      "family": "gaussian-splatting-lightning",
+      "label": "Gaussian Splatting Lightning",
+      "category": "framework",
+      "representation": "sh",
+      "compatibility": "viewer-ready",
+      "repo_type": "external",
+      "repo_path": "../gaussian-splatting-lightning-main",
+      "repo_url": "https://github.com/yzslab/gaussian-splatting-lightning",
+      "default_cwd": "../gaussian-splatting-lightning-main",
+      "operations": {
+        "train": {
+          "enabled": true,
+          "template": "python main.py fit --data.parser {workspace}"
+        },
+        "render": {
+          "enabled": true,
+          "template": "python main.py validate --data.parser {workspace}"
+        },
+        "process_frame": {
+          "enabled": true,
+          "template": "python ../web/tools/realtime_adapter_bridge.py --adapter gaussian-splatting-lightning --representation sh --mode copy-and-scene --input {input_path} --output-dir {output_dir} --repo-path {repo_path}"
+        },
+        "export_scene": {
+          "enabled": true,
+          "input_kind": "ply"
+        }
+      },
+      "requirements": {
+        "python_modules": [
+          "torch",
+          "lightning",
+          "jsonargparse",
+          "wandb",
+          "viser",
+          "plyfile",
+          "diff_gaussian_rasterization",
+          "simple_knn"
+        ],
+        "install_commands": {
+          "cuda121": [
+            "python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121",
+            "python -m pip install lightning",
+            "python -m pip install jsonargparse",
+            "python -m pip install wandb plyfile==0.8.1 viser==0.2.3",
+            "python -m pip install --no-build-isolation git+https://github.com/graphdeco-inria/diff-gaussian-rasterization.git@59f5f77e3ddbac3ed9db93ec2cfe99ed6c5d121d",
+            "python -m pip install --no-build-isolation git+https://github.com/yzslab/simple-knn.git@44f764299fa305faf6ec5ebd99939e0508331503"
+          ],
+          "cpu": [
+            "python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu",
+            "python -m pip install lightning",
+            "python -m pip install jsonargparse",
+            "python -m pip install wandb plyfile==0.8.1 viser==0.2.3"
+          ]
+        }
+      },
+      "notes": "train/render require torch and lightning; {workspace} for train must be a valid parser input path."
+    },
+    {
+      "family": "gaussian-splatting-web",
+      "label": "Gaussian Splatting Web",
+      "category": "viewer",
+      "representation": "sh",
+      "compatibility": "viewer-ready",
+      "repo_type": "external",
+      "repo_path": "",
+      "repo_url": "https://github.com/cvlab-epfl/gaussian-splatting-web",
+      "default_cwd": "",
+      "operations": {
+        "viewer_build": {
+          "enabled": true,
+          "template": "npm run build"
+        },
+        "viewer_dev": {
+          "enabled": true,
+          "template": "npm run start"
+        }
+      },
+      "notes": ""
+    },
+    {
+      "family": "megs2",
+      "label": "MEGS2",
+      "category": "compression",
+      "representation": "sg",
+      "compatibility": "viewer-ready",
+      "repo_type": "local",
+      "repo_path": "../MEGS-2-main",
+      "repo_url": "https://github.com/IGL-HKUST/MEGS-2",
+      "default_cwd": "../MEGS-2-main",
+      "operations": {
+        "train": {
+          "enabled": true,
+          "template": "python train.py -s {workspace} -m {output_dir}"
+        },
+        "render": {
+          "enabled": true,
+          "template": "python render.py -m {output_dir}"
+        },
+        "process_frame": {
+          "enabled": true,
+          "template": "python ../web/tools/materialize_model_output.py --adapter megs2 --representation sg --model-dir {checkpoint_path} --input {input_path} --output-dir {output_dir}"
+        },
+        "export_scene": {
+          "enabled": true,
+          "input_kind": "ply"
+        }
+      },
+      "notes": ""
+    },
+    {
+      "family": "gaussianspa",
+      "label": "GaussianSpa",
+      "category": "compaction",
+      "representation": "sh",
+      "compatibility": "viewer-ready",
+      "repo_type": "external",
+      "repo_path": "",
+      "repo_url": "",
+      "default_cwd": "",
+      "operations": {
+        "train": {
+          "enabled": true,
+          "template": "python train.py -s {workspace} -m {output_dir}"
+        },
+        "process_frame": {
+          "enabled": true,
+          "template": "python ../web/tools/realtime_adapter_bridge.py --adapter gaussianspa --representation sh --mode copy-and-scene --input {input_path} --output-dir {output_dir} --repo-path {repo_path}"
+        },
+        "export_scene": {
+          "enabled": true,
+          "input_kind": "ply"
+        }
+      },
+      "notes": ""
+    },
+    {
+      "family": "scaffold-gs",
+      "label": "Scaffold-GS",
+      "category": "anchor",
+      "representation": "compressed-anchor",
+      "compatibility": "manifest-ready",
+      "repo_type": "local",
+      "repo_path": "../Scaffold-GS-main",
+      "repo_url": "https://github.com/city-super/Scaffold-GS",
+      "default_cwd": "../Scaffold-GS-main",
+      "operations": {
+        "train": {
+          "enabled": true,
+          "template": "python train.py -s {workspace} -m {output_dir}"
+        },
+        "render": {
+          "enabled": true,
+          "template": "python render.py -m {workspace}"
+        },
+        "process_frame": {
+          "enabled": true,
+          "template": "python ../web/tools/materialize_model_output.py --adapter scaffold-gs --representation sh --model-dir {checkpoint_path} --input {input_path} --output-dir {output_dir}"
+        }
+      },
+      "notes": ""
+    },
+    {
+      "family": "reduced-3dgs",
+      "label": "Reduced 3DGS",
+      "category": "compression",
+      "representation": "compressed-sh",
+      "compatibility": "manifest-ready",
+      "repo_type": "local",
+      "repo_path": "../reduced-3dgs-main",
+      "repo_url": "https://github.com/graphdeco-inria/reduced-3dgs",
+      "default_cwd": "../reduced-3dgs-main",
+      "operations": {
+        "train": {
+          "enabled": true,
+          "template": "python train.py -s {workspace} -m {output_dir}"
+        },
+        "render": {
+          "enabled": true,
+          "template": "python render.py -m {workspace}"
+        },
+        "compress": {
+          "enabled": true,
+          "template": "python compress.py --path {input_path}"
+        },
+        "process_frame": {
+          "enabled": true,
+          "template": "python ../web/tools/materialize_model_output.py --adapter reduced-3dgs --representation sh --model-dir {checkpoint_path} --input {input_path} --output-dir {output_dir}"
+        },
+        "export_scene": {
+          "enabled": true,
+          "input_kind": "ply"
+        }
+      },
+      "notes": ""
+    },
+    {
+      "family": "hac",
+      "label": "HAC",
+      "category": "compression",
+      "representation": "compressed-anchor",
+      "compatibility": "manifest-ready",
+      "repo_type": "external",
+      "repo_path": "",
+      "repo_url": "",
+      "default_cwd": "",
+      "operations": {
+        "compress": {
+          "enabled": true,
+          "template": "python compress.py --input {input_path} --output {output_dir}"
+        },
+        "process_frame": {
+          "enabled": false,
+          "template": ""
+        },
+        "export_scene": {
+          "enabled": true,
+          "input_kind": "ply"
+        }
+      },
+      "notes": ""
+    },
+    {
+      "family": "hemgs",
+      "label": "HEMGS",
+      "category": "compression",
+      "representation": "compressed-sh",
+      "compatibility": "manifest-ready",
+      "repo_type": "external",
+      "repo_path": "",
+      "repo_url": "",
+      "default_cwd": "",
+      "operations": {
+        "compress": {
+          "enabled": true,
+          "template": "python compress.py --input {input_path} --output {output_dir}"
+        }
+      },
+      "notes": ""
+    },
+    {
+      "family": "hac-plus-plus",
+      "label": "HAC++",
+      "category": "compression",
+      "representation": "compressed-anchor",
+      "compatibility": "manifest-ready",
+      "repo_type": "local",
+      "repo_path": "../HAC-plus-main",
+      "repo_url": "https://github.com/YihangChen-ee/HAC-plus",
+      "default_cwd": "../HAC-plus-main",
+      "operations": {
+        "train": {
+          "enabled": true,
+          "template": "python train.py -s {workspace} --eval -m {output_dir}"
+        },
+        "render": {
+          "enabled": true,
+          "template": "python render.py -m {output_dir}"
+        },
+        "process_frame": {
+          "enabled": true,
+          "template": "python ../web/tools/materialize_model_output.py --adapter hac-plus-plus --representation sh --model-dir {checkpoint_path} --input {input_path} --output-dir {output_dir}"
+        },
+        "export_scene": {
+          "enabled": true,
+          "input_kind": "ply"
+        }
+      },
+      "notes": ""
+    },
+    {
+      "family": "contextgs",
+      "label": "ContextGS",
+      "category": "compression",
+      "representation": "compressed-anchor",
+      "compatibility": "manifest-ready",
+      "repo_type": "local",
+      "repo_path": "../ContextGS-main",
+      "repo_url": "https://github.com/wyf0912/ContextGS",
+      "default_cwd": "../ContextGS-main",
+      "operations": {
+        "train": {
+          "enabled": true,
+          "template": "python train.py -s {workspace} --eval -m {output_dir}"
+        },
+        "encode": {
+          "enabled": true,
+          "template": "python train.py -s {workspace} --eval -m {output_dir}"
+        },
+        "decode": {
+          "enabled": true,
+          "template": "python decompress.py -s {workspace} --eval -m {output_dir}"
+        },
+        "process_frame": {
+          "enabled": true,
+          "template": "python ../web/tools/materialize_model_output.py --adapter contextgs --representation sh --model-dir {checkpoint_path} --input {input_path} --output-dir {output_dir}"
+        }
+      },
+      "notes": ""
+    },
+    {
+      "family": "codecgs",
+      "label": "CodecGS",
+      "category": "compression",
+      "representation": "compressed-feature",
+      "compatibility": "manifest-ready",
+      "repo_type": "external",
+      "repo_path": "",
+      "repo_url": "",
+      "default_cwd": "",
+      "operations": {
+        "encode": {
+          "enabled": true,
+          "template": "python encode.py --input {input_path} --output {output_dir}"
+        },
+        "decode": {
+          "enabled": true,
+          "template": "python decode.py --input {input_path} --output {output_dir}"
+        }
+      },
+      "notes": ""
+    },
+    {
+      "family": "fcgs",
+      "label": "FCGS",
+      "category": "compression",
+      "representation": "compressed-feature",
+      "compatibility": "manifest-ready",
+      "repo_type": "local",
+      "repo_path": "../FCGS-main",
+      "repo_url": "https://github.com/YihangChen-ee/FCGS",
+      "default_cwd": "../FCGS-main",
+      "operations": {
+        "compress": {
+          "enabled": true,
+          "template": "python encode_single_scene.py --ply_path_from {input_path} --bit_path_to {output_dir}"
+        },
+        "decode": {
+          "enabled": true,
+          "template": "python decode_single_scene.py --bit_path_from {input_path} --ply_path_to {output_dir}/point_cloud.ply"
+        },
+        "process_frame": {
+          "enabled": true,
+          "template": "python ../web/tools/materialize_model_output.py --adapter fcgs --representation sh --model-dir {checkpoint_path} --input {input_path} --output-dir {output_dir}"
+        }
+      },
+      "notes": ""
+    },
+    {
+      "family": "compgs",
+      "label": "CompGS",
+      "category": "compaction",
+      "representation": "compressed-anchor",
+      "compatibility": "manifest-ready",
+      "repo_type": "local",
+      "repo_path": "../CompGS-main",
+      "repo_url": "https://github.com/LiuXiangrui/CompGS",
+      "default_cwd": "../CompGS-main",
+      "operations": {
+        "train": {
+          "enabled": true,
+          "template": "python Train.py --config {workspace}"
+        },
+        "render": {
+          "enabled": true,
+          "template": "python Test.py --dataset_root {workspace} --experiment_root {output_dir}"
+        },
+        "process_frame": {
+          "enabled": true,
+          "template": "python ../web/tools/materialize_model_output.py --adapter compgs --representation sh --model-dir {checkpoint_path} --input {input_path} --output-dir {output_dir}"
+        }
+      },
+      "notes": ""
+    },
+    {
+      "family": "rdo-gaussian",
+      "label": "RDO-Gaussian",
+      "category": "compression",
+      "representation": "compressed-sh",
+      "compatibility": "manifest-ready",
+      "repo_type": "external",
+      "repo_path": "",
+      "repo_url": "",
+      "default_cwd": "",
+      "operations": {
+        "train": {
+          "enabled": true,
+          "template": "python train.py --input {workspace} --output {output_dir}"
+        }
+      },
+      "notes": ""
+    },
+    {
+      "family": "compressed-3dgs",
+      "label": "Compressed 3DGS",
+      "category": "compression",
+      "representation": "compressed-sh",
+      "compatibility": "manifest-ready",
+      "repo_type": "external",
+      "repo_path": "",
+      "repo_url": "",
+      "default_cwd": "",
+      "operations": {
+        "compress": {
+          "enabled": true,
+          "template": "python compress.py --input {input_path} --output {output_dir}"
+        },
+        "decompress": {
+          "enabled": true,
+          "template": "python decompress.py --input {input_path} --output {output_dir}"
+        }
+      },
+      "notes": ""
+    },
+    {
+      "family": "mesongs",
+      "label": "MesonGS",
+      "category": "compression",
+      "representation": "compressed-sh",
+      "compatibility": "manifest-ready",
+      "repo_type": "external",
+      "repo_path": "",
+      "repo_url": "",
+      "default_cwd": "",
+      "operations": {
+        "compress": {
+          "enabled": true,
+          "template": "python compress.py --input {input_path} --output {output_dir}"
+        }
+      },
+      "notes": ""
+    },
+    {
+      "family": "octree-gs",
+      "label": "Octree-GS",
+      "category": "lod",
+      "representation": "compressed-anchor",
+      "compatibility": "manifest-ready",
+      "repo_type": "external",
+      "repo_path": "",
+      "repo_url": "",
+      "default_cwd": "",
+      "operations": {
+        "train": {
+          "enabled": true,
+          "template": "python train.py --source {workspace} --output {output_dir}"
+        }
+      },
+      "notes": ""
+    },
+    {
+      "family": "gaussianpro",
+      "label": "GaussianPro",
+      "category": "compaction",
+      "representation": "sh",
+      "compatibility": "viewer-ready",
+      "repo_type": "external",
+      "repo_path": "",
+      "repo_url": "",
+      "default_cwd": "",
+      "operations": {
+        "train": {
+          "enabled": true,
+          "template": "python train.py --source {workspace} --output {output_dir}"
+        },
+        "export_scene": {
+          "enabled": true,
+          "input_kind": "ply"
+        }
+      },
+      "notes": ""
+    },
+    {
+      "family": "atomgs",
+      "label": "AtomGS",
+      "category": "compaction",
+      "representation": "sh",
+      "compatibility": "viewer-ready",
+      "repo_type": "external",
+      "repo_path": "",
+      "repo_url": "",
+      "default_cwd": "",
+      "operations": {
+        "train": {
+          "enabled": true,
+          "template": "python train.py --source {workspace} --output {output_dir}"
+        },
+        "export_scene": {
+          "enabled": true,
+          "input_kind": "ply"
+        }
+      },
+      "notes": ""
+    },
+    {
+      "family": "taming3dgs",
+      "label": "Taming3DGS",
+      "category": "compaction",
+      "representation": "sh",
+      "compatibility": "viewer-ready",
+      "repo_type": "external",
+      "repo_path": "",
+      "repo_url": "",
+      "default_cwd": "",
+      "operations": {
+        "train": {
+          "enabled": true,
+          "template": "python train.py --source {workspace} --output {output_dir}"
+        },
+        "export_scene": {
+          "enabled": true,
+          "input_kind": "ply"
+        }
+      },
+      "notes": ""
+    }
+  ]
+}

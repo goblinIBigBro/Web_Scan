@@ -134,10 +134,19 @@
               Capture Interval (ms)
               <input id="stream-interval-ms" type="number" min="100" step="100" value="1000" />
             </label>
-            <label>
-              Upload Image
-              <input id="stream-image-file" type="file" accept="image/*" />
-            </label>
+            <section class="upload-panel" id="upload-panel">
+              <div class="upload-panel-head">
+                <p class="upload-title">Upload Photos</p>
+                <button id="clear-upload-files" type="button" class="upload-clear-btn">Clear Selection</button>
+              </div>
+              <label id="upload-dropzone" class="upload-dropzone">
+                <input id="stream-image-file" type="file" accept="image/*" multiple />
+                <span class="upload-dropzone-title">Click to choose photos or drag them here</span>
+                <span class="upload-dropzone-subtitle">You can select multiple images at once. If none are selected, Send Frame captures from camera.</span>
+              </label>
+              <p id="upload-file-summary" class="upload-file-summary">No file selected. Camera capture mode is ready.</p>
+              <div id="upload-preview-grid" class="upload-preview-grid" aria-live="polite"></div>
+            </section>
             <div class="button-row">
               <button id="start-camera" type="button">Start Camera</button>
               <button id="stop-camera" type="button">Stop Camera</button>

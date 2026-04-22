@@ -59,6 +59,7 @@ let lastRemoteCheckReport = null;
 let suppressFlowToggleSync = false;
 let flowManualState = {};
 let lastJobsSnapshot = [];
+let uploadPreviewObjectUrls = [];
 
 const FLOW_BLOCK_IDS = [
   "flow-runtime",
@@ -109,6 +110,107 @@ function computeRemoteConfigReady() {
 
 function generateCaptureBatchId() {
   return `capture-${Date.now()}-${Math.random().toString(16).slice(2, 6)}`;
+}
+
+function getUploadInputNode() {
+  return document.getElementById("stream-image-file");
+}
+
+function getSelectedUploadFiles() {
+  return Array.from(getUploadInputNode()?.files ?? []);
+}
+
+function revokeUploadPreviewObjectUrls() {
+  uploadPreviewObjectUrls.forEach((url) => {
+    try {
+      URL.revokeObjectURL(url);
+    } catch {
+      // ignore URL revoke errors
+    }
+  });
+  uploadPreviewObjectUrls = [];
+}
+
+function formatFileSize(bytes) {
+  const value = Number(bytes || 0);
+  if (!Number.isFinite(value) || value <= 0) return "0 B";
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function renderUploadSelectionSummary() {
+  const summaryNode = document.getElementById("upload-file-summary");
+  const previewGrid = document.getElementById("upload-preview-grid");
+  if (!summaryNode || !previewGrid) return;
+
+  revokeUploadPreviewObjectUrls();
+  const files = getSelectedUploadFiles();
+  if (!files.length) {
+    summaryNode.textContent = "No file selected. Camera capture mode is ready.";
+    const empty = document.createElement("p");
+    empty.className = "upload-preview-empty";
+    empty.textContent = "No photos selected yet.";
+    previewGrid.replaceChildren(empty);
+    return;
+  }
+
+  const totalBytes = files.reduce((sum, file) => sum + (Number(file.size) || 0), 0);
+  summaryNode.textContent = `${files.length} image(s) selected · ${formatFileSize(totalBytes)}`;
+
+  const previewLimit = 12;
+  const fragment = document.createDocumentFragment();
+  files.slice(0, previewLimit).forEach((file, index) => {
+    const card = document.createElement("article");
+    card.className = "upload-preview-card";
+
+    const image = document.createElement("img");
+    const objectUrl = URL.createObjectURL(file);
+    uploadPreviewObjectUrls.push(objectUrl);
+    image.src = objectUrl;
+    image.alt = file.name || `selected image ${index + 1}`;
+
+    const name = document.createElement("span");
+    name.className = "upload-preview-name";
+    name.textContent = `${index + 1}. ${file.name || `image_${index + 1}`}`;
+
+    card.appendChild(image);
+    card.appendChild(name);
+    fragment.appendChild(card);
+  });
+
+  if (files.length > previewLimit) {
+    const more = document.createElement("div");
+    more.className = "upload-preview-more";
+    more.textContent = `+${files.length - previewLimit} more`;
+    fragment.appendChild(more);
+  }
+
+  previewGrid.replaceChildren(fragment);
+}
+
+function applyDroppedUploadFiles(files) {
+  const input = getUploadInputNode();
+  if (!input) return;
+
+  const imageFiles = Array.from(files).filter((file) => String(file.type || "").startsWith("image/"));
+  if (!imageFiles.length) return;
+
+  try {
+    const dataTransfer = new DataTransfer();
+    imageFiles.forEach((file) => dataTransfer.items.add(file));
+    input.files = dataTransfer.files;
+    renderUploadSelectionSummary();
+  } catch {
+    // Some browsers disallow programmatic assignment of FileList.
+  }
+}
+
+function clearUploadFileSelection() {
+  const input = getUploadInputNode();
+  if (!input) return;
+  input.value = "";
+  renderUploadSelectionSummary();
 }
 
 function ensureCaptureBatchId(forceNew = false) {
@@ -764,14 +866,6 @@ async function imageFileToDataUrl(file) {
 }
 
 async function captureCurrentFrame() {
-  const imageFile = document.getElementById("stream-image-file").files?.[0];
-  if (imageFile) {
-    return {
-      imageData: await imageFileToDataUrl(imageFile),
-      filename: imageFile.name || "upload.png",
-    };
-  }
-
   await startCamera();
   const video = document.getElementById("local-stream");
   const canvas = document.createElement("canvas");
@@ -785,32 +879,65 @@ async function captureCurrentFrame() {
   };
 }
 
+async function collectFramesForUpload() {
+  const files = getSelectedUploadFiles();
+  if (!files.length) {
+    return [await captureCurrentFrame()];
+  }
+
+  const frames = [];
+  for (const file of files) {
+    frames.push({
+      imageData: await imageFileToDataUrl(file),
+      filename: file.name || `upload_${Date.now()}.png`,
+    });
+  }
+  return frames;
+}
+
 async function sendCurrentFrame(options = {}) {
   const triggerProcessing = options.triggerProcessing !== false;
   const placeholderMessage = options.placeholderMessage ?? "Frame uploaded, waiting for server processing";
   showProcessedPlaceholder(placeholderMessage);
-  const frame = await captureCurrentFrame();
+  const frames = await collectFramesForUpload();
   const runtime = currentRuntimeContext();
   const sessionId = document.getElementById("stream-session-id").value.trim() || "default-session";
   const captureId = ensureCaptureBatchId();
-  const payload = {
-    session_id: sessionId,
-    capture_id: captureId,
-    algorithm_family: triggerProcessing ? runtime.family : "",
-    repo_path: runtime.repoPath,
-    cwd: runtime.cwd,
-    workspace: runtime.workspace,
-    checkpoint_path: runtime.checkpointPath,
-    image_data: frame.imageData,
-    filename: frame.filename,
-  };
-  const result = await streamFrame(getApiBaseUrl(), payload);
-  if (result.capture_id) {
-    const captureNode = document.getElementById("capture-batch-id");
-    if (captureNode) {
-      captureNode.value = result.capture_id;
+
+  let lastResult = null;
+  for (let index = 0; index < frames.length; index += 1) {
+    const frame = frames[index];
+    const payload = {
+      session_id: sessionId,
+      capture_id: captureId,
+      algorithm_family: triggerProcessing ? runtime.family : "",
+      repo_path: runtime.repoPath,
+      cwd: runtime.cwd,
+      workspace: runtime.workspace,
+      checkpoint_path: runtime.checkpointPath,
+      image_data: frame.imageData,
+      filename: frame.filename,
+    };
+    const result = await streamFrame(getApiBaseUrl(), payload);
+    lastResult = result;
+
+    if (result.capture_id) {
+      const captureNode = document.getElementById("capture-batch-id");
+      if (captureNode) {
+        captureNode.value = result.capture_id;
+      }
+    }
+
+    if (frames.length > 1) {
+      setStepResult("step3", "running", "Step 3 running", `Uploading images ${index + 1}/${frames.length} ...`);
     }
   }
+
+  const result = lastResult;
+  if (!result) {
+    throw new Error("No frame was uploaded.");
+  }
+
   if (result.viewer_url) {
     showProcessedViewer(result.viewer_url);
   } else if (result.output_url) {
@@ -824,11 +951,12 @@ async function sendCurrentFrame(options = {}) {
     viewer: result.job ? "stream-processing" : "frame-uploaded",
     source: result.input_url ?? "-",
   });
+  const uploadedText = frames.length > 1 ? `${frames.length} images` : "1 frame";
   setStepResult(
     "step3",
     "success",
     "Step 3 passed",
-    `Frame uploaded to session ${sessionId}, capture ${result.capture_id || captureId}.`,
+    `Uploaded ${uploadedText} to session ${sessionId}, capture ${result.capture_id || captureId}.`,
   );
   if (!workflowState.frameReady) {
     workflowState.frameReady = true;
@@ -836,7 +964,10 @@ async function sendCurrentFrame(options = {}) {
     workflowState.jobStarted = false;
     refreshWorkflowUI();
   }
-  return result;
+  return {
+    ...result,
+    uploaded_count: frames.length,
+  };
 }
 
 async function handleMaterializeSession() {
@@ -1490,6 +1621,62 @@ function bindEvents() {
   showProcessedPlaceholder();
   registerFlowBlockToggleHandlers();
 
+  const uploadInput = getUploadInputNode();
+  const uploadDropzone = document.getElementById("upload-dropzone");
+  const clearUploadButton = document.getElementById("clear-upload-files");
+
+  if (uploadInput) {
+    uploadInput.addEventListener("change", () => {
+      renderUploadSelectionSummary();
+      const fileCount = getSelectedUploadFiles().length;
+      if (fileCount > 0) {
+        setStepResult("step3", "idle", "Step 3 pending", `Selected ${fileCount} image(s). Click Send Frame to upload.`);
+      }
+    });
+  }
+
+  if (clearUploadButton) {
+    clearUploadButton.addEventListener("click", () => {
+      clearUploadFileSelection();
+      setStepResult("step3", "idle", "Step 3 pending", "Upload a frame or select photos.");
+    });
+  }
+
+  if (uploadDropzone) {
+    const preventDefault = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+    };
+
+    ["dragenter", "dragover"].forEach((eventName) => {
+      uploadDropzone.addEventListener(eventName, (event) => {
+        preventDefault(event);
+        uploadDropzone.classList.add("dragover");
+      });
+    });
+
+    ["dragleave", "dragend", "drop"].forEach((eventName) => {
+      uploadDropzone.addEventListener(eventName, (event) => {
+        preventDefault(event);
+        uploadDropzone.classList.remove("dragover");
+      });
+    });
+
+    uploadDropzone.addEventListener("drop", (event) => {
+      const droppedFiles = Array.from(event.dataTransfer?.files ?? []);
+      if (!droppedFiles.length) return;
+      applyDroppedUploadFiles(droppedFiles);
+      const fileCount = getSelectedUploadFiles().length;
+      if (fileCount > 0) {
+        setStepResult("step3", "idle", "Step 3 pending", `Selected ${fileCount} image(s) by drag-and-drop.`);
+      }
+    });
+  }
+
+  window.addEventListener("beforeunload", () => {
+    revokeUploadPreviewObjectUrls();
+  });
+
   document.getElementById("api-base-url").addEventListener("change", () => {
     workflowState.apiChecked = false;
     workflowState.adapterReady = false;
@@ -1737,7 +1924,7 @@ function bindEvents() {
 
   document.getElementById("send-frame").addEventListener("click", async () => {
     try {
-      setStepResult("step3", "running", "Step 3 running", "Uploading frame...");
+      setStepResult("step3", "running", "Step 3 running", "Uploading selected image(s)...");
       await sendCurrentFrame();
     } catch (error) {
       const info = formatApiError(error, "WGSC-STEP3-FRAME-001");
@@ -1755,6 +1942,9 @@ function bindEvents() {
         event.target.textContent = "Start Stream";
         updateStatus({ viewer: "stream-stopped" });
         return;
+      }
+      if (getSelectedUploadFiles().length) {
+        throw new Error("Start Stream uses camera frames only. Clear selected photos first, or click Send Frame for batch upload.");
       }
       await startCamera();
       const intervalMs = Number(document.getElementById("stream-interval-ms").value || 1000);
@@ -2037,6 +2227,10 @@ function bootstrapDefaults() {
   document.getElementById("remote-python").value = "python3";
   document.getElementById("remote-activate-cmd").value = "";
   document.getElementById("stream-session-id").value = "session-demo";
+  const uploadInput = getUploadInputNode();
+  if (uploadInput) {
+    uploadInput.value = "";
+  }
   document.getElementById("capture-batch-id").value = "";
   document.getElementById("dataset-name").value = "";
   document.getElementById("use-existing-remote-dataset").checked = false;
@@ -2063,6 +2257,7 @@ function bootstrapDefaults() {
   populateRemoteDatasetSelector([]);
   ensureCaptureBatchId(true);
   refreshRemoteDatasetSummary();
+  renderUploadSelectionSummary();
   lastJobsSnapshot = [];
   jobLogState.jobId = "";
   jobLogState.page = 1;

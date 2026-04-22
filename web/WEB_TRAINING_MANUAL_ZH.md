@@ -41,6 +41,31 @@ python -m pip install paramiko
 python train.py -s <workspace> --eval -m <output_dir>
 ```
 
+### 2.2.1 无头 COLMAP 运行环境
+
+- 自动 COLMAP 会放到 Xvfb 里执行，这样即使远端没有真实桌面也能运行。
+- 远端无头主机必须安装 `xvfb` / `xvfb-run`，否则 COLMAP 的图形初始化仍可能失败。
+- 如果希望把 OpenGL 调用转给 GPU，建议同时安装 `virtualgl` / `vglrun`；后端会在可用时自动优先使用它。
+- 如果远端只装了 `colmap`，但没有 Xvfb，仍可能出现 `qt.qpa.xcb` / display 相关错误并中断。
+- 后端会优先使用 VirtualGL；如果没有 `vglrun`，则自动退回到纯 Xvfb 方式。
+
+### 2.2.2 FCGS 远程压缩
+
+- FCGS 直接压缩已有的 3DGS 点云，不需要 COLMAP，也不需要场景优化阶段。
+- 远端仓库必须包含 `submodules/diff-gaussian-rasterization`。请用 `git clone --recursive`，或者在远端执行 `git submodule update --init --recursive`。
+- 按 [FCGS 远程配置指南](../FCGS-main/fcgs/README.md) 使用更新后的 Python 3.10 环境：Python 3.10、PyTorch 2.2.*、torchvision 0.17.*、pytorch-cuda 11.8、numpy 1.26.*、pillow 10.*、plyfile 1.1.*、tqdm 4.66.*、lpips。
+- FCGS 直接在仓库根目录运行下面这些入口：
+
+```bash
+python encode_single_scene.py --lmd 1e-4 --ply_path_from <path/to/point_cloud.ply> --bit_path_to <path/to/bitstreams> --determ 1
+python decode_single_scene.py --lmd 1e-4 --bit_path_from <path/to/bitstreams> --ply_path_to <path/to/point_cloud.ply>
+python decode_single_scene_validate.py --lmd 1e-4 --bit_path_from <path/to/bitstreams> --ply_path_to <path/to/point_cloud.ply> --source_path <path/to/scene>
+```
+
+- 支持的 `--lmd` 取值是 `1e-4`、`2e-4`、`4e-4`、`8e-4`、`16e-4`。
+- 如果 `tmc3` 不在 `PATH` 里，就手动修改 [model/gpcc_utils.py](../FCGS-main/model/gpcc_utils.py) 中两个 `change tmc3 path` 位置。
+- `checkpoints/checkpoint_*.pkl` 需要保留；选择的 `--lmd` 会对应到相应的 checkpoint。
+
 ### 2.3 推荐机器与环境
 
 | 项目 | 推荐值 | 备注 |
@@ -59,6 +84,12 @@ python train.py -s <workspace> --eval -m <output_dir>
   - torchvision 0.17.*
   - torchaudio 2.2.*
   - pytorch-cuda 12.1
+- FCGS 则建议使用 `FCGS-main/environment.yml`：
+  - Python 3.10
+  - PyTorch 2.2.*
+  - torchvision 0.17.*
+  - pytorch-cuda 11.8
+  - numpy 1.26.* / pillow 10.* / plyfile 1.1.* / tqdm 4.66.* / lpips
 - HAC++ 官方 README 还给出了 Ubuntu 20.04.1 / CUDA 11.8 / gcc 9.4.0 的实测组合。
 - 不建议再按 Python 3.8 / PyTorch 1.2 这类旧组合来配当前分支。
 - 压缩和回传链路会调用 GPCC / tmc3，远端还需要能直接执行 `tmc3`。
@@ -89,6 +120,8 @@ python train.py -s <workspace> --eval -m <output_dir>
 1. 远端 conda / 虚拟环境能正常激活：`source ~/.bashrc && conda activate HAC_env`（或使用你自己的激活命令）。
 1. 远端仓库路径可运行：`cd <repo_path> && python train.py -h`。
 1. 远端写权限正常：`touch <workspace_root>/.write_test && rm <workspace_root>/.write_test` 以及 `touch <output_root>/.write_test && rm <output_root>/.write_test`。
+1. 无头 COLMAP 运行环境可用：`command -v xvfb-run`，并且 `xvfb-run -a colmap feature_extractor -h` 可以启动。
+1. 如需 GPU OpenGL 转发，`command -v vglrun` 可用（可选，Xvfb-only 模式也能工作）。
 1. `tmc3` 可直接调用：`which tmc3` 与 `tmc3 --help`。
 1. 磁盘空间足够：`df -h`。
 1. 通过上述检查后，再执行页面的一键上传、训练、回传流程。
@@ -281,8 +314,8 @@ Remote Connecting -> Remote Uploading -> Remote Training -> Remote Downloading -
 ### Step 4 SSH Remote Check
 
 - 成功：`/api/remote-check` 返回 `WGSC-STEP4-SSH-OK`。
-- 失败：配置缺失、paramiko 缺失、网络不可达、认证失败、repo 路径不存在、远端目录不可写、远端 python 不可执行。
-- 常见代码：`WGSC-STEP4-CONFIG-001`、`WGSC-STEP4-DEPENDENCY-001`、`WGSC-STEP4-SSH-NET-001`、`WGSC-STEP4-SSH-AUTH-001`、`WGSC-STEP4-PATH-REPO-001`、`WGSC-STEP4-PATH-WRITE-001`、`WGSC-STEP4-REMOTE-PY-001`。
+- 失败：配置缺失、paramiko 缺失、网络不可达、认证失败、repo 路径不存在、远端目录不可写、远端 python 不可执行，或者在需要 COLMAP 校验时缺少无头运行环境。
+- 常见代码：`WGSC-STEP4-CONFIG-001`、`WGSC-STEP4-DEPENDENCY-001`、`WGSC-STEP4-SSH-NET-001`、`WGSC-STEP4-SSH-AUTH-001`、`WGSC-STEP4-PATH-REPO-001`、`WGSC-STEP4-PATH-WRITE-001`、`WGSC-STEP4-REMOTE-PY-001`、`WGSC-STEP5-COLMAP-TOOL-001`。
 
 ### Step 5 Start Remote Job
 
@@ -309,6 +342,8 @@ Remote Connecting -> Remote Uploading -> Remote Training -> Remote Downloading -
 | WGSC-STEP4-PATH-REPO-001 | Step4 | 远端 repo_path 不存在 | 修正为远端真实仓库目录 |
 | WGSC-STEP4-PATH-WRITE-001 | Step4 | 远端目录不可写 | 改用可写路径如 `/tmp/web_scan/...` |
 | WGSC-STEP4-REMOTE-PY-001 | Step4 | 远端 python 不可执行 | 修正 `remote.python` 或激活命令 |
+| WGSC-STEP5-COLMAP-TOOL-001 | Step4/5 | 无头 COLMAP 运行环境缺失，或 `xvfb-run` 无法拉起 COLMAP | 安装 `xvfb-run`；如需 GPU 透传 OpenGL 再装 `vglrun`；确认 `xvfb-run -a colmap feature_extractor -h` 能正常启动 |
+| WGSC-STEP5-COLMAP-REMOTE-001 | Step5 | 在无头运行时执行 COLMAP 预处理失败 | 查看远端 `runtime.log`，检查 OpenGL 驱动、图像数据、权限与 `OMP_NUM_THREADS`，修复后重试 |
 | WGSC-STEP5-OP-UNSUPPORTED-001 | Step5 | operation 无远程模板 | 切换 operation 或补齐 adapter 模板 |
 | WGSC-STEP5-WORKSPACE-001 | Step5 | workspace 缺失 | 开启 `auto_materialize` 或显式传 workspace |
 | WGSC-STEP5-WORKSPACE-002 | Step5 | workspace 目录不存在 | 检查本地路径是否存在 |

@@ -2,6 +2,30 @@
 
 ## 2026-04-20
 
+### Step3 多图上传支持
+
+- 前端上传控件增强（`web/index.html`）：
+  - `Upload Image` 改为 `Upload Images (multi-select)`，文件输入启用 `multiple`。
+
+- 前端上传逻辑增强（`web/src/core/app.js`）：
+  - 新增 `collectFramesForUpload()`，支持将多张图片转换为 data URL 并批量提交。
+  - `sendCurrentFrame()` 改为批量顺序上传：
+    - 多图时逐张调用现有 `POST /api/stream-frame`（兼容后端，无需改 API）。
+    - Step3 结果区显示上传进度与总上传数量。
+  - 保留相机模式：未选择文件时仍按原逻辑抓取当前摄像头帧上传。
+
+### Step3 批量上传体验优化
+
+- 页面交互升级（`web/index.html` + `web/styles.css`）：
+  - 将普通文件输入升级为上传面板（Upload Panel）：拖拽区、已选数量摘要、缩略图网格、清空按钮。
+  - 新增拖拽高亮态与移动端适配，提升多图选择可见性。
+
+- 前端行为增强（`web/src/core/app.js`）：
+  - 新增选择预览渲染：按已选图片生成缩略图与文件摘要，并在重选时回收对象 URL（避免内存泄漏）。
+  - 支持拖拽文件到上传区并自动填充到文件输入。
+  - 新增 `Clear Selection`，可一键清空当前多图选择。
+  - `Start Stream` 在已选文件时会给出明确提示，避免误把同一批图片循环上传。
+
 ### 远程数据集管理与自动 COLMAP（Step4/Step5）
 
 - 后端远程执行增强（`web/server/remote_executor.py`）：

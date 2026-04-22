@@ -126,8 +126,34 @@ def _assert_remote_python_available(client, remote_python: str) -> None:
     )
 
 
+def _check_remote_command_available(client, command_name: str) -> bool:
+  test_script = f"command -v {_quote(command_name)} >/dev/null 2>&1"
+  return _run_remote_command(client, f"bash -lc {_quote(test_script)}", None) == 0
+
+
+def _remote_colmap_runtime_setup_script() -> str:
+  return (
+    "OMP_NUM_THREADS_VALUE=\"${OMP_NUM_THREADS:-1}\""
+    " && case \"$OMP_NUM_THREADS_VALUE\" in \"\"|*[!0-9]*|0) OMP_NUM_THREADS_VALUE=1 ;; esac"
+    " && export OMP_NUM_THREADS=\"$OMP_NUM_THREADS_VALUE\""
+    " && export QT_QPA_PLATFORM=xcb"
+    " && if command -v vglrun >/dev/null 2>&1; then colmap_headless() { vglrun \"$@\"; }; else colmap_headless() { \"$@\"; }; fi"
+  )
+
+
+def _wrap_remote_colmap_headless_script(command_script: str) -> str:
+  runtime_script = _remote_colmap_runtime_setup_script()
+  return (
+    "command -v xvfb-run >/dev/null 2>&1"
+    f" && xvfb-run -a -s \"-screen 0 1280x1024x24\" bash -lc {_quote(runtime_script + ' && ' + command_script)}"
+  )
+
+
 def _check_remote_colmap_available(client) -> bool:
-  test_script = "colmap -h >/dev/null 2>&1"
+  test_script = _wrap_remote_colmap_headless_script(
+    "command -v colmap >/dev/null 2>&1"
+    " && colmap_headless colmap feature_extractor -h >/dev/null 2>&1"
+  )
   return _run_remote_command(client, f"bash -lc {_quote(test_script)}", None) == 0
 
 
@@ -282,16 +308,38 @@ def remote_preflight_check(
       "python": validated["python"],
     })
 
+    xvfb_run_available = _check_remote_command_available(client, "xvfb-run")
+    checks.append({
+      "name": "remote_xvfb_run",
+      "ok": xvfb_run_available,
+      "message": "Remote xvfb-run executable is available" if xvfb_run_available else "Remote xvfb-run executable not found in PATH",
+      "required": bool(check_colmap_required),
+    })
+    if check_colmap_required and not xvfb_run_available:
+      raise RemoteExecutionError(
+        "Remote xvfb-run is not available. Install Xvfb/xvfb-run before auto COLMAP workflow.",
+        code_hint="WGSC-STEP5-COLMAP-TOOL-001",
+        stage="colmap",
+      )
+
+    vglrun_available = _check_remote_command_available(client, "vglrun")
+    checks.append({
+      "name": "remote_vglrun",
+      "ok": vglrun_available,
+      "message": "Remote VirtualGL vglrun executable is available" if vglrun_available else "Remote VirtualGL vglrun not found in PATH; Xvfb fallback will be used",
+      "required": False,
+    })
+
     colmap_available = _check_remote_colmap_available(client)
     checks.append({
       "name": "remote_colmap",
       "ok": colmap_available,
-      "message": "Remote colmap executable is available" if colmap_available else "Remote colmap executable not found in PATH",
+      "message": "Remote colmap can run under Xvfb" if colmap_available else "Remote colmap failed headless preflight",
       "required": bool(check_colmap_required),
     })
     if check_colmap_required and not colmap_available:
       raise RemoteExecutionError(
-        "Remote colmap is not available. Install colmap or adjust PATH before auto COLMAP workflow.",
+        "Remote colmap cannot start under Xvfb. Install Xvfb/xvfb-run and ensure colmap is in PATH before auto COLMAP workflow.",
         code_hint="WGSC-STEP5-COLMAP-TOOL-001",
         stage="colmap",
       )
@@ -557,6 +605,7 @@ def _build_remote_colmap_script(workspace_dir: str) -> str:
   sparse_0 = str(PurePosixPath(sparse_root) / "0")
 
   steps = [
+    "command -v colmap >/dev/null 2>&1",
     f"mkdir -p {_quote(images_dir)} {_quote(distorted_sparse)} {_quote(sparse_root)}",
     (
       f"if [ -d {_quote(input_dir)} ]; then "
@@ -564,21 +613,21 @@ def _build_remote_colmap_script(workspace_dir: str) -> str:
       "fi"
     ),
     (
-      f"colmap feature_extractor "
+      f"colmap_headless colmap feature_extractor "
       f"--database_path {_quote(database_path)} "
       f"--image_path {_quote(images_dir)} "
       "--ImageReader.single_camera 1 --ImageReader.camera_model OPENCV"
     ),
-    f"colmap exhaustive_matcher --database_path {_quote(database_path)}",
+    f"colmap_headless colmap exhaustive_matcher --database_path {_quote(database_path)}",
     (
-      f"colmap mapper "
+      f"colmap_headless colmap mapper "
       f"--database_path {_quote(database_path)} "
       f"--image_path {_quote(images_dir)} "
       f"--output_path {_quote(distorted_sparse)}"
     ),
     f"if [ -d {_quote(distorted_sparse_0)} ]; then rm -rf {_quote(sparse_0)} && cp -a {_quote(distorted_sparse_0)} {_quote(sparse_0)}; fi",
   ]
-  return " && ".join(steps)
+  return _wrap_remote_colmap_headless_script(" && ".join(steps))
 
 
 def run_remote_algorithm(

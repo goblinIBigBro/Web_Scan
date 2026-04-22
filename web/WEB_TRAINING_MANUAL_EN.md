@@ -36,11 +36,37 @@ python -m pip install paramiko
 - Reachable from the local machine via SSH.
 - The account has write access to the remote workspace and output directories.
 - HAC-plus-main, training scripts, and the runtime environment are ready.
+- For auto COLMAP on a headless Linux host, install `xvfb`/`xvfb-run` and `virtualgl`/`vglrun`; the backend will run COLMAP inside Xvfb and use VirtualGL when available.
 - The remote repo path must be able to run the HAC++ training command directly, for example:
 
 ```bash
 python train.py -s <workspace> --eval -m <output_dir>
 ```
+
+### 2.2.1 Headless COLMAP runtime
+
+- Auto COLMAP is launched inside Xvfb so it can run without a real desktop display.
+- `xvfb-run` is required on the remote host for the headless COLMAP stage.
+- `vglrun` is optional but recommended when you want VirtualGL to forward OpenGL to GPU-backed rendering.
+- If only `colmap` is installed and Xvfb is missing, the COLMAP stage can still abort with `qt.qpa.xcb` / display-related errors.
+- The backend will use VirtualGL when it is available, and otherwise fall back to plain Xvfb execution.
+
+### 2.2.2 FCGS remote compression
+
+- FCGS compresses existing 3DGS point clouds directly, so it does not need COLMAP or a scene-optimization stage.
+- The remote checkout must include `submodules/diff-gaussian-rasterization`. Use `git clone --recursive` or run `git submodule update --init --recursive` on the remote host.
+- Use the updated Python 3.10 environment from [the FCGS remote guide](../FCGS-main/fcgs/README.md): Python 3.10, PyTorch 2.2.*, torchvision 0.17.*, pytorch-cuda 11.8, numpy 1.26.*, pillow 10.*, plyfile 1.1.*, tqdm 4.66.*, and lpips.
+- FCGS runs directly from the repository root with the following entrypoints:
+
+```bash
+python encode_single_scene.py --lmd 1e-4 --ply_path_from <path/to/point_cloud.ply> --bit_path_to <path/to/bitstreams> --determ 1
+python decode_single_scene.py --lmd 1e-4 --bit_path_from <path/to/bitstreams> --ply_path_to <path/to/point_cloud.ply>
+python decode_single_scene_validate.py --lmd 1e-4 --bit_path_from <path/to/bitstreams> --ply_path_to <path/to/point_cloud.ply> --source_path <path/to/scene>
+```
+
+- Supported `--lmd` values are `1e-4`, `2e-4`, `4e-4`, `8e-4`, and `16e-4`.
+- If `tmc3` is not on `PATH`, update the two fallback locations in [model/gpcc_utils.py](../FCGS-main/model/gpcc_utils.py) manually.
+- Keep the `checkpoints/checkpoint_*.pkl` files in place; the selected `--lmd` chooses the corresponding checkpoint.
 
 ### 2.3 Recommended machine and environment
 
@@ -60,6 +86,12 @@ python train.py -s <workspace> --eval -m <output_dir>
   - torchvision 0.17.*
   - torchaudio 2.2.*
   - pytorch-cuda 12.1
+- For FCGS, prefer `FCGS-main/environment.yml`:
+  - Python 3.10
+  - PyTorch 2.2.*
+  - torchvision 0.17.*
+  - pytorch-cuda 11.8
+  - numpy 1.26.* / pillow 10.* / plyfile 1.1.* / tqdm 4.66.* / lpips
 - The HAC++ README also reports a tested setup of Ubuntu 20.04.1 / CUDA 11.8 / gcc 9.4.0.
 - Do not use legacy Python 3.8 / PyTorch 1.2 style environments for this branch.
 - The compression and return path uses GPCC / `tmc3`, so the remote machine must be able to execute `tmc3` directly.
@@ -90,6 +122,8 @@ If all items below pass, it is safe to use `One-click Upload and Remote Train`.
 1. Remote conda or virtualenv activation works: `source ~/.bashrc && conda activate HAC_env` (or your own activation command).
 1. Remote repo path is executable: `cd <repo_path> && python train.py -h`.
 1. Remote write permissions are valid: `touch <workspace_root>/.write_test && rm <workspace_root>/.write_test` and `touch <output_root>/.write_test && rm <output_root>/.write_test`.
+1. Headless COLMAP runtime is available: `command -v xvfb-run` and `xvfb-run -a colmap feature_extractor -h`.
+1. VirtualGL is available when GPU OpenGL forwarding is needed: `command -v vglrun` (optional, Xvfb-only mode still works).
 1. `tmc3` is callable: `which tmc3` and `tmc3 --help`.
 1. Disk space is sufficient: `df -h`.
 1. Only after all checks pass should you run the full upload -> train -> return flow.
@@ -279,8 +313,8 @@ Response:
 ### Step 4 SSH Remote Check
 
 - Success: `/api/remote-check` returns `WGSC-STEP4-SSH-OK`.
-- Failure: invalid config, missing paramiko, SSH connectivity/auth failure, invalid remote paths, non-executable remote python.
-- Typical codes: `WGSC-STEP4-CONFIG-001`, `WGSC-STEP4-DEPENDENCY-001`, `WGSC-STEP4-SSH-NET-001`, `WGSC-STEP4-SSH-AUTH-001`, `WGSC-STEP4-PATH-REPO-001`, `WGSC-STEP4-PATH-WRITE-001`, `WGSC-STEP4-REMOTE-PY-001`.
+- Failure: invalid config, missing paramiko, SSH connectivity/auth failure, invalid remote paths, non-executable remote python, or missing headless COLMAP runtime when COLMAP validation is required.
+- Typical codes: `WGSC-STEP4-CONFIG-001`, `WGSC-STEP4-DEPENDENCY-001`, `WGSC-STEP4-SSH-NET-001`, `WGSC-STEP4-SSH-AUTH-001`, `WGSC-STEP4-PATH-REPO-001`, `WGSC-STEP4-PATH-WRITE-001`, `WGSC-STEP4-REMOTE-PY-001`, `WGSC-STEP5-COLMAP-TOOL-001`.
 
 ### Step 5 Start Remote Job
 
@@ -307,6 +341,8 @@ Response:
 | WGSC-STEP4-PATH-REPO-001 | Step4 | Remote repo path not found | Use actual repo directory on remote host |
 | WGSC-STEP4-PATH-WRITE-001 | Step4 | Remote workspace/output not writable | Switch to writable path like `/tmp/web_scan/...` |
 | WGSC-STEP4-REMOTE-PY-001 | Step4 | Remote python not executable | Fix `remote.python` or activate command |
+| WGSC-STEP5-COLMAP-TOOL-001 | Step4/5 | Headless COLMAP runtime is missing or `xvfb-run` cannot launch COLMAP | Install `xvfb-run`; install `vglrun` if GPU-forwarded OpenGL is needed; verify `xvfb-run -a colmap feature_extractor -h` succeeds |
+| WGSC-STEP5-COLMAP-REMOTE-001 | Step5 | COLMAP preprocessing failed under the headless runtime | Inspect the remote `runtime.log`, check OpenGL drivers, dataset images, permissions, and `OMP_NUM_THREADS`, then retry |
 | WGSC-STEP5-OP-UNSUPPORTED-001 | Step5 | No remote template for selected operation | Switch operation or update adapter template |
 | WGSC-STEP5-WORKSPACE-001 | Step5 | Workspace missing | Enable `auto_materialize` or provide workspace |
 | WGSC-STEP5-WORKSPACE-002 | Step5 | Workspace does not exist | Fix local workspace path |

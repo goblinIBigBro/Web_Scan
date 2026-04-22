@@ -419,11 +419,17 @@ def prepare_colmap_workspace(
   if convert_script and convert_script.exists():
     suggested_command = f"python {convert_script} -s {workspace_root}"
   else:
-    suggested_command = (
-      "colmap feature_extractor --database_path "
-      f"{workspace_root / 'distorted' / 'database.db'} --image_path {input_dir} "
+    colmap_prepare_script = (
+      "OMP_NUM_THREADS_VALUE=\"${OMP_NUM_THREADS:-1}\""
+      " && case \"$OMP_NUM_THREADS_VALUE\" in \"\"|*[!0-9]*|0) OMP_NUM_THREADS_VALUE=1 ;; esac"
+      " && export OMP_NUM_THREADS=\"$OMP_NUM_THREADS_VALUE\""
+      " && export QT_QPA_PLATFORM=xcb"
+      " && if command -v vglrun >/dev/null 2>&1; then colmap_headless() { vglrun \"$@\"; }; else colmap_headless() { \"$@\"; }; fi"
+      f" && command -v colmap >/dev/null 2>&1"
+      f" && colmap_headless colmap feature_extractor --database_path {workspace_root / 'distorted' / 'database.db'} --image_path {input_dir} "
       "--ImageReader.single_camera 1 --ImageReader.camera_model OPENCV"
     )
+    suggested_command = f'xvfb-run -a -s "-screen 0 1280x1024x24" bash -lc {shlex.quote(colmap_prepare_script)}'
 
   manifest = {
     "version": "0.1.0",

@@ -53,7 +53,7 @@ python train.py -s <workspace> --eval -m <output_dir>
 
 ### 2.2.2 FCGS remote compression
 
-- FCGS compresses existing 3DGS point clouds directly, so it does not need COLMAP or a scene-optimization stage.
+- FCGS compression entrypoints directly consume existing 3DGS point clouds, but if your upstream data still has to be prepared from images or you want to run validation / scene-related flows, the remote host still needs COLMAP.
 - The remote checkout must include `submodules/diff-gaussian-rasterization`. Use `git clone --recursive` or run `git submodule update --init --recursive` on the remote host.
 - Use the updated Python 3.10 environment from [the FCGS remote guide](../FCGS-main/fcgs/README.md): Python 3.10, PyTorch 2.2.*, torchvision 0.17.*, pytorch-cuda 11.8, numpy 1.26.*, pillow 10.*, plyfile 1.1.*, tqdm 4.66.*, and lpips.
 - FCGS runs directly from the repository root with the following entrypoints:

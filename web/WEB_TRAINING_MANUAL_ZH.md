@@ -51,7 +51,7 @@ python train.py -s <workspace> --eval -m <output_dir>
 
 ### 2.2.2 FCGS 远程压缩
 
-- FCGS 直接压缩已有的 3DGS 点云，不需要 COLMAP，也不需要场景优化阶段。
+- FCGS 的压缩入口本身直接处理已有的 3DGS 点云，但如果你的上游数据需要从图像准备 3DGS，或者要跑验证/场景相关流程，远端仍需要 COLMAP。
 - 远端仓库必须包含 `submodules/diff-gaussian-rasterization`。请用 `git clone --recursive`，或者在远端执行 `git submodule update --init --recursive`。
 - 按 [FCGS 远程配置指南](../FCGS-main/fcgs/README.md) 使用更新后的 Python 3.10 环境：Python 3.10、PyTorch 2.2.*、torchvision 0.17.*、pytorch-cuda 11.8、numpy 1.26.*、pillow 10.*、plyfile 1.1.*、tqdm 4.66.*、lpips。
 - FCGS 直接在仓库根目录运行下面这些入口：

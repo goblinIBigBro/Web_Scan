@@ -43,11 +43,69 @@ python train.py -s <workspace> --eval -m <output_dir>
 
 ### 2.2.1 无头 COLMAP 运行环境
 
-- 自动 COLMAP 会放到 Xvfb 里执行，这样即使远端没有真实桌面也能运行。
+#### 基本原理
+
+- 自动 COLMAP 会放到 Xvfb（虚拟 X 服务器）里执行，这样即使远端没有真实桌面也能运行。
 - 远端无头主机必须安装 `xvfb` / `xvfb-run`，否则 COLMAP 的图形初始化仍可能失败。
 - 如果希望把 OpenGL 调用转给 GPU，建议同时安装 `virtualgl` / `vglrun`；后端会在可用时自动优先使用它。
 - 如果远端只装了 `colmap`，但没有 Xvfb，仍可能出现 `qt.qpa.xcb` / display 相关错误并中断。
-- 后端会优先使用 VirtualGL；如果没有 `vglrun`，则自动退回到纯 Xvfb 方式。
+
+#### VirtualGL / Xvfb 自动降级策略
+
+后端运行时自动选择最优的执行环境：
+
+1. **优先级1：VirtualGL 模式**（最优，需要 GPU OpenGL 透传）
+   - 条件：`vglrun` 可用 + `xvfb-run` 可用 + GPU 可见
+   - 效果：COLMAP 的 OpenGL 调用通过 VirtualGL 转给 GPU 处理，性能最佳
+   - 命令：`xvfb-run -a ... vglrun colmap feature_extractor ...`
+
+2. **优先级2：Xvfb-only 模式**（降级，CPU 渲染）
+   - 条件：`vglrun` 不可用，但 `xvfb-run` 可用
+   - 效果：COLMAP 在虚拟显示中使用 CPU 进行 OpenGL 渲染，速度较慢但可工作
+   - 命令：`xvfb-run -a ... colmap feature_extractor ...`
+
+3. **失败状态**（不支持）
+   - 条件：`xvfb-run` 不可用
+   - 结果：返回错误 `WGSC-STEP5-COLMAP-TOOL-001`，需要安装 Xvfb
+
+#### 执行时的环境变量
+
+后端在运行 COLMAP 前会设置以下环境变量：
+
+```bash
+# 设置 OMP 线程数（防止过度并发，默认1）
+export OMP_NUM_THREADS="1"
+
+# 设置 Qt 平台为 xcb（X11 兼容模式）
+export QT_QPA_PLATFORM=xcb
+```
+
+这些设置确保 COLMAP 能在无显示环境下正确初始化 Qt 图形库。
+
+#### 安装指南
+
+**远端主机上的必需安装**：
+
+```bash
+# Ubuntu 20.04 / 22.04
+sudo apt-get update
+sudo apt-get install -y xvfb
+
+# 可选：GPU OpenGL 透传（推荐大场景使用）
+sudo apt-get install -y virtualgl
+```
+
+**验证安装**：
+
+```bash
+# 检查 xvfb-run
+command -v xvfb-run
+xvfb-run -a colmap feature_extractor -h
+
+# 检查 VirtualGL（如果已安装）
+command -v vglrun
+vglrun colmap feature_extractor -h
+```
 
 ### 2.2.2 FCGS 远程压缩
 
@@ -113,18 +171,67 @@ python decode_single_scene_validate.py --lmd 1e-4 --bit_path_from <path/to/bitst
 
 只要下面这些检查都通过，就可以放心点页面里的 `One-click Upload and Remote Train`。
 
-1. 本地依赖可用：`python -m pip install paramiko`。
-1. 本地到远端 SSH 可登录：`ssh <user>@<host> -p <port>`。
-1. 远端 GPU 可见：`nvidia-smi`。
-1. 远端 Python 和 PyTorch 可用：`python -V` 与 `python -c "import torch; print(torch.__version__, torch.cuda.is_available())"`。
-1. 远端 conda / 虚拟环境能正常激活：`source ~/.bashrc && conda activate HAC_env`（或使用你自己的激活命令）。
-1. 远端仓库路径可运行：`cd <repo_path> && python train.py -h`。
-1. 远端写权限正常：`touch <workspace_root>/.write_test && rm <workspace_root>/.write_test` 以及 `touch <output_root>/.write_test && rm <output_root>/.write_test`。
-1. 无头 COLMAP 运行环境可用：`command -v xvfb-run`，并且 `xvfb-run -a colmap feature_extractor -h` 可以启动。
-1. 如需 GPU OpenGL 转发，`command -v vglrun` 可用（可选，Xvfb-only 模式也能工作）。
-1. `tmc3` 可直接调用：`which tmc3` 与 `tmc3 --help`。
-1. 磁盘空间足够：`df -h`。
-1. 通过上述检查后，再执行页面的一键上传、训练、回传流程。
+1. **本地依赖**：`python -m pip install paramiko`。
+
+2. **SSH 连接**：`ssh <user>@<host> -p <port>`。
+   - 验证能否直接登录远端
+   - 如失败：检查 host/port/用户名/密码
+
+3. **远端 GPU**：`nvidia-smi`。
+   - 确认 GPU 可见且驱动正常
+   - 如失败：检查驱动安装、cuda-toolkit 版本
+
+4. **远端 Python 和 PyTorch**：
+   ```bash
+   python -V
+   python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+   ```
+   - 验证 Python 版本 ≥ 3.10
+   - 验证 PyTorch 已正确安装且 CUDA 可用
+
+5. **远端环境激活**：`source ~/.bashrc && conda activate HAC_env`。
+   - 根据实际配置替换激活命令
+   - 如失败：检查 `.bashrc` 或 `~/.profile`
+
+6. **远端仓库可运行**：`cd <repo_path> && python train.py -h`。
+   - 验证仓库路径正确且包含 `train.py`
+   - 验证 Python 能导入项目模块
+
+7. **远端写权限**：
+   ```bash
+   touch <workspace_root>/.write_test && rm <workspace_root>/.write_test
+   touch <output_root>/.write_test && rm <output_root>/.write_test
+   ```
+   - 确认两个目录都可写
+   - 如失败：改用 `/tmp/web_scan/...` 等可写路径
+
+8. **无头 COLMAP 工具**：
+   ```bash
+   command -v xvfb-run
+   xvfb-run -a colmap feature_extractor -h
+   ```
+   - 验证 `xvfb-run` 可执行
+   - 验证 COLMAP 能在虚拟显示中启动
+   - **如失败**：执行 `sudo apt-get install -y xvfb`
+
+9. **GPU OpenGL 转发（可选但推荐）**：
+   ```bash
+   command -v vglrun
+   vglrun colmap feature_extractor -h
+   ```
+   - 检查 VirtualGL 是否可用
+   - 如不可用，系统会自动降级到 Xvfb-only
+   - **如希望启用**：执行 `sudo apt-get install -y virtualgl`
+
+10. **tmc3 压缩工具**：`which tmc3 && tmc3 --help`。
+    - 确认 tmc3 在 PATH 中（用于后端压缩阶段）
+    - 如失败：安装或配置 GPCC 工具链
+
+11. **磁盘空间**：`df -h`。
+    - 确认 `/tmp` 和数据目录有足够空间（建议 200GB+）
+    - 计算方式：图像数据 + workspace 临时文件 + output 结果
+
+12. **通过以上检查后**：在页面执行 `Check SSH` 按钮再次验证远端状态，然后点击 `One-click Upload and Remote Train`。
 
 ### 2.6 当前支持与未来占位
 
@@ -325,7 +432,186 @@ Remote Connecting -> Remote Uploading -> Remote Training -> Remote Downloading -
 
 ---
 
-## 9. 常见错误码与解决方案
+## 10. 远程 COLMAP 工作流详解
+
+### 10.1 何时触发 COLMAP
+
+**在以下场景自动触发 COLMAP 预处理**：
+
+1. 上传多张图像但缺少 `sparse/0/cameras.bin` 等稀疏重建文件
+2. 远端 workspace 为空或不完整
+3. 数据需要从原始图像进行 3D 重建
+
+**不触发 COLMAP 的场景**：
+
+1. 已上传完整的稀疏重建（camera、images、points 文件都存在）
+2. 使用 FCGS 等不需要 COLMAP 的纯压缩流程（直接输入点云 PLY）
+
+### 10.2 Step 4 验证阶段（远端预检查）
+
+**点击 `Check SSH` 按钮时执行**：
+
+```
+本地 server
+    ↓ （SSH 登录）
+远端主机
+    ├─ 检查 SSH 连接和身份认证
+    ├─ 检查 workspace_root / output_root 写权限
+    ├─ 检查 repo_path 存在性
+    ├─ 检查 remote_python 可执行
+    │
+    ├─ 如果 family 需要 COLMAP：
+    │  ├─ 检查 `xvfb-run` 可用
+    │  ├─ 检查 `vglrun` 可用（可选）
+    │  └─ 测试运行：xvfb-run -a colmap feature_extractor -h
+    │
+    └─ 返回检查结果
+        ↓
+本地 UI（显示通过/失败）
+```
+
+**检查项详情**：
+
+| 检查项 | 命令 | 是否必需 | 失败处理 |
+|--------|------|---------|---------|
+| xvfb-run | `command -v xvfb-run` | 需要 COLMAP 时必需 | `WGSC-STEP5-COLMAP-TOOL-001` → 安装 Xvfb |
+| vglrun | `command -v vglrun` | 可选 | 警告，自动降级到 Xvfb-only |
+| COLMAP 可执行 | `xvfb-run -a colmap feature_extractor -h` | 需要 COLMAP 时必需 | `WGSC-STEP5-COLMAP-TOOL-001` → 检查 COLMAP 安装 |
+
+### 10.3 Step 5 执行阶段（远端运行）
+
+**点击 `One-click Upload and Remote Train` 后的流程**：
+
+```
+本地
+├─ 上传图像数据到 <workspace_root>/<session_id>/<family>/<job_id>/input/
+└─ 返回 workspace 路径给后端
+
+远端主机（run_remote_algorithm）
+├─ Step 1: 验证 COLMAP 必需
+│  └─ 若需要 → 执行 COLMAP 预处理
+│
+├─ Step 2: 设置运行时环境变量
+│  ├─ OMP_NUM_THREADS=1（或外部指定值）
+│  ├─ QT_QPA_PLATFORM=xcb
+│  └─ 定义 colmap_headless() 函数
+│
+├─ Step 3: 自动选择执行模式
+│  ├─ 若 vglrun 可用 → 使用 VirtualGL 模式
+│  └─ 否则 → 使用 Xvfb-only 模式
+│
+├─ Step 4: 执行 COLMAP 命令
+│  └─ xvfb-run -a -s "-screen 0 1280x1024x24" bash -lc '
+│       OMP_NUM_THREADS=1 QT_QPA_PLATFORM=xcb
+│       colmap_headless colmap feature_extractor \
+│         --database_path <workspace>/distorted/database.db \
+│         --image_path <workspace>/input \
+│         --ImageReader.single_camera 1 \
+│         --ImageReader.camera_model OPENCV
+│     '
+│
+└─ 继续执行后续训练流程（HAC++ train.py）
+
+结果回传本地
+├─ 稀疏重建文件（cameras.bin、images.bin、points3D.bin）
+├─ 训练结果（point_cloud.ply）
+└─ 指标日志（metrics.csv）
+```
+
+### 10.4 环境变量说明
+
+**OMP_NUM_THREADS**
+
+- **默认值**：1（保守值，防止过度并发造成内存溢出）
+- **可调范围**：1 ~ CPU 核数
+- **优化建议**：
+  - 小场景（<200 张图）：保留默认 1
+  - 中等场景（200-500 张）：设置为 2-4
+  - 大场景（>500 张）：设置为 CPU 核数的 50-75%
+- **设置方法**（在远端执行前）：`export OMP_NUM_THREADS=4`
+
+**QT_QPA_PLATFORM**
+
+- **值**：`xcb`（X11 兼容模式）
+- **作用**：强制 Qt 使用 X11 backend，避免 Wayland 或其他显示服务器冲突
+
+### 10.5 VirtualGL vs Xvfb 对比
+
+| 对比项 | VirtualGL 模式 | Xvfb-only 模式 |
+|--------|---------------|----------------|
+| 依赖 | vglrun + Xvfb | Xvfb 只 |
+| 性能 | 快（GPU 加速） | 慢（CPU 渲染） |
+| OpenGL | GPU 处理 | CPU 软件实现 |
+| 适用场景 | 大场景、GPU 充足 | 小场景、无 GPU 或演示 |
+| 故障率 | 低（成熟方案） | 极低（无需 GPU 驱动） |
+
+### 10.6 常见问题与诊断
+
+#### 问题：`qt.qpa.xcb: Could not connect to display`
+
+**原因**：Xvfb 未成功启动或虚拟显示初始化失败
+
+**诊断**：
+```bash
+# 手动测试 Xvfb
+Xvfb :99 -screen 0 1280x1024x24 &
+export DISPLAY=:99
+colmap feature_extractor -h
+```
+
+**修复**：
+```bash
+# 重新安装 Xvfb
+sudo apt-get remove -y xvfb
+sudo apt-get install -y xvfb
+# 验证
+xvfb-run -a glxgears
+```
+
+#### 问题：COLMAP 进程被 killed（OOM）
+
+**原因**：内存不足或 OMP_NUM_THREADS 设置过高
+
+**诊断**：
+```bash
+free -h
+grep OMP_NUM_THREADS ~/.bashrc  # 查看当前设置
+dmesg | tail -20  # 查看内存 OOM 日志
+```
+
+**修复**：
+```bash
+# 降低线程数
+export OMP_NUM_THREADS=1
+# 清理临时文件
+rm -rf /tmp/web_scan/workspaces/*/workspace/distorted/*
+# 检查磁盘空间
+du -sh <workspace_root>
+```
+
+#### 问题：`vglrun: command not found`（但不影响运行）
+
+**原因**：VirtualGL 未安装
+
+**诊断**：
+```bash
+command -v vglrun  # 返回空
+dpkg -l | grep virtualgl
+```
+
+**恢复方案**：
+- 若不装 VirtualGL：系统自动降级到 Xvfb-only，功能不变，仅速度略慢
+- 若想启用 GPU 透传：`sudo apt-get install -y virtualgl`
+
+### 10.7 性能优化建议
+
+1. **预先测试 COLMAP**：在远端单独运行一次小规模数据集的 COLMAP，验证环境
+2. **调整 OMP_NUM_THREADS**：根据 CPU 核数和内存调参
+3. **使用 GPU 加速**：安装 VirtualGL + 高端 GPU（RTX 4090 等）
+4. **网络优化**：上传图像前压缩，减少传输时间
+5. **监控资源**：在远端终端执行 `watch -n 1 'nvidia-smi && free -h'` 实时观察
+
+---
 
 | 错误码 | 步骤 | 含义 | 处理建议 |
 | --- | --- | --- | --- |
@@ -342,8 +628,8 @@ Remote Connecting -> Remote Uploading -> Remote Training -> Remote Downloading -
 | WGSC-STEP4-PATH-REPO-001 | Step4 | 远端 repo_path 不存在 | 修正为远端真实仓库目录 |
 | WGSC-STEP4-PATH-WRITE-001 | Step4 | 远端目录不可写 | 改用可写路径如 `/tmp/web_scan/...` |
 | WGSC-STEP4-REMOTE-PY-001 | Step4 | 远端 python 不可执行 | 修正 `remote.python` 或激活命令 |
-| WGSC-STEP5-COLMAP-TOOL-001 | Step4/5 | 无头 COLMAP 运行环境缺失，或 `xvfb-run` 无法拉起 COLMAP | 安装 `xvfb-run`；如需 GPU 透传 OpenGL 再装 `vglrun`；确认 `xvfb-run -a colmap feature_extractor -h` 能正常启动 |
-| WGSC-STEP5-COLMAP-REMOTE-001 | Step5 | 在无头运行时执行 COLMAP 预处理失败 | 查看远端 `runtime.log`，检查 OpenGL 驱动、图像数据、权限与 `OMP_NUM_THREADS`，修复后重试 |
+| WGSC-STEP5-COLMAP-TOOL-001 | Step4/5 | 无头 COLMAP 运行环境缺失，或 `xvfb-run` 无法拉起 COLMAP | **安装 Xvfb**：`sudo apt-get install -y xvfb`；**验证**：`xvfb-run -a colmap feature_extractor -h`；如需 GPU 透传再装 `vglrun`：`sudo apt-get install -y virtualgl` |
+| WGSC-STEP5-COLMAP-REMOTE-001 | Step5 | 远端 COLMAP 预处理失败，可能原因：OpenGL 驱动缺失、图像数据权限、虚拟显示配置错误、OMP_NUM_THREADS 设置不当 | **查看日志**：`tail -f /tmp/web_scan/outputs/.../runtime.log`；**检查项**：1) OpenGL：`glxinfo \| grep vendor`；2) 图像权限：`ls -l <input_dir>`；3) OMP 线程：`echo $OMP_NUM_THREADS`；4) Xvfb：`ps aux \| grep Xvfb`；**常见修复**：调高 OMP_NUM_THREADS 至 CPU 核数、检查磁盘空间、重新安装驱动 |
 | WGSC-STEP5-OP-UNSUPPORTED-001 | Step5 | operation 无远程模板 | 切换 operation 或补齐 adapter 模板 |
 | WGSC-STEP5-WORKSPACE-001 | Step5 | workspace 缺失 | 开启 `auto_materialize` 或显式传 workspace |
 | WGSC-STEP5-WORKSPACE-002 | Step5 | workspace 目录不存在 | 检查本地路径是否存在 |

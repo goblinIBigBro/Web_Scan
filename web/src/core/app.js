@@ -243,6 +243,148 @@ function getSelectedRemoteDataset() {
   };
 }
 
+function normalizeRemotePath(path) {
+  const raw = String(path || "").trim().replaceAll("\\", "/");
+  return raw.replace(/\/+$/, "");
+}
+
+function getAvailableFamilies() {
+  const families = (Array.isArray(serverAlgorithms) ? serverAlgorithms : [])
+    .map((item) => String(item?.family || "").trim())
+    .filter(Boolean);
+  return Array.from(new Set(families)).sort();
+}
+
+function deriveDatasetCoverage(dataset) {
+  const apiCoverage = dataset?.training_coverage;
+  if (apiCoverage && typeof apiCoverage === "object") {
+    const available = Array.isArray(apiCoverage.available_families)
+      ? apiCoverage.available_families.map((item) => String(item || "").trim()).filter(Boolean)
+      : getAvailableFamilies();
+    const trained = Array.isArray(apiCoverage.trained_families)
+      ? apiCoverage.trained_families.map((item) => String(item || "").trim()).filter(Boolean)
+      : [];
+    const failed = Array.isArray(apiCoverage.failed_families)
+      ? apiCoverage.failed_families.map((item) => String(item || "").trim()).filter(Boolean)
+      : [];
+    const running = Array.isArray(apiCoverage.running_families)
+      ? apiCoverage.running_families.map((item) => String(item || "").trim()).filter(Boolean)
+      : [];
+    const missing = Array.isArray(apiCoverage.missing_families)
+      ? apiCoverage.missing_families.map((item) => String(item || "").trim()).filter(Boolean)
+      : available.filter((item) => !trained.includes(item));
+    return { available, trained, failed, running, missing };
+  }
+
+  const available = getAvailableFamilies();
+  const datasetId = String(dataset?.id || "").trim();
+  const datasetPath = normalizeRemotePath(dataset?.path || "");
+  const trainedSet = new Set();
+  const failedSet = new Set();
+  const runningSet = new Set();
+  (Array.isArray(lastJobsSnapshot) ? lastJobsSnapshot : []).forEach((job) => {
+    if (String(job?.operation || "") !== "remote_train") return;
+    const family = String(job?.algorithm_family || "").trim();
+    if (!family) return;
+    const jobDatasetId = String(job?.remote_result?.remote_dataset_id || job?.remote_dataset_id || "").trim();
+    const jobDatasetPath = normalizeRemotePath(job?.remote_result?.remote_dataset_workspace || job?.remote_dataset_path || "");
+    if (!jobDatasetId && !jobDatasetPath) return;
+    const matchesDataset = (datasetId && jobDatasetId && datasetId === jobDatasetId)
+      || (datasetPath && jobDatasetPath && datasetPath === jobDatasetPath);
+    if (!matchesDataset) return;
+    const status = String(job?.status || "").trim().toLowerCase();
+    if (status === "completed") {
+      trainedSet.add(family);
+    } else if (status === "failed") {
+      failedSet.add(family);
+    } else if (status === "running" || status === "queued") {
+      runningSet.add(family);
+    }
+  });
+
+  const trained = Array.from(trainedSet).sort();
+  return {
+    available,
+    trained,
+    failed: Array.from(failedSet).sort(),
+    running: Array.from(runningSet).sort(),
+    missing: available.filter((item) => !trainedSet.has(item)),
+  };
+}
+
+function summarizeFamilies(families, emptyText = "None") {
+  if (!families?.length) return emptyText;
+  if (families.length <= 3) return families.join(", ");
+  return `${families.slice(0, 3).join(", ")} +${families.length - 3}`;
+}
+
+function renderRemoteDatasetLibrary(report = null) {
+  const container = document.getElementById("remote-dataset-library");
+  if (!container) return;
+
+  const datasets = Array.isArray(report?.datasets) ? report.datasets : [];
+  if (!datasets.length) {
+    container.innerHTML = '<p class="dataset-library-empty">Run Check SSH to load reusable remote datasets.</p>';
+    return;
+  }
+
+  const selected = getSelectedRemoteDataset();
+  const useExisting = isUseExistingRemoteDataset();
+
+  container.innerHTML = datasets
+    .map((dataset) => {
+      const id = String(dataset?.id || "").trim();
+      const name = String(dataset?.name || id || "Unnamed dataset").trim();
+      const frameCount = Number(dataset?.frame_count || 0);
+      const stage = dataset?.stage || {};
+      const hasRaw = Boolean(stage?.raw ?? dataset?.has_input_images);
+      const hasSparse = Boolean(stage?.sparse ?? dataset?.has_sparse_model);
+      const hasUndistorted = Boolean(stage?.undistorted ?? dataset?.has_undistorted_marker);
+      const coverage = deriveDatasetCoverage(dataset);
+
+      const cardClasses = ["dataset-card"];
+      if (id && id === selected.id) cardClasses.push("selected");
+      if (useExisting && id && id === selected.id) cardClasses.push("using-existing");
+
+      return `
+        <article class="${cardClasses.join(" ")}" data-dataset-id="${escapeHtml(id)}">
+          <header class="dataset-card-head">
+            <h4>${escapeHtml(name)}</h4>
+            <p>${escapeHtml(id || "(no id)")}</p>
+          </header>
+          <div class="dataset-stage-row">
+            <span class="dataset-badge ${hasRaw ? "ok" : "missing"}">Stage1 Raw ${hasRaw ? "Ready" : "Missing"}</span>
+            <span class="dataset-badge ${hasSparse ? "ok" : "missing"}">Stage2 Sparse ${hasSparse ? "Ready" : "Missing"}</span>
+            <span class="dataset-badge ${hasUndistorted ? "ok" : "missing"}">Undistorted ${hasUndistorted ? "Yes" : "No"}</span>
+          </div>
+          <p class="dataset-meta">Frames: ${Number.isFinite(frameCount) && frameCount > 0 ? frameCount : "unknown"} · Sparse files: ${Number(dataset?.sparse_file_count || 0)}</p>
+          <p class="dataset-meta">Trained: ${escapeHtml(summarizeFamilies(coverage.trained))}</p>
+          <p class="dataset-meta">Missing: ${escapeHtml(summarizeFamilies(coverage.missing))}</p>
+          <p class="dataset-meta">Failed: ${escapeHtml(summarizeFamilies(coverage.failed))}</p>
+          <button type="button" class="dataset-select-btn" data-select-dataset-id="${escapeHtml(id)}">Use this dataset</button>
+        </article>
+      `;
+    })
+    .join("");
+
+  container.querySelectorAll("[data-select-dataset-id]").forEach((buttonNode) => {
+    buttonNode.addEventListener("click", () => {
+      const datasetId = String(buttonNode.getAttribute("data-select-dataset-id") || "").trim();
+      if (!datasetId) return;
+      const selector = document.getElementById("remote-dataset-select");
+      const useExistingNode = document.getElementById("use-existing-remote-dataset");
+      if (selector) {
+        selector.value = datasetId;
+      }
+      if (useExistingNode) {
+        useExistingNode.checked = true;
+      }
+      refreshRemoteDatasetSummary(lastRemoteCheckReport);
+      refreshWorkflowUI();
+    });
+  });
+}
+
 function populateRemoteDatasetSelector(datasets) {
   const select = document.getElementById("remote-dataset-select");
   if (!select) return;
@@ -259,11 +401,13 @@ function populateRemoteDatasetSelector(datasets) {
     if (!id) return;
     const path = String(dataset?.path || "").trim();
     const frameCount = Number(dataset?.frame_count || 0);
-    const marker = String(dataset?.latest_marker || "").trim();
+    const stageLabel = String(dataset?.stage_label || dataset?.stage?.label || "").trim();
+    const trainedCount = Number(dataset?.trained_families?.length || 0);
     const summary = [
       id,
       frameCount > 0 ? `${frameCount} frames` : "frames unknown",
-      marker || "no marker",
+      stageLabel || "stage unknown",
+      trainedCount > 0 ? `${trainedCount} trained` : "not trained",
     ].join(" · ");
     options.push(`<option value="${escapeHtml(id)}" data-path="${escapeHtml(path)}">${escapeHtml(summary)}</option>`);
   });
@@ -278,6 +422,8 @@ function refreshRemoteDatasetSummary(report = null) {
   const summary = document.getElementById("remote-dataset-summary");
   if (!summary) return;
 
+  renderRemoteDatasetLibrary(report);
+
   const customPath = document.getElementById("remote-dataset-path")?.value.trim() || "";
   const selected = getSelectedRemoteDataset();
   const useExisting = isUseExistingRemoteDataset();
@@ -291,7 +437,11 @@ function refreshRemoteDatasetSummary(report = null) {
       return;
     }
     if (selected.id) {
-      summary.textContent = `Using existing remote dataset: ${selected.id}`;
+      const selectedDataset = (Array.isArray(report?.datasets) ? report.datasets : []).find(
+        (item) => String(item?.id || "").trim() === selected.id,
+      );
+      const coverage = deriveDatasetCoverage(selectedDataset || {});
+      summary.textContent = `Using existing remote dataset: ${selected.id}. Trained ${coverage.trained.length}/${coverage.available.length}, missing ${coverage.missing.length}.`;
       return;
     }
     summary.textContent = "Existing dataset mode is enabled. Please select a dataset or fill custom path.";
@@ -334,6 +484,9 @@ function registerFlowBlockToggleHandlers() {
 
 function flowStateForBlock(blockId) {
   const useExisting = isUseExistingRemoteDataset();
+  const remoteDatasetPath = document.getElementById("remote-dataset-path")?.value.trim() || "";
+  const selectedRemoteDataset = getSelectedRemoteDataset();
+  const existingDatasetReady = Boolean(remoteDatasetPath || selectedRemoteDataset.id);
   if (blockId === "flow-runtime") {
     if (!workflowState.apiChecked || !workflowState.adapterReady) {
       return "active";
@@ -346,11 +499,16 @@ function flowStateForBlock(blockId) {
   }
   if (blockId === "flow-remote-config") {
     if (!workflowState.adapterReady) return "locked";
-    if (!workflowState.frameReady && !useExisting) return "locked";
     return workflowState.remoteConfigReady && workflowState.sshChecked ? "done" : "active";
   }
   if (blockId === "flow-remote-run") {
-    if ((!workflowState.frameReady && !useExisting) || !workflowState.remoteConfigReady || !workflowState.sshChecked) {
+    if (!workflowState.remoteConfigReady || !workflowState.sshChecked) {
+      return "locked";
+    }
+    if (!useExisting && !workflowState.frameReady) {
+      return "locked";
+    }
+    if (useExisting && !existingDatasetReady) {
       return "locked";
     }
     return workflowState.jobStarted ? "done" : "active";
@@ -443,10 +601,6 @@ function refreshWorkflowHint() {
     node.textContent = "Step 2: Validate adapter capability.";
     return;
   }
-  if (!workflowState.frameReady && !useExisting) {
-    node.textContent = "Step 3: Please send at least one frame (Send Frame).";
-    return;
-  }
   if (!workflowState.remoteConfigReady) {
     node.textContent = "Step 4: Fill remote host/user/password and remote paths, then run Check SSH.";
     return;
@@ -463,6 +617,10 @@ function refreshWorkflowHint() {
   const selectedRemoteDataset = getSelectedRemoteDataset();
   if (useExisting && !remoteDatasetPath && !selectedRemoteDataset.id) {
     node.textContent = "Step 5: Existing dataset mode is on. Select a remote dataset or enter remote dataset path.";
+    return;
+  }
+  if (!useExisting && !workflowState.frameReady) {
+    node.textContent = "Step 3: Upload photos (or capture one frame) before Step 5 upload-train mode.";
     return;
   }
   if (!workflowState.jobStarted) {
@@ -485,9 +643,10 @@ function refreshWorkflowUI() {
   const canSession = workflowState.frameReady;
   const canRunJob = workflowState.sessionReady;
   const canRefreshJobs = workflowState.apiChecked;
-  const canRemoteCheck = canCapture && (canSession || useExisting) && workflowState.remoteConfigReady;
+  const canRemoteCheck = canCapture && workflowState.remoteConfigReady;
   const canRemoteTrain =
     canCapture
+    && (useExisting || workflowState.frameReady)
     && workflowState.remoteConfigReady
     && workflowState.sshChecked
     && selectedOperationSupportsRemote()
@@ -531,7 +690,7 @@ function refreshWorkflowUI() {
     setStepPill("step-pill-capture", workflowState.frameReady ? "done" : "active", workflowState.frameReady ? "Done" : "Active");
   }
 
-  if (!workflowState.frameReady && !useExisting) {
+  if (!workflowState.adapterReady) {
     setStepPill("step-pill-session", "locked", "Locked");
   } else {
     setStepPill(
@@ -541,7 +700,12 @@ function refreshWorkflowUI() {
     );
   }
 
-  if ((!workflowState.frameReady && !useExisting) || !workflowState.remoteConfigReady || !workflowState.sshChecked) {
+  if (
+    !workflowState.remoteConfigReady
+    || !workflowState.sshChecked
+    || (!useExisting && !workflowState.frameReady)
+    || (useExisting && !existingDatasetReady)
+  ) {
     setStepPill("step-pill-job", "locked", "Locked");
   } else {
     setStepPill("step-pill-job", workflowState.jobStarted ? "done" : "active", workflowState.jobStarted ? "Done" : "Active");
@@ -1395,6 +1559,7 @@ async function refreshJobs() {
   const jobs = data.jobs ?? [];
   lastJobsSnapshot = jobs;
   renderJobs(jobs);
+  refreshRemoteDatasetSummary(lastRemoteCheckReport);
   populateJobLogSelector(jobs);
   if (jobLogState.jobId) {
     await loadJobLogs(jobLogState.page);
@@ -1803,11 +1968,21 @@ function bindEvents() {
   });
 
   document.getElementById("remote-dataset-select").addEventListener("change", () => {
+    const select = document.getElementById("remote-dataset-select");
+    const useExistingNode = document.getElementById("use-existing-remote-dataset");
+    if (useExistingNode && String(select?.value || "").trim()) {
+      useExistingNode.checked = true;
+    }
     refreshRemoteDatasetSummary(lastRemoteCheckReport);
     refreshWorkflowUI();
   });
 
   document.getElementById("remote-dataset-path").addEventListener("input", () => {
+    const customPath = document.getElementById("remote-dataset-path")?.value.trim() || "";
+    const useExistingNode = document.getElementById("use-existing-remote-dataset");
+    if (useExistingNode && customPath) {
+      useExistingNode.checked = true;
+    }
     refreshRemoteDatasetSummary(lastRemoteCheckReport);
     refreshWorkflowUI();
   });

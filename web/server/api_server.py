@@ -419,15 +419,31 @@ def prepare_colmap_workspace(
   if convert_script and convert_script.exists():
     suggested_command = f"python {convert_script} -s {workspace_root}"
   else:
+    database_path = workspace_root / "distorted" / "database.db"
+    distorted_sparse_path = workspace_root / "distorted" / "sparse"
+    distorted_sparse_0 = distorted_sparse_path / "0"
+    sparse_root = workspace_root / "sparse"
+    sparse_0 = sparse_root / "0"
+    marker_path = workspace_root / ".wgsc_colmap_undistorted.ok"
+
     colmap_prepare_script = (
       "OMP_NUM_THREADS_VALUE=\"${OMP_NUM_THREADS:-1}\""
       " && case \"$OMP_NUM_THREADS_VALUE\" in \"\"|*[!0-9]*|0) OMP_NUM_THREADS_VALUE=1 ;; esac"
       " && export OMP_NUM_THREADS=\"$OMP_NUM_THREADS_VALUE\""
       " && export QT_QPA_PLATFORM=xcb"
       " && if command -v vglrun >/dev/null 2>&1; then colmap_headless() { vglrun \"$@\"; }; else colmap_headless() { \"$@\"; }; fi"
-      f" && command -v colmap >/dev/null 2>&1"
-      f" && colmap_headless colmap feature_extractor --database_path {workspace_root / 'distorted' / 'database.db'} --image_path {input_dir} "
+      " && command -v colmap >/dev/null 2>&1"
+      f" && rm -f {shlex.quote(str(marker_path))} {shlex.quote(str(database_path))}"
+      f" && mkdir -p {shlex.quote(str(distorted_sparse_path))} {shlex.quote(str(sparse_root))}"
+      f" && colmap_headless colmap feature_extractor --database_path {shlex.quote(str(database_path))} --image_path {shlex.quote(str(input_dir))} "
       "--ImageReader.single_camera 1 --ImageReader.camera_model OPENCV"
+      f" && colmap_headless colmap exhaustive_matcher --database_path {shlex.quote(str(database_path))}"
+      f" && colmap_headless colmap mapper --database_path {shlex.quote(str(database_path))} --image_path {shlex.quote(str(input_dir))} --output_path {shlex.quote(str(distorted_sparse_path))}"
+      f" && rm -rf {shlex.quote(str(images_dir))} {shlex.quote(str(sparse_root))}"
+      f" && mkdir -p {shlex.quote(str(images_dir))} {shlex.quote(str(sparse_root))} {shlex.quote(str(sparse_0))}"
+      f" && colmap_headless colmap image_undistorter --image_path {shlex.quote(str(input_dir))} --input_path {shlex.quote(str(distorted_sparse_0))} --output_path {shlex.quote(str(workspace_root))} --output_type COLMAP"
+      f" && if [ -d {shlex.quote(str(sparse_root))} ]; then find {shlex.quote(str(sparse_root))} -maxdepth 1 -type f -exec mv -f {{}} {shlex.quote(str(sparse_0))} \\; ; fi"
+      f" && touch {shlex.quote(str(marker_path))}"
     )
     suggested_command = f'xvfb-run -a -s "-screen 0 1280x1024x24" bash -lc {shlex.quote(colmap_prepare_script)}'
 
@@ -1196,6 +1212,131 @@ def enrich_job(job: Dict[str, Any]) -> Dict[str, Any]:
   return enriched
 
 
+def _normalize_remote_dataset_path(path: str) -> str:
+  value = str(path or "").strip().replace("\\", "/")
+  while value.endswith("/"):
+    value = value[:-1]
+  return value
+
+
+def _append_family_coverage(coverage: Dict[str, set[str]], job_status: str, family: str) -> None:
+  normalized_status = str(job_status or "").strip().lower()
+  if normalized_status == "completed":
+    coverage["trained"].add(family)
+    return
+  if normalized_status == "failed":
+    coverage["failed"].add(family)
+    return
+  if normalized_status in {"queued", "running"}:
+    coverage["running"].add(family)
+
+
+def _annotate_datasets_with_training_coverage(
+  datasets: list[Dict[str, Any]],
+  *,
+  family_scope: str,
+) -> list[Dict[str, Any]]:
+  if not datasets:
+    return []
+
+  available_families = sorted({
+    str(item.get("family", "")).strip()
+    for item in list_adapters()
+    if str(item.get("family", "")).strip()
+  })
+
+  coverage_by_id: Dict[str, Dict[str, set[str]]] = {}
+  coverage_by_id_family: Dict[str, Dict[str, set[str]]] = {}
+  coverage_by_path: Dict[str, Dict[str, set[str]]] = {}
+
+  for raw_job in JOBS.values():
+    job = enrich_job(raw_job)
+    if str(job.get("operation", "")).strip() != "remote_train":
+      continue
+
+    trained_family = str(job.get("algorithm_family", "")).strip()
+    if not trained_family:
+      continue
+
+    job_status = str(job.get("status", "")).strip()
+    remote_result_raw = job.get("remote_result")
+    remote_result: Dict[str, Any] = remote_result_raw if isinstance(remote_result_raw, dict) else {}
+    dataset_id = str(
+      remote_result.get("remote_dataset_id")
+      or job.get("remote_dataset_id")
+      or ""
+    ).strip()
+    dataset_path = _normalize_remote_dataset_path(
+      str(
+        remote_result.get("remote_dataset_workspace")
+        or job.get("remote_dataset_path")
+        or ""
+      )
+    )
+
+    if dataset_id:
+      bucket = coverage_by_id.setdefault(dataset_id, {"trained": set(), "failed": set(), "running": set()})
+      _append_family_coverage(bucket, job_status, trained_family)
+
+      family_bucket_key = f"{trained_family}::{dataset_id}"
+      family_bucket = coverage_by_id_family.setdefault(family_bucket_key, {"trained": set(), "failed": set(), "running": set()})
+      _append_family_coverage(family_bucket, job_status, trained_family)
+
+    if dataset_path:
+      path_bucket = coverage_by_path.setdefault(dataset_path, {"trained": set(), "failed": set(), "running": set()})
+      _append_family_coverage(path_bucket, job_status, trained_family)
+
+  normalized_scope = str(family_scope or "").strip()
+  annotated: list[Dict[str, Any]] = []
+  for dataset in datasets:
+    annotated_item = dict(dataset)
+    dataset_id = str(dataset.get("id", "")).strip()
+    dataset_path = _normalize_remote_dataset_path(str(dataset.get("path", "")))
+
+    trained_families: set[str] = set()
+    failed_families: set[str] = set()
+    running_families: set[str] = set()
+
+    if dataset_id and normalized_scope:
+      scoped_key = f"{normalized_scope}::{dataset_id}"
+      scoped = coverage_by_id_family.get(scoped_key)
+      if scoped:
+        trained_families.update(scoped["trained"])
+        failed_families.update(scoped["failed"])
+        running_families.update(scoped["running"])
+
+    if dataset_id:
+      generic = coverage_by_id.get(dataset_id)
+      if generic:
+        trained_families.update(generic["trained"])
+        failed_families.update(generic["failed"])
+        running_families.update(generic["running"])
+
+    if dataset_path:
+      by_path = coverage_by_path.get(dataset_path)
+      if by_path:
+        trained_families.update(by_path["trained"])
+        failed_families.update(by_path["failed"])
+        running_families.update(by_path["running"])
+
+    missing_families = sorted(f for f in available_families if f not in trained_families)
+
+    annotated_item["trained_families"] = sorted(trained_families)
+    annotated_item["failed_families"] = sorted(failed_families)
+    annotated_item["running_families"] = sorted(running_families)
+    annotated_item["missing_families"] = missing_families
+    annotated_item["training_coverage"] = {
+      "available_families": available_families,
+      "trained_families": sorted(trained_families),
+      "failed_families": sorted(failed_families),
+      "running_families": sorted(running_families),
+      "missing_families": missing_families,
+    }
+    annotated.append(annotated_item)
+
+  return annotated
+
+
 def prune_job_history() -> None:
   ordered_jobs = sorted(JOBS.values(), key=lambda item: item.get("created_at", 0), reverse=True)
   keep_ids: set[str] = set()
@@ -1666,6 +1807,10 @@ class ApiHandler(SimpleHTTPRequestHandler):
           manual_anchor="#9-%E5%B8%B8%E8%A7%81%E9%94%99%E8%AF%AF%E7%A0%81%E4%B8%8E%E8%A7%A3%E5%86%B3%E6%96%B9%E6%A1%88",
         )
         return
+
+      raw_datasets = result.get("datasets")
+      datasets: list[Dict[str, Any]] = [item for item in raw_datasets if isinstance(item, dict)] if isinstance(raw_datasets, list) else []
+      result["datasets"] = _annotate_datasets_with_training_coverage(datasets, family_scope=family)
 
       json_response(self, {
         "ok": True,

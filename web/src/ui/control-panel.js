@@ -398,6 +398,9 @@ export function renderJobs(jobs) {
       const commandPreview = summarizeText(job.command, 120);
       const stderrPreview = summarizeText(job.stderr, 180);
       const createdAtText = formatCreatedAt(job.created_at);
+      const datasetRef = job.remote_result?.remote_dataset_id || job.remote_dataset_id || "-";
+      const datasetPath = job.remote_result?.remote_dataset_workspace || job.remote_dataset_path || "-";
+      const datasetMode = job.use_existing_remote_dataset ? "existing" : "new-upload";
       return `
         <article class="job-item" data-status="${escapeHtml(job.status ?? "-")}">
           <details class="job-card" ${job.status === "running" || job.status === "failed" ? "open" : ""}>
@@ -414,6 +417,9 @@ export function renderJobs(jobs) {
             <div class="job-detail-grid">
               <p><strong>Created:</strong> ${escapeHtml(createdAtText)}</p>
               <p><strong>Remote Stage:</strong> ${escapeHtml(job.remote_stage ?? "-")}</p>
+              <p><strong>Dataset Mode:</strong> ${escapeHtml(datasetMode)}</p>
+              <p><strong>Dataset ID:</strong> ${escapeHtml(datasetRef)}</p>
+              <p><strong>Dataset Path:</strong> ${escapeHtml(summarizeText(datasetPath, 80))}</p>
               <p><strong>Return code:</strong> ${escapeHtml(job.return_code ?? "-")}</p>
               <p><strong>Command:</strong> ${escapeHtml(commandPreview)}</p>
               <p><strong>STDERR:</strong> ${escapeHtml(stderrPreview)}</p>

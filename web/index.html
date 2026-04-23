@@ -202,7 +202,7 @@
               <input id="remote-activate-cmd" type="text" placeholder="source ~/.bashrc && conda activate HAC_env" />
             </label>
             <label>
-              Existing Remote Dataset
+              Existing Remote Dataset (advanced selector)
               <select id="remote-dataset-select">
                 <option value="">Upload a new capture and run COLMAP</option>
               </select>
@@ -215,6 +215,15 @@
               <input id="use-existing-remote-dataset" type="checkbox" />
               Use existing remote dataset (skip upload and COLMAP)
             </label>
+            <section class="dataset-library-panel">
+              <div class="dataset-library-head">
+                <h4>Remote Dataset Library</h4>
+                <p class="panel-copy">Select first, then run Step 5. Cards show stage1 raw, stage2 sparse, and model coverage.</p>
+              </div>
+              <div id="remote-dataset-library" class="dataset-library-grid">
+                <p class="dataset-library-empty">Run Check SSH to load reusable remote datasets.</p>
+              </div>
+            </section>
             <p id="remote-dataset-summary" class="field-note">Run Check SSH to load remote dataset history.</p>
             <div class="button-row">
               <button id="check-remote-ssh" type="button">Check SSH</button>

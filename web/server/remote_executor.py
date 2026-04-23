@@ -176,6 +176,22 @@ def _read_remote_json_file(sftp, remote_path: str) -> Dict[str, Any]:
     return {}
 
 
+def _remote_path_exists_sftp(sftp, remote_path: str) -> bool:
+  try:
+    sftp.stat(remote_path)
+    return True
+  except Exception:
+    return False
+
+
+def _remote_count_files_sftp(sftp, remote_dir: str) -> int:
+  try:
+    entries = sftp.listdir_attr(remote_dir)
+  except Exception:
+    return 0
+  return sum(1 for item in entries if not stat.S_ISDIR(item.st_mode))
+
+
 def _list_remote_datasets(
   sftp,
   *,
@@ -201,6 +217,10 @@ def _list_remote_datasets(
     dataset_id = entry.filename
     dataset_dir = str(dataset_base / dataset_id)
     workspace_dir = str(PurePosixPath(dataset_dir) / "workspace")
+    input_dir = str(PurePosixPath(workspace_dir) / "input")
+    images_dir = str(PurePosixPath(workspace_dir) / "images")
+    sparse_dir = str(PurePosixPath(workspace_dir) / "sparse" / "0")
+    undistorted_marker = str(PurePosixPath(workspace_dir) / ".wgsc_colmap_undistorted.ok")
 
     manifest = {}
     for candidate in (
@@ -215,6 +235,21 @@ def _list_remote_datasets(
     frame_count = _safe_int(manifest.get("frame_count"), 0)
     dataset_name = str(manifest.get("dataset_name") or manifest.get("title") or dataset_id)
 
+    input_file_count = _remote_count_files_sftp(sftp, input_dir)
+    images_file_count = _remote_count_files_sftp(sftp, images_dir)
+    sparse_file_count = _remote_count_files_sftp(sftp, sparse_dir)
+    has_raw_images = input_file_count > 0 or images_file_count > 0 or frame_count > 0
+    has_sparse_model = sparse_file_count > 0
+    has_undistorted = _remote_path_exists_sftp(sftp, undistorted_marker)
+
+    stage_label = "raw_only"
+    if has_sparse_model:
+      stage_label = "sparse_ready"
+    if has_sparse_model and has_undistorted:
+      stage_label = "undistorted_ready"
+
+    resolved_frame_count = frame_count or input_file_count or images_file_count
+
     items.append({
       "id": dataset_id,
       "name": dataset_name,
@@ -222,7 +257,21 @@ def _list_remote_datasets(
       "dataset_dir": dataset_dir,
       "session_id": str(manifest.get("session_id", "")),
       "capture_id": str(manifest.get("capture_id", "")),
-      "frame_count": frame_count,
+      "frame_count": resolved_frame_count,
+      "input_file_count": input_file_count,
+      "images_file_count": images_file_count,
+      "sparse_file_count": sparse_file_count,
+      "has_input_images": has_raw_images,
+      "has_sparse_model": has_sparse_model,
+      "has_undistorted_marker": has_undistorted,
+      "latest_marker": ".wgsc_colmap_undistorted.ok" if has_undistorted else "",
+      "stage": {
+        "raw": has_raw_images,
+        "sparse": has_sparse_model,
+        "undistorted": has_undistorted,
+        "label": stage_label,
+      },
+      "stage_label": stage_label,
       "updated_at": _safe_int(getattr(entry, "st_mtime", 0), 0),
     })
 
@@ -587,8 +636,10 @@ def _remote_directory_exists(client, remote_dir: str) -> bool:
 
 def _remote_has_sparse_workspace(client, workspace_dir: str) -> bool:
   sparse_dir = str(PurePosixPath(workspace_dir) / "sparse" / "0")
+  marker_path = str(PurePosixPath(workspace_dir) / ".wgsc_colmap_undistorted.ok")
   script = (
-    f"test -d {_quote(sparse_dir)}"
+    f"test -f {_quote(marker_path)}"
+    f" && test -d {_quote(sparse_dir)}"
     f" && [ \"$(find {_quote(sparse_dir)} -maxdepth 1 -type f | wc -l)\" -gt 0 ]"
   )
   return _run_remote_command(client, f"bash -lc {_quote(script)}", None) == 0
@@ -603,29 +654,36 @@ def _build_remote_colmap_script(workspace_dir: str) -> str:
   sparse_root = str(PurePosixPath(workspace_dir) / "sparse")
   distorted_sparse_0 = str(PurePosixPath(distorted_sparse) / "0")
   sparse_0 = str(PurePosixPath(sparse_root) / "0")
+  marker_path = str(PurePosixPath(workspace_dir) / ".wgsc_colmap_undistorted.ok")
 
   steps = [
     "command -v colmap >/dev/null 2>&1",
-    f"mkdir -p {_quote(images_dir)} {_quote(distorted_sparse)} {_quote(sparse_root)}",
-    (
-      f"if [ -d {_quote(input_dir)} ]; then "
-      f"cp -a {_quote(str(PurePosixPath(input_dir) / '.'))} {_quote(images_dir)}; "
-      "fi"
-    ),
+    f"rm -f {_quote(marker_path)} {_quote(database_path)}",
+    f"mkdir -p {_quote(distorted_sparse)} {_quote(sparse_root)}",
     (
       f"colmap_headless colmap feature_extractor "
       f"--database_path {_quote(database_path)} "
-      f"--image_path {_quote(images_dir)} "
+      f"--image_path {_quote(input_dir)} "
       "--ImageReader.single_camera 1 --ImageReader.camera_model OPENCV"
     ),
     f"colmap_headless colmap exhaustive_matcher --database_path {_quote(database_path)}",
     (
       f"colmap_headless colmap mapper "
       f"--database_path {_quote(database_path)} "
-      f"--image_path {_quote(images_dir)} "
+      f"--image_path {_quote(input_dir)} "
       f"--output_path {_quote(distorted_sparse)}"
     ),
-    f"if [ -d {_quote(distorted_sparse_0)} ]; then rm -rf {_quote(sparse_0)} && cp -a {_quote(distorted_sparse_0)} {_quote(sparse_0)}; fi",
+    f"rm -rf {_quote(images_dir)} {_quote(sparse_root)}",
+    f"mkdir -p {_quote(images_dir)} {_quote(sparse_root)} {_quote(sparse_0)}",
+    (
+      f"colmap_headless colmap image_undistorter "
+      f"--image_path {_quote(input_dir)} "
+      f"--input_path {_quote(distorted_sparse_0)} "
+      f"--output_path {_quote(workspace_dir)} "
+      "--output_type COLMAP"
+    ),
+    f"if [ -d {_quote(sparse_root)} ]; then find {_quote(sparse_root)} -maxdepth 1 -type f -exec mv -f {{}} {_quote(sparse_0)} \\; ; fi",
+    f"touch {_quote(marker_path)}",
   ]
   return _wrap_remote_colmap_headless_script(" && ".join(steps))
 

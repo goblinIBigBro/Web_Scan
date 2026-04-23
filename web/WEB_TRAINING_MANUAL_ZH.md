@@ -147,7 +147,7 @@ python decode_single_scene_validate.py --lmd 1e-4 --bit_path_from <path/to/bitst
   - PyTorch 2.2.*
   - torchvision 0.17.*
   - pytorch-cuda 11.8
-  - numpy 1.26.* / pillow 10.* / plyfile 1.1.* / tqdm 4.66.* / lpips
+  - numpy 1.26.*/ pillow 10.* / plyfile 1.1.*/ tqdm 4.66.* / lpips
 - HAC++ 官方 README 还给出了 Ubuntu 20.04.1 / CUDA 11.8 / gcc 9.4.0 的实测组合。
 - 不建议再按 Python 3.8 / PyTorch 1.2 这类旧组合来配当前分支。
 - 压缩和回传链路会调用 GPCC / tmc3，远端还需要能直接执行 `tmc3`。
@@ -182,10 +182,12 @@ python decode_single_scene_validate.py --lmd 1e-4 --bit_path_from <path/to/bitst
    - 如失败：检查驱动安装、cuda-toolkit 版本
 
 4. **远端 Python 和 PyTorch**：
+
    ```bash
    python -V
    python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
    ```
+
    - 验证 Python 版本 ≥ 3.10
    - 验证 PyTorch 已正确安装且 CUDA 可用
 
@@ -198,27 +200,33 @@ python decode_single_scene_validate.py --lmd 1e-4 --bit_path_from <path/to/bitst
    - 验证 Python 能导入项目模块
 
 7. **远端写权限**：
+
    ```bash
    touch <workspace_root>/.write_test && rm <workspace_root>/.write_test
    touch <output_root>/.write_test && rm <output_root>/.write_test
    ```
+
    - 确认两个目录都可写
    - 如失败：改用 `/tmp/web_scan/...` 等可写路径
 
 8. **无头 COLMAP 工具**：
+
    ```bash
    command -v xvfb-run
    xvfb-run -a colmap feature_extractor -h
    ```
+
    - 验证 `xvfb-run` 可执行
    - 验证 COLMAP 能在虚拟显示中启动
    - **如失败**：执行 `sudo apt-get install -y xvfb`
 
 9. **GPU OpenGL 转发（可选但推荐）**：
+
    ```bash
    command -v vglrun
    vglrun colmap feature_extractor -h
    ```
+
    - 检查 VirtualGL 是否可用
    - 如不可用，系统会自动降级到 Xvfb-only
    - **如希望启用**：执行 `sudo apt-get install -y virtualgl`
@@ -483,6 +491,7 @@ Remote Connecting -> Remote Uploading -> Remote Training -> Remote Downloading -
 **点击 `One-click Upload and Remote Train` 后的流程**：
 
 ```
+
 本地
 ├─ 上传图像数据到 <workspace_root>/<session_id>/<family>/<job_id>/input/
 └─ 返回 workspace 路径给后端
@@ -552,6 +561,7 @@ Remote Connecting -> Remote Uploading -> Remote Training -> Remote Downloading -
 **原因**：Xvfb 未成功启动或虚拟显示初始化失败
 
 **诊断**：
+
 ```bash
 # 手动测试 Xvfb
 Xvfb :99 -screen 0 1280x1024x24 &
@@ -560,6 +570,7 @@ colmap feature_extractor -h
 ```
 
 **修复**：
+
 ```bash
 # 重新安装 Xvfb
 sudo apt-get remove -y xvfb
@@ -573,6 +584,7 @@ xvfb-run -a glxgears
 **原因**：内存不足或 OMP_NUM_THREADS 设置过高
 
 **诊断**：
+
 ```bash
 free -h
 grep OMP_NUM_THREADS ~/.bashrc  # 查看当前设置
@@ -580,6 +592,7 @@ dmesg | tail -20  # 查看内存 OOM 日志
 ```
 
 **修复**：
+
 ```bash
 # 降低线程数
 export OMP_NUM_THREADS=1
@@ -594,12 +607,14 @@ du -sh <workspace_root>
 **原因**：VirtualGL 未安装
 
 **诊断**：
+
 ```bash
 command -v vglrun  # 返回空
 dpkg -l | grep virtualgl
 ```
 
 **恢复方案**：
+
 - 若不装 VirtualGL：系统自动降级到 Xvfb-only，功能不变，仅速度略慢
 - 若想启用 GPU 透传：`sudo apt-get install -y virtualgl`
 

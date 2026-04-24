@@ -436,7 +436,7 @@ def prepare_colmap_workspace(
       f" && rm -f {shlex.quote(str(marker_path))} {shlex.quote(str(database_path))}"
       f" && mkdir -p {shlex.quote(str(distorted_sparse_path))} {shlex.quote(str(sparse_root))}"
       f" && colmap_headless colmap feature_extractor --database_path {shlex.quote(str(database_path))} --image_path {shlex.quote(str(input_dir))} "
-      "--ImageReader.single_camera 1 --ImageReader.camera_model OPENCV"
+      "--ImageReader.single_camera 1 --ImageReader.camera_model SIMPLE_PINHOLE"
       f" && colmap_headless colmap exhaustive_matcher --database_path {shlex.quote(str(database_path))}"
       f" && colmap_headless colmap mapper --database_path {shlex.quote(str(database_path))} --image_path {shlex.quote(str(input_dir))} --output_path {shlex.quote(str(distorted_sparse_path))}"
       f" && rm -rf {shlex.quote(str(images_dir))} {shlex.quote(str(sparse_root))}"
@@ -492,6 +492,7 @@ def format_operation_command(
   workspace: str = "",
   checkpoint_path: str = "",
   repo_path: str = "",
+  training_args: Dict[str, Any] | None = None,
 ) -> str | None:
   operation_config = adapter.get("operations", {}).get(operation, {})
   command_template = operation_config.get("template")
@@ -504,6 +505,7 @@ def format_operation_command(
     "checkpoint_path": checkpoint_path,
     "repo_path": repo_path or adapter.get("repo_path", ""),
     "source": input_path or workspace,
+    **(training_args or {}),
   }
   return command_template.format(**format_args)
 
@@ -837,6 +839,7 @@ def build_capture_pipeline(
   output_dir: str,
   repo_path: str = "",
   checkpoint_path: str = "",
+  training_args: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
   adapter = get_adapter(family)
   if not adapter:
@@ -861,6 +864,7 @@ def build_capture_pipeline(
       workspace=workspace_root,
       checkpoint_path=checkpoint_path,
       repo_path=resolved_repo,
+      training_args=training_args,
     )
     if command:
       commands.append({"name": operation, "command": command})
@@ -901,6 +905,31 @@ def build_capture_pipeline(
 def build_viewer_url(relative_url: str, representation: str | None = None) -> str:
   renderer = "sg" if (representation or "").lower() == "sg" else "sh"
   return f"/web/viewers/{renderer}.html?url={relative_url}"
+
+
+def _training_format_args(payload: Dict[str, Any]) -> Dict[str, Any]:
+  return {
+    "iterations": payload.get("iterations", 30_000),
+    "voxel_size": payload.get("voxel_size", 0.001),
+    "update_init_factor": payload.get("update_init_factor", 16),
+    "lmbda": payload.get("lmbda", 0.001),
+    "mask_lr_final": payload.get("mask_lr_final", 0.0001),
+    "position_lr_init": payload.get("position_lr_init", 0.0),
+    "position_lr_final": payload.get("position_lr_final", 0.0),
+    "position_lr_delay_mult": payload.get("position_lr_delay_mult", 0.01),
+    "position_lr_max_steps": payload.get("position_lr_max_steps", 30_000),
+    "offset_lr_init": payload.get("offset_lr_init", 0.01),
+    "offset_lr_final": payload.get("offset_lr_final", 0.0001),
+    "offset_lr_delay_mult": payload.get("offset_lr_delay_mult", 0.01),
+    "offset_lr_max_steps": payload.get("offset_lr_max_steps", 30_000),
+    "mask_lr_init": payload.get("mask_lr_init", 0.01),
+    "mask_lr_delay_mult": payload.get("mask_lr_delay_mult", 0.01),
+    "mask_lr_max_steps": payload.get("mask_lr_max_steps", 30_000),
+    "feature_lr": payload.get("feature_lr", 0.0075),
+    "opacity_lr": payload.get("opacity_lr", 0.02),
+    "scaling_lr": payload.get("scaling_lr", 0.007),
+    "rotation_lr": payload.get("rotation_lr", 0.002),
+  }
 
 
 def newest_iteration_ply(directory: Path) -> Path | None:
@@ -1212,6 +1241,82 @@ def enrich_job(job: Dict[str, Any]) -> Dict[str, Any]:
   return enriched
 
 
+def _artifact_score(directory: Path) -> float:
+  """Use the freshest file timestamp under a candidate output dir as ranking score."""
+  targets = [
+    directory / "scene_manifest.json",
+    directory / "latest.png",
+    directory / "point_cloud.ply",
+    directory / "latest.ply",
+    directory / "scene.ply",
+    directory / "metrics.json",
+  ]
+  scores: list[float] = []
+  for target in targets:
+    if target.exists():
+      try:
+        scores.append(target.stat().st_mtime)
+      except OSError:
+        continue
+  try:
+    scores.append(directory.stat().st_mtime)
+  except OSError:
+    pass
+  return max(scores) if scores else 0.0
+
+
+def discover_runtime_results(*, limit: int = 30, max_scan_dirs: int = 1800) -> list[Dict[str, Any]]:
+  """Scan local server output roots and return mountable runtime artifacts."""
+  safe_limit = max(1, min(limit, 100))
+  safe_max_scan_dirs = max(200, min(max_scan_dirs, 8000))
+
+  scan_roots = [
+    (WEB_DIR / "generated" / "runs").resolve(),
+    (STREAM_DIR).resolve(),
+    (WEB_DIR / "generated" / "datasets").resolve(),
+  ]
+
+  discovered: Dict[str, Dict[str, Any]] = {}
+  scanned_dirs = 0
+
+  for root in scan_roots:
+    if not root.exists() or not root.is_dir():
+      continue
+
+    for current_root, _, _ in os.walk(root):
+      scanned_dirs += 1
+      if scanned_dirs > safe_max_scan_dirs:
+        break
+      directory = Path(current_root)
+      artifacts = read_runtime_artifacts(str(directory))
+      if not any(artifacts.get(key) for key in ("manifest_url", "viewer_url", "point_cloud_url", "result_url")):
+        continue
+
+      output_dir = str(directory.resolve())
+      item = {
+        "id": f"discovered::{uuid.uuid5(uuid.NAMESPACE_URL, output_dir).hex[:12]}",
+        "source": "discovered",
+        "output_dir": output_dir,
+        "representation": "sg" if str(artifacts.get("viewer_url", "")).find("/viewers/sg.html") >= 0 else "sh",
+        "score": _artifact_score(directory),
+      }
+      for key in ("manifest_url", "viewer_url", "point_cloud_url", "result_url"):
+        if artifacts.get(key):
+          item[key] = artifacts[key]
+
+      metrics = artifacts.get("metrics")
+      if isinstance(metrics, dict):
+        item["metrics"] = metrics
+
+      discovered[output_dir] = item
+
+    if scanned_dirs > safe_max_scan_dirs:
+      break
+
+  ordered = sorted(discovered.values(), key=lambda value: float(value.get("score", 0.0)), reverse=True)
+  return ordered[:safe_limit]
+
+
 def _normalize_remote_dataset_path(path: str) -> str:
   value = str(path or "").strip().replace("\\", "/")
   while value.endswith("/"):
@@ -1478,6 +1583,7 @@ def start_remote_job_thread(
   remote_dataset_id: str,
   remote_dataset_path: str,
   use_existing_remote_dataset: bool,
+  training_args: Dict[str, Any] | None = None,
 ) -> None:
   def runner() -> None:
     ensure_job_logging(job)
@@ -1526,6 +1632,7 @@ def start_remote_job_thread(
         remote_dataset_id=remote_dataset_id,
         remote_dataset_path=remote_dataset_path,
         use_existing_remote_dataset=use_existing_remote_dataset,
+        training_args=training_args or {},
         log_callback=on_log,
         stage_callback=on_stage,
       )
@@ -1591,6 +1698,17 @@ class ApiHandler(SimpleHTTPRequestHandler):
       return
     if parsed.path == "/api/jobs":
       json_response(self, {"jobs": [enrich_job(job) for job in JOBS.values()]})
+      return
+    if parsed.path == "/api/results/discover":
+      limit = safe_int(query.get("limit", ["30"])[0], 30, minimum=1, maximum=100)
+      max_scan_dirs = safe_int(query.get("max_scan_dirs", ["1800"])[0], 1800, minimum=200, maximum=8000)
+      results = discover_runtime_results(limit=limit, max_scan_dirs=max_scan_dirs)
+      json_response(self, {
+        "ok": True,
+        "results": results,
+        "latest": results[0] if results else None,
+        "count": len(results),
+      })
       return
     if parsed.path.startswith("/api/jobs/"):
       parts = parsed.path.strip("/").split("/")
@@ -1995,6 +2113,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
         "workspace": workspace_for_template,
         "checkpoint_path": remote_checkpoint_path,
         "source": source_path or workspace_for_template,
+        **_training_format_args(payload),
       }
 
       confirmed_ok, confirmed_message, confirmed_details = validate_path_confirmation_payload(
@@ -2080,6 +2199,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
         remote_dataset_id=remote_dataset_id,
         remote_dataset_path=remote_dataset_path,
         use_existing_remote_dataset=use_existing_remote_dataset,
+        training_args=_training_format_args(payload),
       )
       json_response(
         self,
@@ -2134,6 +2254,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
         "checkpoint_path": payload.get("checkpoint_path", ""),
         "repo_path": resolved_repo,
         "source": payload.get("source", payload.get("workspace", "")),
+        **_training_format_args(payload),
       }
 
       confirmed_ok, confirmed_message, confirmed_details = validate_path_confirmation_payload(
@@ -2377,6 +2498,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
           output_dir=output_dir,
           repo_path=repo_path,
           checkpoint_path=checkpoint_path,
+          training_args=_training_format_args(payload),
         )
         job = None
         if execute:

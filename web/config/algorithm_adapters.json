@@ -276,7 +276,7 @@
       "operations": {
         "train": {
           "enabled": true,
-          "template": "python train.py -s {workspace} --eval -m {output_dir}"
+          "template": "python train.py -s {workspace} --eval -m {output_dir} --iterations {iterations} --voxel_size {voxel_size} --update_init_factor {update_init_factor} --lmbda {lmbda} --mask_lr_final {mask_lr_final} --position_lr_init {position_lr_init} --position_lr_final {position_lr_final} --position_lr_delay_mult {position_lr_delay_mult} --position_lr_max_steps {position_lr_max_steps} --offset_lr_init {offset_lr_init} --offset_lr_final {offset_lr_final} --offset_lr_delay_mult {offset_lr_delay_mult} --offset_lr_max_steps {offset_lr_max_steps} --mask_lr_init {mask_lr_init} --mask_lr_delay_mult {mask_lr_delay_mult} --mask_lr_max_steps {mask_lr_max_steps} --feature_lr {feature_lr} --opacity_lr {opacity_lr} --scaling_lr {scaling_lr} --rotation_lr {rotation_lr}"
         },
         "render": {
           "enabled": true,

@@ -131,6 +131,17 @@ export async function fetchJobs(apiBaseUrl) {
   return parseJson(response);
 }
 
+export async function fetchDiscoveredResults(apiBaseUrl, options = {}) {
+  const limit = Number(options.limit || 30);
+  const maxScanDirs = Number(options.maxScanDirs || 1800);
+  const params = new URLSearchParams({
+    limit: String(Number.isFinite(limit) && limit > 0 ? limit : 30),
+    max_scan_dirs: String(Number.isFinite(maxScanDirs) && maxScanDirs > 0 ? maxScanDirs : 1800),
+  });
+  const response = await fetch(withApiBase(apiBaseUrl, `api/results/discover?${params.toString()}`));
+  return parseJson(response);
+}
+
 export async function fetchJob(apiBaseUrl, jobId) {
   const response = await fetch(withApiBase(apiBaseUrl, `api/jobs/${jobId}`));
   return parseJson(response);

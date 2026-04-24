@@ -9,6 +9,7 @@ import {
   buildJobMetricsCsvUrl,
   exportScenePackage,
   fetchEnvironmentCheck,
+  fetchDiscoveredResults,
   fetchAlgorithms,
   fetchHealth,
   fetchJob,
@@ -78,6 +79,107 @@ const jobLogState = {
   totalPages: 1,
   tailLines: 120,
 };
+
+const JOB_LOG_LAYOUT_KEY = "gaussian-web-job-log-left-ratio-v1";
+const DEFAULT_JOB_LOG_LEFT_RATIO = 1.2;
+
+let jobLogLeftRatio = DEFAULT_JOB_LOG_LEFT_RATIO;
+
+function loadJobLogLeftRatio() {
+  try {
+    const raw = Number(localStorage.getItem(JOB_LOG_LAYOUT_KEY));
+    if (Number.isFinite(raw) && raw >= 0.7 && raw <= 2.5) {
+      return raw;
+    }
+  } catch {
+    // ignore storage errors
+  }
+  return DEFAULT_JOB_LOG_LEFT_RATIO;
+}
+
+function saveJobLogLeftRatio(nextRatio) {
+  try {
+    localStorage.setItem(JOB_LOG_LAYOUT_KEY, String(nextRatio));
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function applyJobLogLayoutRatio(nextRatio) {
+  const safeRatio = Number.isFinite(nextRatio) ? Math.max(0.7, Math.min(2.5, nextRatio)) : DEFAULT_JOB_LOG_LEFT_RATIO;
+  jobLogLeftRatio = safeRatio;
+  document.documentElement.style.setProperty("--job-log-left-ratio", `${safeRatio.toFixed(3)}fr`);
+  saveJobLogLeftRatio(safeRatio);
+}
+
+function setJobLogsFullscreen(enabled) {
+  document.body.classList.toggle("job-logs-fullscreen", Boolean(enabled));
+  const button = document.getElementById("toggle-job-logs-fullscreen");
+  if (button) {
+    button.textContent = enabled ? "Exit Fullscreen" : "Fullscreen Logs";
+  }
+}
+
+function collectTrainingOptions() {
+  const numberValue = (id, fallback) => {
+    const node = document.getElementById(id);
+    const value = Number(node?.value);
+    return Number.isFinite(value) ? value : fallback;
+  };
+  return {
+    iterations: Math.max(1, Math.round(numberValue("train-iterations", 30000))),
+    voxel_size: numberValue("train-voxel-size", 0.001),
+    update_init_factor: Math.max(1, Math.round(numberValue("train-update-init-factor", 16))),
+    lmbda: numberValue("train-lmbda", 0.001),
+    mask_lr_final: numberValue("train-mask-lr-final", 0.0001),
+    position_lr_init: numberValue("train-position-lr-init", 0.0),
+    position_lr_final: numberValue("train-position-lr-final", 0.0),
+    position_lr_delay_mult: numberValue("train-position-lr-delay-mult", 0.01),
+    position_lr_max_steps: Math.max(1, Math.round(numberValue("train-position-lr-max-steps", 30000))),
+    offset_lr_init: numberValue("train-offset-lr-init", 0.01),
+    offset_lr_final: numberValue("train-offset-lr-final", 0.0001),
+    offset_lr_delay_mult: numberValue("train-offset-lr-delay-mult", 0.01),
+    offset_lr_max_steps: Math.max(1, Math.round(numberValue("train-offset-lr-max-steps", 30000))),
+    mask_lr_init: numberValue("train-mask-lr-init", 0.01),
+    mask_lr_delay_mult: numberValue("train-mask-lr-delay-mult", 0.01),
+    mask_lr_max_steps: Math.max(1, Math.round(numberValue("train-mask-lr-max-steps", 30000))),
+    feature_lr: numberValue("train-feature-lr", 0.0075),
+    opacity_lr: numberValue("train-opacity-lr", 0.02),
+    scaling_lr: numberValue("train-scaling-lr", 0.007),
+    rotation_lr: numberValue("train-rotation-lr", 0.002),
+  };
+}
+
+function applyTrainingDefaults() {
+  const defaults = {
+    "train-iterations": "30000",
+    "train-voxel-size": "0.001",
+    "train-update-init-factor": "16",
+    "train-lmbda": "0.001",
+    "train-mask-lr-final": "0.0001",
+    "train-position-lr-init": "0.0",
+    "train-position-lr-final": "0.0",
+    "train-position-lr-delay-mult": "0.01",
+    "train-position-lr-max-steps": "30000",
+    "train-offset-lr-init": "0.01",
+    "train-offset-lr-final": "0.0001",
+    "train-offset-lr-delay-mult": "0.01",
+    "train-offset-lr-max-steps": "30000",
+    "train-mask-lr-init": "0.01",
+    "train-mask-lr-delay-mult": "0.01",
+    "train-mask-lr-max-steps": "30000",
+    "train-feature-lr": "0.0075",
+    "train-opacity-lr": "0.02",
+    "train-scaling-lr": "0.007",
+    "train-rotation-lr": "0.002",
+  };
+  Object.entries(defaults).forEach(([id, value]) => {
+    const node = document.getElementById(id);
+    if (node && !String(node.value || "").trim()) {
+      node.value = value;
+    }
+  });
+}
 
 const workflowState = {
   apiChecked: false,
@@ -495,11 +597,15 @@ function flowStateForBlock(blockId) {
   }
   if (blockId === "flow-capture") {
     if (!workflowState.adapterReady) return "locked";
+    if (useExisting) {
+      return existingDatasetReady ? "done" : "active";
+    }
     return workflowState.frameReady ? "done" : "active";
   }
   if (blockId === "flow-remote-config") {
     if (!workflowState.adapterReady) return "locked";
-    return workflowState.remoteConfigReady && workflowState.sshChecked ? "done" : "active";
+    if (workflowState.remoteConfigReady && workflowState.sshChecked) return "done";
+    return "active";
   }
   if (blockId === "flow-remote-run") {
     if (!workflowState.remoteConfigReady || !workflowState.sshChecked) {
@@ -606,7 +712,9 @@ function refreshWorkflowHint() {
     return;
   }
   if (!workflowState.sshChecked) {
-    node.textContent = "Step 4: Run Check SSH before starting remote job.";
+    node.textContent = useExisting
+      ? "Step 4: Run Check SSH, then select an existing remote dataset."
+      : "Step 4: Run Check SSH before starting remote job.";
     return;
   }
   if (!selectedOperationSupportsRemote()) {
@@ -687,7 +795,11 @@ function refreshWorkflowUI() {
   if (!workflowState.adapterReady) {
     setStepPill("step-pill-capture", "locked", "Locked");
   } else {
-    setStepPill("step-pill-capture", workflowState.frameReady ? "done" : "active", workflowState.frameReady ? "Done" : "Active");
+    if (useExisting && existingDatasetReady) {
+      setStepPill("step-pill-capture", "done", "Skipped");
+    } else {
+      setStepPill("step-pill-capture", workflowState.frameReady ? "done" : "active", workflowState.frameReady ? "Done" : "Active");
+    }
   }
 
   if (!workflowState.adapterReady) {
@@ -1555,7 +1667,11 @@ async function loadJobLogs(page = 1) {
 }
 
 async function refreshJobs() {
-  const data = await fetchJobs(getApiBaseUrl());
+  const apiBase = getApiBaseUrl();
+  const [data, discovered] = await Promise.all([
+    fetchJobs(apiBase),
+    fetchDiscoveredResults(apiBase, { limit: 30, maxScanDirs: 1800 }).catch(() => ({ results: [], latest: null })),
+  ]);
   const jobs = data.jobs ?? [];
   lastJobsSnapshot = jobs;
   renderJobs(jobs);
@@ -1567,6 +1683,11 @@ async function refreshJobs() {
   const runningJob = jobs.slice().reverse().find((item) => item.status === "running" || item.status === "queued");
   if (runningJob) {
     applyJobMetrics(runningJob);
+  } else {
+    const latestDiscovered = discovered?.latest ?? (Array.isArray(discovered?.results) ? discovered.results[0] : null);
+    if (latestDiscovered) {
+      applyJobMetrics(latestDiscovered);
+    }
   }
   return jobs;
 }
@@ -1599,6 +1720,7 @@ async function handleExportPackage() {
 
 async function handleSubmitAlgorithmJob() {
   const extraArgs = parseExtraArgs();
+  const trainingOptions = collectTrainingOptions();
   const algorithmFamily = document.getElementById("algorithm-family").value;
   const operation = document.getElementById("algorithm-operation").value;
   const outputDir = document.getElementById("server-output-dir").value.trim();
@@ -1623,6 +1745,7 @@ async function handleSubmitAlgorithmJob() {
     preprocess: collectPreprocessOptions(),
     editor: collectEditorOptions(),
     viewer_backend: document.getElementById("viewer-backend").value,
+    ...trainingOptions,
     path_confirmation: pathConfirmation,
   };
   const result = await submitAlgorithmJob(getApiBaseUrl(), payload);
@@ -1637,6 +1760,7 @@ async function handleSubmitAlgorithmJob() {
 
 async function handleRunCapturePipeline() {
   const runtime = currentRuntimeContext();
+  const trainingOptions = collectTrainingOptions();
   const sessionId = document.getElementById("stream-session-id").value.trim() || "default-session";
   const outputDir =
     document.getElementById("server-output-dir").value.trim() ||
@@ -1647,6 +1771,7 @@ async function handleRunCapturePipeline() {
     output_dir: outputDir,
     repo_path: runtime.repoPath,
     checkpoint_path: runtime.checkpointPath,
+    ...trainingOptions,
     execute_immediately: true,
   });
   document.getElementById("server-output-dir").value = result.pipeline.output_dir;
@@ -1674,6 +1799,7 @@ async function handleRunCapturePipeline() {
 
 async function handleOneClickRemoteTrain() {
   const runtime = currentRuntimeContext();
+  const trainingOptions = collectTrainingOptions();
   const sessionId = document.getElementById("stream-session-id").value.trim() || "default-session";
   const operation = document.getElementById("algorithm-operation").value;
   const useExisting = isUseExistingRemoteDataset();
@@ -1731,6 +1857,7 @@ async function handleOneClickRemoteTrain() {
     checkpoint_path: runtime.checkpointPath,
     output_dir: outputDir,
     path_confirmation: pathConfirmation,
+    ...trainingOptions,
     remote: collectRemoteConfig(),
     require_remote_check: true,
   });
@@ -2220,6 +2347,49 @@ function bindEvents() {
     await copyCurrentJobLogTail();
   });
 
+  const jobLogsLayout = document.querySelector(".job-logs-layout");
+  const jobLogsDivider = document.getElementById("job-logs-divider");
+  if (jobLogsDivider && jobLogsLayout) {
+    let dragging = false;
+    const updateFromPointer = (clientX) => {
+      const rect = jobLogsLayout.getBoundingClientRect();
+      if (!rect.width) return;
+      const fraction = Math.max(0.22, Math.min(0.78, (clientX - rect.left) / rect.width));
+      const ratio = fraction / Math.max(0.0001, 1 - fraction);
+      applyJobLogLayoutRatio(ratio);
+    };
+
+    jobLogsDivider.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return;
+      dragging = true;
+      jobLogsDivider.setPointerCapture(event.pointerId);
+      document.body.classList.add("job-logs-resizing");
+      updateFromPointer(event.clientX);
+    });
+
+    jobLogsDivider.addEventListener("pointermove", (event) => {
+      if (!dragging) return;
+      updateFromPointer(event.clientX);
+    });
+
+    const finishDrag = () => {
+      if (!dragging) return;
+      dragging = false;
+      document.body.classList.remove("job-logs-resizing");
+    };
+
+    jobLogsDivider.addEventListener("pointerup", finishDrag);
+    jobLogsDivider.addEventListener("pointercancel", finishDrag);
+    window.addEventListener("pointerup", finishDrag);
+  }
+
+  const fullscreenButton = document.getElementById("toggle-job-logs-fullscreen");
+  if (fullscreenButton) {
+    fullscreenButton.addEventListener("click", () => {
+      setJobLogsFullscreen(!document.body.classList.contains("job-logs-fullscreen"));
+    });
+  }
+
   document.getElementById("job-metrics-prev").addEventListener("click", async () => {
     if (jobLogState.page <= 1) return;
     try {
@@ -2372,6 +2542,9 @@ function bindEvents() {
 
 function bootstrapDefaults() {
   flowManualState = loadFlowManualState();
+  applyJobLogLayoutRatio(loadJobLogLeftRatio());
+  setJobLogsFullscreen(false);
+  applyTrainingDefaults();
 
   document.getElementById("manifest-url").value = "./scenes/megs2-sg.scene.json";
   document.getElementById("source-url").value = "";
@@ -2449,7 +2622,7 @@ function bootstrapDefaults() {
   workflowState.jobStarted = false;
   setStepResult("step1", "idle", "Step 1 pending", "Check runtime.");
   setStepResult("step2", "idle", "Step 2 pending", "Validate adapter capability.");
-  setStepResult("step3", "idle", "Step 3 pending", "Upload first frame.");
+  setStepResult("step3", "idle", "Step 3 pending", "Choose upload or an existing remote dataset.");
   setStepResult("step4", "idle", "Step 4 pending", "Fill remote config and run Check SSH.");
   setStepResult("step5", "idle", "Step 5 pending", "Start remote job.");
   refreshWorkflowUI();

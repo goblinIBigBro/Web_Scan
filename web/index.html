@@ -106,6 +106,93 @@
                 <textarea id="server-extra-args" rows="6" placeholder='{"checkpoint_path":"","workspace":""}'></textarea>
               </label>
             </details>
+            <details class="training-panel" open>
+              <summary>Training Hyperparameters</summary>
+              <div class="training-grid">
+                <label>
+                  Iterations
+                  <input id="train-iterations" type="number" min="1" step="1" value="30000" />
+                </label>
+                <label>
+                  Voxel Size
+                  <input id="train-voxel-size" type="number" min="0.000001" step="0.000001" value="0.001" />
+                </label>
+                <label>
+                  Update Init Factor
+                  <input id="train-update-init-factor" type="number" min="1" step="1" value="16" />
+                </label>
+                <label>
+                  Lambda
+                  <input id="train-lmbda" type="number" min="0" step="0.0001" value="0.001" />
+                </label>
+                <label>
+                  Mask LR Final
+                  <input id="train-mask-lr-final" type="number" min="0" step="0.000001" value="0.0001" />
+                </label>
+              </div>
+              <div class="training-grid training-grid-lr">
+                <label>
+                  Position LR Init
+                  <input id="train-position-lr-init" type="number" step="0.0001" value="0.0" />
+                </label>
+                <label>
+                  Position LR Final
+                  <input id="train-position-lr-final" type="number" step="0.0001" value="0.0" />
+                </label>
+                <label>
+                  Position LR Delay Mult
+                  <input id="train-position-lr-delay-mult" type="number" min="0" step="0.01" value="0.01" />
+                </label>
+                <label>
+                  Position LR Max Steps
+                  <input id="train-position-lr-max-steps" type="number" min="1" step="1" value="30000" />
+                </label>
+                <label>
+                  Offset LR Init
+                  <input id="train-offset-lr-init" type="number" step="0.0001" value="0.01" />
+                </label>
+                <label>
+                  Offset LR Final
+                  <input id="train-offset-lr-final" type="number" step="0.0001" value="0.0001" />
+                </label>
+                <label>
+                  Offset LR Delay Mult
+                  <input id="train-offset-lr-delay-mult" type="number" min="0" step="0.01" value="0.01" />
+                </label>
+                <label>
+                  Offset LR Max Steps
+                  <input id="train-offset-lr-max-steps" type="number" min="1" step="1" value="30000" />
+                </label>
+                <label>
+                  Mask LR Init
+                  <input id="train-mask-lr-init" type="number" step="0.0001" value="0.01" />
+                </label>
+                <label>
+                  Mask LR Delay Mult
+                  <input id="train-mask-lr-delay-mult" type="number" min="0" step="0.01" value="0.01" />
+                </label>
+                <label>
+                  Mask LR Max Steps
+                  <input id="train-mask-lr-max-steps" type="number" min="1" step="1" value="30000" />
+                </label>
+                <label>
+                  Feature LR
+                  <input id="train-feature-lr" type="number" step="0.0001" value="0.0075" />
+                </label>
+                <label>
+                  Opacity LR
+                  <input id="train-opacity-lr" type="number" step="0.0001" value="0.02" />
+                </label>
+                <label>
+                  Scaling LR
+                  <input id="train-scaling-lr" type="number" step="0.0001" value="0.007" />
+                </label>
+                <label>
+                  Rotation LR
+                  <input id="train-rotation-lr" type="number" step="0.0001" value="0.002" />
+                </label>
+              </div>
+            </details>
             <div class="step-result-grid">
               <div id="step-result-step1" class="step-result idle"></div>
               <div id="step-result-step2" class="step-result idle"></div>
@@ -440,6 +527,7 @@
                     <a id="download-job-log" class="button-link" href="#" download>Download .log</a>
                     <a id="download-job-csv" class="button-link" href="#" download>Download metrics.csv</a>
                     <button id="copy-job-log" type="button">Copy Raw Log</button>
+                    <button id="toggle-job-logs-fullscreen" type="button">Fullscreen Logs</button>
                   </div>
                   <p id="job-log-meta" class="panel-copy job-log-meta">No job selected.</p>
                   <div class="job-logs-layout">
@@ -474,6 +562,8 @@
                         <button id="job-metrics-next" type="button">Next</button>
                       </div>
                     </section>
+
+                    <div id="job-logs-divider" class="job-logs-divider" aria-hidden="true"></div>
 
                     <section class="job-log-tail-panel">
                       <div class="job-log-section-head">

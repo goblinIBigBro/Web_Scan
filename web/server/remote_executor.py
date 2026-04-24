@@ -664,7 +664,7 @@ def _build_remote_colmap_script(workspace_dir: str) -> str:
       f"colmap_headless colmap feature_extractor "
       f"--database_path {_quote(database_path)} "
       f"--image_path {_quote(input_dir)} "
-      "--ImageReader.single_camera 1 --ImageReader.camera_model OPENCV"
+      "--ImageReader.single_camera 1 --ImageReader.camera_model SIMPLE_PINHOLE"
     ),
     f"colmap_headless colmap exhaustive_matcher --database_path {_quote(database_path)}",
     (
@@ -705,6 +705,7 @@ def run_remote_algorithm(
   remote_dataset_id: str = "",
   remote_dataset_path: str = "",
   use_existing_remote_dataset: bool = False,
+  training_args: Dict[str, Any] | None = None,
   log_callback: Callable[[str, str], None] | None = None,
   stage_callback: Callable[[str], None] | None = None,
 ) -> Dict[str, Any]:
@@ -760,6 +761,7 @@ def run_remote_algorithm(
     checkpoint_path=checkpoint_path,
     repo_path=validated["repo_path"],
     source=source_path or remote_workspace_for_command,
+    **(training_args or {}),
   )
 
   format_args = {
@@ -769,6 +771,7 @@ def run_remote_algorithm(
     "checkpoint_path": checkpoint_path,
     "repo_path": validated["repo_path"],
     "source": source_path or remote_workspace_for_command,
+    **(training_args or {}),
   }
   try:
     remote_command = sanitize_formatted_command(command_template, remote_command, format_args)

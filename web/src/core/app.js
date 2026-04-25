@@ -25,6 +25,8 @@ const root = document.getElementById("app-root");
 const STATE_KEY = "gaussvision-workbench-state-v1";
 const REMOTE_KEY = "gaussvision-remote-config-v1";
 const MAX_LOG_CHARS = 180_000;
+const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"]);
+const MODEL_EXTENSIONS = new Set([".ply"]);
 
 const NAV_ITEMS = [
   { id: "overview", label: "Overview" },
@@ -195,6 +197,53 @@ function summarize(value, length = 64) {
   const text = String(value ?? "").trim();
   if (text.length <= length) return text || "-";
   return `${text.slice(0, length - 1)}…`;
+}
+
+function fileExtension(value) {
+  const text = String(value ?? "").split("?")[0].split("#")[0].trim().toLowerCase();
+  const name = text.slice(text.lastIndexOf("/") + 1);
+  const dot = name.lastIndexOf(".");
+  return dot >= 0 ? name.slice(dot) : "";
+}
+
+function classifyAssetUrl(url) {
+  const ext = fileExtension(url);
+  if (MODEL_EXTENSIONS.has(ext)) return "ply";
+  if (IMAGE_EXTENSIONS.has(ext)) return "image";
+  return "";
+}
+
+function getRenderablePlyAsset(asset = {}) {
+  const sourceUrl = asset.point_cloud_url || asset.ply_url || asset.ply_path || "";
+  if (classifyAssetUrl(sourceUrl) !== "ply") return null;
+  return {
+    type: "ply",
+    sourceUrl,
+    viewerUrl: asset.viewer_url || "",
+  };
+}
+
+function getRenderableImageAsset(asset = {}) {
+  const imageUrl = asset.result_url || asset.output_url || asset.image_url || "";
+  if (classifyAssetUrl(imageUrl) !== "image") return null;
+  return {
+    type: "image",
+    imageUrl,
+    sourceUrl: imageUrl,
+  };
+}
+
+function classifyResultAsset(asset = {}) {
+  return getRenderablePlyAsset(asset) || getRenderableImageAsset(asset) || {
+    type: "",
+    sourceUrl: asset.point_cloud_url || asset.result_url || asset.viewer_url || asset.output_url || "",
+  };
+}
+
+function resultTypeLabel(asset = {}) {
+  if (getRenderablePlyAsset(asset)) return "PLY 3D Model";
+  if (getRenderableImageAsset(asset)) return "Image";
+  return "Unknown";
 }
 
 function formatBytes(bytes) {
@@ -773,9 +822,8 @@ function renderRealtimePage() {
 
 function renderProcessedResult() {
   const job = getJob();
-  if (job?.viewer_url) return `<iframe class="viewer-frame" src="${escapeHtml(job.viewer_url)}"></iframe>`;
-  if (job?.result_url) return `<img class="result-image" src="${escapeHtml(job.result_url)}" alt="result" />`;
-  return `<div class="viewer-frame" style="display:grid;place-items:center;"><p class="panel-copy">Waiting for upload or training results.</p></div>`;
+  if (job) return renderResultSurface(job, { tall: false });
+  return renderResultSurface(null, { tall: false, emptyText: "Waiting for upload or training results." });
 }
 
 function renderAlgorithmPage() {
@@ -1026,32 +1074,71 @@ function renderBrowserPage() {
           <button class="primary" data-action="load-ply" type="button">Load PLY</button>
           <button data-action="open-selected-result" type="button" ${state.selectedJobId ? "" : "disabled"}>Open Current Job Result</button>
         </div>
-        ${renderViewerSurface(state.loadedPly?.viewer_url, state.loadedPly?.point_cloud_url, state.loadedPly?.result_url)}
+        ${renderResultSurface(state.loadedPly, { tall: true })}
       </div>
     </section>
     <section class="panel">
       <div class="panel-head"><h2>Discovered Results</h2><span class="badge">${discoveredResults.length}</span></div>
       <div class="card dataset-list">
-        ${discoveredResults.length ? discoveredResults.map((item) => `
-          <article class="selectable-card">
-            <strong>${escapeHtml(summarize(item.output_dir, 84))}</strong>
-            <p class="panel-copy">${escapeHtml(item.point_cloud_url || item.result_url || item.viewer_url || "-")}</p>
-            <button data-action="open-discovered-result" data-output-dir="${escapeHtml(item.output_dir)}" type="button">Open</button>
-          </article>
-        `).join("") : `<p class="panel-copy">Click Discover Results to scan generated/runs, streams, and datasets.</p>`}
+        ${discoveredResults.length ? discoveredResults.map((item) => {
+          const asset = classifyResultAsset(item);
+          return `
+            <article class="selectable-card">
+              <div class="button-row">
+                <strong>${escapeHtml(summarize(item.output_dir, 84))}</strong>
+                <span class="badge ${asset.type ? "ok" : "warn"}">${escapeHtml(resultTypeLabel(item))}</span>
+              </div>
+              <p class="panel-copy">${escapeHtml(asset.sourceUrl || "-")}</p>
+              <button data-action="open-discovered-result" data-output-dir="${escapeHtml(item.output_dir)}" type="button">Open</button>
+            </article>
+          `;
+        }).join("") : `<p class="panel-copy">Click Discover Results to scan generated/runs, streams, and datasets.</p>`}
       </div>
     </section>
   `;
 }
 
-function renderViewerSurface(viewerUrl, pointCloudUrl, imageUrl) {
-  if (viewerUrl) return `<iframe class="viewer-frame tall" src="${escapeHtml(viewerUrl)}"></iframe>`;
-  if (imageUrl) return `<img class="result-image" src="${escapeHtml(imageUrl)}" alt="result" />`;
+function renderResultSurface(asset, options = {}) {
+  const classified = classifyResultAsset(asset || {});
+  const frameClass = `viewer-frame${options.tall === false ? "" : " tall"}`;
+  if (classified.type === "ply") {
+    if (!classified.viewerUrl) {
+      return `
+        <div class="${frameClass} result-placeholder">
+          <div>
+            <h3>PLY 3D Model Detected</h3>
+            <p class="panel-copy">${escapeHtml(classified.sourceUrl)}</p>
+            <p class="panel-copy">A PLY file must be opened through the 3D viewer. No viewer URL was returned for this model.</p>
+          </div>
+        </div>
+      `;
+    }
+    return `
+      <section class="result-surface">
+        <div class="result-toolbar">
+          <span class="badge ok">PLY 3D Model</span>
+          <span class="panel-copy">Use the 3D viewer controls to rotate and zoom.</span>
+        </div>
+        <iframe class="${frameClass}" src="${escapeHtml(classified.viewerUrl)}" title="PLY 3D model viewer"></iframe>
+      </section>
+    `;
+  }
+  if (classified.type === "image") {
+    return `
+      <section class="result-surface result-surface-image">
+        <div class="result-toolbar">
+          <span class="badge ok">Image Result</span>
+          <span class="panel-copy">Displayed as an image. 3D rendering is skipped.</span>
+        </div>
+        <img class="result-image" src="${escapeHtml(classified.imageUrl)}" alt="model result" />
+      </section>
+    `;
+  }
   return `
-    <div class="viewer-frame tall" style="display:grid;place-items:center;">
+    <div class="${frameClass} result-placeholder">
       <div>
-        <h3>Waiting for viewer assets</h3>
-        <p class="panel-copy">${pointCloudUrl ? escapeHtml(pointCloudUrl) : "PLY is preferred; images can be used as fallback."}</p>
+        <h3>Waiting for supported result assets</h3>
+        <p class="panel-copy">${classified.sourceUrl ? escapeHtml(classified.sourceUrl) : escapeHtml(options.emptyText || "PLY and image files are handled by separate viewers.")}</p>
       </div>
     </div>
   `;
@@ -1119,9 +1206,13 @@ function renderResultPage() {
   const params = new URLSearchParams(window.location.search);
   const jobId = params.get("job") || state.selectedJobId;
   const job = getJob(jobId);
-  const mode = state.renderMode || "ply";
-  const viewerUrl = mode === "ply" ? job?.viewer_url : "";
-  const imageUrl = mode === "image" ? job?.result_url : "";
+  const plyAsset = job ? getRenderablePlyAsset(job) : null;
+  const imageAsset = job ? getRenderableImageAsset(job) : null;
+  const preferredMode = state.renderMode || "ply";
+  const mode = preferredMode === "image" && imageAsset ? "image" : plyAsset ? "ply" : imageAsset ? "image" : preferredMode;
+  const surfaceAsset = mode === "image"
+    ? { result_url: imageAsset?.imageUrl || "" }
+    : { viewer_url: plyAsset?.viewerUrl || "", point_cloud_url: plyAsset?.sourceUrl || "" };
   return `
     <section class="panel">
       <div class="panel-head">
@@ -1130,14 +1221,14 @@ function renderResultPage() {
           <p class="panel-copy">${job ? `${job.algorithm_family} · ${job.id}` : "Job not found. Try opening it from discovered results."}</p>
         </div>
         <div class="button-row">
-          <button data-bind-render="ply" class="${mode === "ply" ? "primary" : ""}" data-action="set-render-mode" data-mode="ply" type="button">PLY</button>
-          <button data-bind-render="image" class="${mode === "image" ? "primary" : ""}" data-action="set-render-mode" data-mode="image" type="button">Image Fallback</button>
+          <button data-bind-render="ply" class="${mode === "ply" ? "primary" : ""}" data-action="set-render-mode" data-mode="ply" type="button" ${plyAsset ? "" : "disabled"}>PLY</button>
+          <button data-bind-render="image" class="${mode === "image" ? "primary" : ""}" data-action="set-render-mode" data-mode="image" type="button" ${imageAsset ? "" : "disabled"}>Image</button>
           <button data-page="algorithm" type="button">Back to Jobs</button>
         </div>
       </div>
       <div class="card grid">
-        ${job ? renderViewerSurface(viewerUrl, job.point_cloud_url, imageUrl || job.result_url) : `<p class="panel-copy">No renderable job yet. Finish training first or load a PLY from the Browser page.</p>`}
-        ${job && mode === "ply" && !job.viewer_url ? `<div class="error-box"><p>This job has no available PLY viewer. Switch to image fallback, or check whether the output directory contains point_cloud.ply / latest.ply.</p></div>` : ""}
+        ${job ? renderResultSurface(surfaceAsset, { tall: true }) : `<p class="panel-copy">No renderable job yet. Finish training first or load a PLY from the Browser page.</p>`}
+        ${job && !plyAsset && !imageAsset ? `<div class="error-box"><p>No supported result file was found. Supported model files use .ply, while image results use .png, .jpg, .jpeg, .bmp, .gif, .webp, .tif, or .tiff.</p></div>` : ""}
       </div>
     </section>
   `;
@@ -1701,11 +1792,13 @@ async function loadQuickPly() {
 function openDiscovered(outputDir) {
   const item = discoveredResults.find((result) => result.output_dir === outputDir);
   if (!item) return;
+  const plyAsset = getRenderablePlyAsset(item);
+  const imageAsset = getRenderableImageAsset(item);
   state.loadedPly = {
     ok: true,
-    viewer_url: item.viewer_url,
-    point_cloud_url: item.point_cloud_url,
-    result_url: item.result_url,
+    viewer_url: plyAsset?.viewerUrl || "",
+    point_cloud_url: plyAsset?.sourceUrl || "",
+    result_url: plyAsset ? "" : imageAsset?.imageUrl || "",
   };
   state.activePage = "browser";
   persistState();

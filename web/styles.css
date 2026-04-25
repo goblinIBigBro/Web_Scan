@@ -576,6 +576,30 @@ pre {
   object-fit: contain;
 }
 
+.result-surface {
+  display: grid;
+  gap: 10px;
+}
+
+.result-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.result-surface-image .result-image {
+  min-height: 300px;
+  max-height: min(560px, 58vh);
+}
+
+.result-placeholder {
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
 .viewer-frame.tall {
   height: calc(100vh - 220px);
   min-height: 560px;

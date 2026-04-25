@@ -1691,10 +1691,9 @@ def start_job_thread(job: Dict[str, Any], command: str, cwd: str | None = None) 
             **job.get("metrics", {}),
             **artifacts["metrics"],
           }
-        if artifacts.get("result_url"):
-          job["result_url"] = artifacts["result_url"]
-        if artifacts.get("viewer_url"):
-          job["viewer_url"] = artifacts["viewer_url"]
+        for key in ("manifest_url", "viewer_url", "point_cloud_url", "result_url"):
+          if artifacts.get(key):
+            job[key] = artifacts[key]
       stream.close()
 
     try:
@@ -1746,10 +1745,9 @@ def start_job_thread(job: Dict[str, Any], command: str, cwd: str | None = None) 
           **job.get("metrics", {}),
           **artifacts["metrics"],
         }
-      if artifacts.get("result_url"):
-        job["result_url"] = artifacts["result_url"]
-      if artifacts.get("viewer_url"):
-        job["viewer_url"] = artifacts["viewer_url"]
+      for key in ("manifest_url", "viewer_url", "point_cloud_url", "result_url"):
+        if artifacts.get(key):
+          job[key] = artifacts[key]
       job["return_code"] = return_code
       if return_code != 0:
         missing_module = extract_missing_module_from_stderr(job.get("stderr", ""))

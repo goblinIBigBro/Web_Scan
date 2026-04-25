@@ -566,6 +566,40 @@ def _run_remote_command(client, command: str, log_callback: Callable[[str, str],
   return return_code
 
 
+def _run_remote_command_cancellable(
+  client,
+  command: str,
+  log_callback: Callable[[str, str], None] | None,
+  cancel_checker: Callable[[], bool] | None = None,
+) -> int:
+  stdin, stdout, stderr = client.exec_command(command, get_pty=True)
+  stdin.close()
+
+  stdout_thread = threading.Thread(target=_read_stream, args=(stdout, "stdout", log_callback), daemon=True)
+  stderr_thread = threading.Thread(target=_read_stream, args=(stderr, "stderr", log_callback), daemon=True)
+  stdout_thread.start()
+  stderr_thread.start()
+
+  channel = stdout.channel
+  while not channel.exit_status_ready():
+    if cancel_checker and cancel_checker():
+      if log_callback:
+        log_callback("stderr", "[Cancel] Cancellation requested. Closing remote command channel.\n")
+      try:
+        channel.close()
+      except Exception:
+        pass
+      stdout_thread.join(timeout=1)
+      stderr_thread.join(timeout=1)
+      return 130
+    time.sleep(0.25)
+
+  return_code = channel.recv_exit_status()
+  stdout_thread.join(timeout=1)
+  stderr_thread.join(timeout=1)
+  return return_code
+
+
 def sanitize_formatted_command(command_template: str, formatted_command: str, format_args: Dict[str, Any]) -> str:
   """Remove flags from a formatted command when their template placeholders were empty.
 
@@ -708,6 +742,7 @@ def run_remote_algorithm(
   training_args: Dict[str, Any] | None = None,
   log_callback: Callable[[str, str], None] | None = None,
   stage_callback: Callable[[str], None] | None = None,
+  cancel_checker: Callable[[], bool] | None = None,
 ) -> Dict[str, Any]:
   validated = validate_remote_config(remote_config)
 
@@ -787,6 +822,14 @@ def run_remote_algorithm(
   sftp = None
 
   try:
+    def assert_not_cancelled() -> None:
+      if cancel_checker and cancel_checker():
+        raise RemoteExecutionError(
+          "Remote job was canceled by user.",
+          code_hint="WGSC-JOB-CANCELED",
+          stage="canceled",
+        )
+
     if stage_callback:
       stage_callback("connecting")
     client.connect(
@@ -800,6 +843,7 @@ def run_remote_algorithm(
     )
 
     sftp = client.open_sftp()
+    assert_not_cancelled()
 
     if use_existing_remote_dataset:
       if stage_callback:
@@ -819,6 +863,7 @@ def run_remote_algorithm(
       if stage_callback:
         stage_callback("uploading_workspace")
       upload_info = _upload_directory(sftp, workspace_dir, remote_paths["workspace_dir"])
+      assert_not_cancelled()
 
       if stage_callback:
         stage_callback("saving_named_dataset")
@@ -828,7 +873,12 @@ def run_remote_algorithm(
         f" && rm -rf {_quote(remote_workspace_for_command)}"
         f" && cp -a {_quote(remote_paths['workspace_dir'])} {_quote(remote_workspace_for_command)}"
       )
-      persist_rc = _run_remote_command(client, f"bash -lc {_quote(persist_script)}", log_callback)
+      persist_rc = _run_remote_command_cancellable(
+        client,
+        f"bash -lc {_quote(persist_script)}",
+        log_callback,
+        cancel_checker,
+      )
       if persist_rc != 0:
         raise RemoteExecutionError(
           "Failed to persist named remote dataset workspace.",
@@ -836,7 +886,7 @@ def run_remote_algorithm(
           stage="dataset",
         )
 
-    if auto_colmap and not use_existing_remote_dataset:
+    if auto_colmap:
       has_sparse = _remote_has_sparse_workspace(client, remote_workspace_for_command)
       if has_sparse:
         if log_callback:
@@ -851,7 +901,12 @@ def run_remote_algorithm(
             stage="colmap",
           )
         colmap_script = _build_remote_colmap_script(remote_workspace_for_command)
-        colmap_rc = _run_remote_command(client, f"bash -lc {_quote(colmap_script)}", log_callback)
+        colmap_rc = _run_remote_command_cancellable(
+          client,
+          f"bash -lc {_quote(colmap_script)}",
+          log_callback,
+          cancel_checker,
+        )
         if colmap_rc != 0:
           raise RemoteExecutionError(
             "Remote COLMAP preprocessing failed.",
@@ -863,6 +918,7 @@ def run_remote_algorithm(
     elif use_existing_remote_dataset and log_callback:
       log_callback("stdout", f"[Dataset] Reusing existing remote dataset: {resolved_dataset_id or remote_workspace_for_command}\n")
 
+    assert_not_cancelled()
     steps = [
       f"mkdir -p {_quote(remote_paths['output_dir'])}",
       f"cd {_quote(validated['repo_path'])}",
@@ -875,7 +931,13 @@ def run_remote_algorithm(
 
     if stage_callback:
       stage_callback("executing_remote_command")
-    return_code = _run_remote_command(client, shell_command, log_callback)
+    return_code = _run_remote_command_cancellable(client, shell_command, log_callback, cancel_checker)
+    if cancel_checker and cancel_checker():
+      raise RemoteExecutionError(
+        "Remote job was canceled by user.",
+        code_hint="WGSC-JOB-CANCELED",
+        stage="canceled",
+      )
 
     if stage_callback:
       stage_callback("downloading_output")

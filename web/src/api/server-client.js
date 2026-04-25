@@ -115,6 +115,17 @@ export async function runRemoteAlgorithm(apiBaseUrl, payload) {
   return parseJson(response);
 }
 
+export async function previewRemoteAlgorithm(apiBaseUrl, payload) {
+  const response = await fetch(withApiBase(apiBaseUrl, "api/run-remote-algorithm/preview"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  return parseJson(response);
+}
+
 export async function remoteCheck(apiBaseUrl, payload) {
   const response = await fetch(withApiBase(apiBaseUrl, "api/remote-check"), {
     method: "POST",
@@ -122,6 +133,17 @@ export async function remoteCheck(apiBaseUrl, payload) {
       "Content-Type": "application/json",
     },
     body: JSON.stringify(payload),
+  });
+  return parseJson(response);
+}
+
+export async function cancelJob(apiBaseUrl, jobId) {
+  const response = await fetch(withApiBase(apiBaseUrl, `api/jobs/${jobId}/cancel`), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({}),
   });
   return parseJson(response);
 }
@@ -155,6 +177,14 @@ export async function fetchJobLogs(apiBaseUrl, jobId, options = {}) {
     page: String(Number.isFinite(page) && page > 0 ? page : 1),
     page_size: String(Number.isFinite(pageSize) && pageSize > 0 ? pageSize : 20),
     tail_lines: String(Number.isFinite(tailLines) && tailLines > 0 ? tailLines : 120),
+  });
+  const response = await fetch(withApiBase(apiBaseUrl, `api/jobs/${jobId}/logs?${params.toString()}`));
+  return parseJson(response);
+}
+
+export async function fetchJobLogDelta(apiBaseUrl, jobId, cursor = 0) {
+  const params = new URLSearchParams({
+    cursor: String(Math.max(0, Number(cursor) || 0)),
   });
   const response = await fetch(withApiBase(apiBaseUrl, `api/jobs/${jobId}/logs?${params.toString()}`));
   return parseJson(response);
@@ -203,6 +233,17 @@ export async function prepareColmapWorkspace(apiBaseUrl, payload) {
 
 export async function runCapturePipeline(apiBaseUrl, payload) {
   const response = await fetch(withApiBase(apiBaseUrl, "api/run-capture-pipeline"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  return parseJson(response);
+}
+
+export async function loadPlyFile(apiBaseUrl, payload) {
+  const response = await fetch(withApiBase(apiBaseUrl, "api/load-ply"), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",

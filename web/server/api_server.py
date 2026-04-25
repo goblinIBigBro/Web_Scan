@@ -18,7 +18,7 @@ from collections import deque
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from shutil import which
 from typing import Any, Dict
 from urllib.parse import parse_qs, urlparse
@@ -41,6 +41,7 @@ from web.server.adapter_registry import (
 )
 from web.server.remote_executor import (
   RemoteExecutionError,
+  build_remote_paths,
   remote_preflight_check,
   run_remote_algorithm,
   sanitize_remote_config,
@@ -206,6 +207,40 @@ def read_job_log_tail_lines(job: Dict[str, Any], limit: int) -> list[str]:
   safe_limit = max(1, min(limit, 3000))
   with log_file.open("r", encoding="utf-8", errors="replace") as handle:
     return list(deque(handle, maxlen=safe_limit))
+
+
+def read_job_log_since_cursor(job: Dict[str, Any], cursor: int, max_bytes: int = 200_000) -> Dict[str, Any]:
+  ensure_job_logging(job)
+  log_file_value = str(job.get("log_file", "")).strip()
+  if not log_file_value:
+    return {"cursor": 0, "from_cursor": 0, "lines": [], "truncated": False}
+
+  log_file = Path(log_file_value)
+  if not log_file.exists():
+    return {"cursor": 0, "from_cursor": 0, "lines": [], "truncated": False}
+
+  file_size = log_file.stat().st_size
+  safe_cursor = max(0, int(cursor or 0))
+  if safe_cursor > file_size:
+    safe_cursor = 0
+
+  read_from = safe_cursor
+  truncated = False
+  if file_size - read_from > max_bytes:
+    read_from = max(0, file_size - max_bytes)
+    truncated = True
+
+  with log_file.open("rb") as handle:
+    handle.seek(read_from)
+    raw = handle.read(max_bytes)
+
+  text = raw.decode("utf-8", errors="replace")
+  return {
+    "cursor": file_size,
+    "from_cursor": read_from,
+    "lines": text.splitlines(keepends=True),
+    "truncated": truncated,
+  }
 
 
 def build_metrics_page(job: Dict[str, Any], page: int, page_size: int) -> Dict[str, Any]:
@@ -907,6 +942,67 @@ def build_viewer_url(relative_url: str, representation: str | None = None) -> st
   return f"/web/viewers/{renderer}.html?url={relative_url}"
 
 
+def load_ply_file(ply_path: str, representation: str | None = None) -> Dict[str, Any]:
+  """
+  Load a PLY file independently from the training flow.
+  Supports absolute paths and paths relative to ROOT_DIR.
+  """
+  try:
+    ply_file = Path(ply_path).resolve()
+
+    # Keep path handling explicit so load failures can be explained clearly.
+    if not (ply_file.exists()):
+      return {
+        "ok": False,
+        "error": f"PLY file does not exist: {ply_path}",
+        "path": ply_path,
+      }
+
+    if not ply_file.suffix.lower() == ".ply":
+      return {
+        "ok": False,
+        "error": f"File is not a PLY file: {ply_file.suffix}",
+        "path": str(ply_file),
+      }
+
+    # Files inside ROOT_DIR can be served directly; external files are copied
+    # into a generated cache that is reachable by the static viewer.
+    try:
+      if ROOT_DIR in ply_file.parents or ply_file == ROOT_DIR:
+        point_cloud_url = "/" + str(ply_file.relative_to(ROOT_DIR)).replace("\\", "/")
+      else:
+        cache_dir = WEB_DIR / "generated" / "ply_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        cache_filename = f"{ply_file.stem}_{int(time.time())}.ply"
+        cache_path = cache_dir / cache_filename
+
+        shutil.copy2(ply_file, cache_path)
+        point_cloud_url = "/" + str(cache_path.relative_to(ROOT_DIR)).replace("\\", "/")
+    except Exception as e:
+      return {
+        "ok": False,
+        "error": f"Could not process file path: {str(e)}",
+        "path": str(ply_file),
+      }
+
+    viewer_url = build_viewer_url(point_cloud_url, representation)
+
+    return {
+      "ok": True,
+      "point_cloud_url": point_cloud_url,
+      "viewer_url": viewer_url,
+      "path": str(ply_file),
+      "file_size": ply_file.stat().st_size,
+    }
+  except Exception as e:
+    return {
+      "ok": False,
+      "error": str(e),
+      "path": ply_path,
+    }
+
+
 def _training_format_args(payload: Dict[str, Any]) -> Dict[str, Any]:
   return {
     "iterations": payload.get("iterations", 30_000),
@@ -1185,6 +1281,109 @@ def operation_command_template(adapter: Dict[str, Any], operation: str) -> str:
   return command_template
 
 
+def build_remote_algorithm_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
+  family = str(payload.get("algorithm_family", "")).strip()
+  if not family:
+    raise ValueError("algorithm_family is required")
+
+  adapter = get_adapter(family)
+  if not adapter:
+    raise ValueError(f"Unknown algorithm family: {family}")
+
+  operation = str(payload.get("operation", "train")).strip() or "train"
+  command_template = operation_command_template(adapter, operation)
+  remote_config = validate_remote_config(extract_remote_config_input(payload))
+
+  session_id = str(payload.get("session_id", "default-session")).strip() or "default-session"
+  dataset_name = str(payload.get("dataset_name", "")).strip() or session_id
+  preview_job_id = str(payload.get("preview_job_id", "")).strip() or f"preview-{uuid.uuid4().hex[:8]}"
+  use_existing_remote_dataset = bool(payload.get("use_existing_remote_dataset", False))
+  remote_dataset_id = str(payload.get("remote_dataset_id", "")).strip()
+  remote_dataset_path = str(payload.get("remote_dataset_path", "")).strip()
+
+  if use_existing_remote_dataset:
+    if remote_dataset_path:
+      remote_workspace_for_command = str(PurePosixPath(remote_dataset_path))
+      if not remote_dataset_id:
+        remote_dataset_id = PurePosixPath(remote_workspace_for_command).parent.name
+    elif remote_dataset_id:
+      remote_workspace_for_command = str(
+        PurePosixPath(remote_config["workspace_root"]) / "datasets" / family / remote_dataset_id / "workspace"
+      )
+    else:
+      raise ValueError("remote_dataset_id or remote_dataset_path is required when use_existing_remote_dataset=true")
+  else:
+    dataset_slug = _normalize_slug(dataset_name, fallback="dataset")
+    remote_dataset_id = remote_dataset_id or f"{dataset_slug}-{preview_job_id.replace('preview-', '')}"
+    remote_workspace_for_command = str(
+      PurePosixPath(remote_config["workspace_root"]) / "datasets" / family / remote_dataset_id / "workspace"
+    )
+
+  requested_output_dir = str(payload.get("output_dir", "")).strip()
+  resolved_output_dir = resolve_project_path(requested_output_dir)
+  if not resolved_output_dir:
+    resolved_output_dir = default_run_output_dir(session_id, family)
+
+  remote_paths = build_remote_paths(
+    workspace_root=remote_config["workspace_root"],
+    output_root=remote_config["output_root"],
+    session_id=session_id,
+    family=family,
+    job_id=preview_job_id,
+  )
+
+  checkpoint_path = str(payload.get("remote_checkpoint_path", payload.get("checkpoint_path", ""))).strip()
+  input_path = str(payload.get("input_path", "")).strip()
+  source_path = str(payload.get("source", "")).strip()
+  format_args = {
+    "input_path": input_path,
+    "output_dir": remote_paths["output_dir"],
+    "workspace": remote_workspace_for_command,
+    "checkpoint_path": checkpoint_path,
+    "repo_path": remote_config["repo_path"],
+    "source": source_path or remote_workspace_for_command,
+    **_training_format_args(payload),
+  }
+  remote_command = command_template.format(**format_args)
+  remote_command = sanitize_formatted_command(command_template, remote_command, format_args)
+  if remote_command.lstrip().startswith("python "):
+    remote_command = f"{remote_config['python']}{remote_command.lstrip()[len('python') :]}"
+
+  steps = [
+    f"mkdir -p {shlex.quote(remote_paths['output_dir'])}",
+    f"cd {shlex.quote(remote_config['repo_path'])}",
+  ]
+  if remote_config["activate_cmd"]:
+    steps.append(remote_config["activate_cmd"])
+  steps.append(remote_command)
+  remote_script = " && ".join(steps)
+  missing_inputs = missing_template_fields(command_template, format_args)
+
+  return {
+    "preview_job_id": preview_job_id,
+    "algorithm_family": family,
+    "operation": operation,
+    "dataset_name": dataset_name,
+    "remote_dataset_id": remote_dataset_id,
+    "remote_workspace": remote_workspace_for_command,
+    "remote_output_dir": remote_paths["output_dir"],
+    "local_output_dir": resolved_output_dir,
+    "checkpoint_path": checkpoint_path,
+    "command_template": command_template,
+    "remote_command": remote_command,
+    "shell_command": f"bash -lc {shlex.quote(remote_script)}",
+    "missing_inputs": missing_inputs,
+    "remote": sanitize_remote_config(remote_config),
+    "path_confirmation": {
+      "confirmed": True,
+      "family": family,
+      "operation": operation,
+      "checkpoint_path": checkpoint_path,
+      "output_dir": resolved_output_dir,
+    },
+  }
+
+
 def safe_int(raw_value: Any, default: int, *, minimum: int, maximum: int) -> int:
   try:
     value = int(raw_value)
@@ -1236,7 +1435,7 @@ def enrich_job(job: Dict[str, Any]) -> Dict[str, Any]:
   if isinstance(enriched.get("metrics_history"), list):
     enriched["metrics_history_count"] = len(enriched["metrics_history"])
     enriched.pop("metrics_history", None)
-  for private_field in ("log_dir", "log_file", "metrics_csv_file"):
+  for private_field in ("log_dir", "log_file", "metrics_csv_file", "_process"):
     enriched.pop(private_field, None)
   return enriched
 
@@ -1468,6 +1667,10 @@ def prune_job_history() -> None:
 def start_job_thread(job: Dict[str, Any], command: str, cwd: str | None = None) -> None:
   def runner() -> None:
     ensure_job_logging(job)
+    if job.get("cancel_requested"):
+      job["status"] = "canceled"
+      job["finished_at"] = time.time()
+      return
     job["status"] = "running"
     job["started_at"] = time.time()
     job["metrics"] = {}
@@ -1529,6 +1732,7 @@ def start_job_thread(job: Dict[str, Any], command: str, cwd: str | None = None) 
         text=True,
         bufsize=1,
       )
+      job["_process"] = process
       stdout_thread = threading.Thread(target=consume_stream, args=(process.stdout, "stdout"), daemon=True)
       stderr_thread = threading.Thread(target=consume_stream, args=(process.stderr, "stderr"), daemon=True)
       stdout_thread.start()
@@ -1556,12 +1760,16 @@ def start_job_thread(job: Dict[str, Any], command: str, cwd: str | None = None) 
             append_job_log_line(job, "stderr", hint_text)
             merged_stderr = f"{job.get('stderr', '').rstrip()}\n\n{hint_text}".strip()
             job["stderr"] = merged_stderr[-12000:]
-      job["status"] = "completed" if return_code == 0 else "failed"
+      if job.get("cancel_requested"):
+        job["status"] = "canceled"
+      else:
+        job["status"] = "completed" if return_code == 0 else "failed"
     except Exception as exc:  # pragma: no cover
-      job["status"] = "failed"
+      job["status"] = "canceled" if job.get("cancel_requested") else "failed"
       append_job_log_line(job, "stderr", str(exc))
       job["stderr"] = str(exc)
     finally:
+      job.pop("_process", None)
       job["finished_at"] = time.time()
 
   threading.Thread(target=runner, daemon=True).start()
@@ -1587,6 +1795,11 @@ def start_remote_job_thread(
 ) -> None:
   def runner() -> None:
     ensure_job_logging(job)
+    if job.get("cancel_requested"):
+      job["status"] = "canceled"
+      job["remote_stage"] = "canceled"
+      job["finished_at"] = time.time()
+      return
     job["status"] = "running"
     job["started_at"] = time.time()
     job["metrics"] = {}
@@ -1635,6 +1848,7 @@ def start_remote_job_thread(
         training_args=training_args or {},
         log_callback=on_log,
         stage_callback=on_stage,
+        cancel_checker=lambda: bool(job.get("cancel_requested")),
       )
       job["return_code"] = result.get("return_code", 1)
       job["remote_result"] = {
@@ -1647,9 +1861,17 @@ def start_remote_job_thread(
         "download": result.get("download", {}),
       }
       update_artifacts()
-      job["status"] = "completed" if job["return_code"] == 0 else "failed"
+      if job.get("cancel_requested"):
+        job["status"] = "canceled"
+        job["remote_stage"] = "canceled"
+      else:
+        job["status"] = "completed" if job["return_code"] == 0 else "failed"
     except Exception as exc:  # pragma: no cover - network/runtime dependent
-      job["status"] = "failed"
+      if job.get("cancel_requested") or getattr(exc, "code_hint", "") == "WGSC-JOB-CANCELED":
+        job["status"] = "canceled"
+        job["remote_stage"] = "canceled"
+      else:
+        job["status"] = "failed"
       append_job_log_line(job, "stderr", str(exc))
       merged_stderr = f"{job.get('stderr', '').rstrip()}\n{exc}".strip()
       job["stderr"] = merged_stderr[-12000:]
@@ -1728,6 +1950,23 @@ class ApiHandler(SimpleHTTPRequestHandler):
         return
 
       if len(parts) == 4 and parts[3] == "logs":
+        if "cursor" in query:
+          cursor = safe_int(query.get("cursor", ["0"])[0], 0, minimum=0, maximum=10_000_000_000)
+          delta = read_job_log_since_cursor(job, cursor)
+          json_response(self, {
+            "ok": True,
+            "job_id": job_id,
+            "status": job.get("status", "-"),
+            "cursor": delta["cursor"],
+            "from_cursor": delta["from_cursor"],
+            "log_lines": delta["lines"],
+            "log_text": "".join(delta["lines"]),
+            "truncated": delta["truncated"],
+            "logs_download_url": f"/api/jobs/{job_id}/logs/download",
+            "metrics_csv_url": f"/api/jobs/{job_id}/metrics.csv",
+          })
+          return
+
         page = safe_int(query.get("page", ["1"])[0], 1, minimum=1, maximum=100000)
         page_size = safe_int(query.get("page_size", ["20"])[0], 20, minimum=1, maximum=200)
         tail_lines = safe_int(query.get("tail_lines", ["120"])[0], 120, minimum=1, maximum=3000)
@@ -1790,6 +2029,37 @@ class ApiHandler(SimpleHTTPRequestHandler):
         status=400,
         manual_anchor="#9-%E5%B8%B8%E8%A7%81%E9%94%99%E8%AF%AF%E7%A0%81%E4%B8%8E%E8%A7%A3%E5%86%B3%E6%96%B9%E6%A1%88",
       )
+      return
+
+    if parsed.path.startswith("/api/jobs/") and parsed.path.endswith("/cancel"):
+      parts = parsed.path.strip("/").split("/")
+      job_id = parts[2] if len(parts) >= 3 else ""
+      job = JOBS.get(job_id)
+      if not job:
+        json_response(self, {"ok": False, "error": f"Unknown job: {job_id}"}, status=404)
+        return
+
+      status = str(job.get("status", "")).strip().lower()
+      if status in {"completed", "failed", "canceled"}:
+        json_response(self, {"ok": True, "job": enrich_job(job), "message": f"Job is already {status}."})
+        return
+
+      job["cancel_requested"] = True
+      job["status"] = "canceled"
+      job["remote_stage"] = "canceled"
+      append_job_log_line(job, "stderr", "[Cancel] User requested job cancellation.\n")
+      process = job.get("_process")
+      if process is not None:
+        try:
+          if process.poll() is None:
+            process.terminate()
+        except Exception as exc:
+          append_job_log_line(job, "stderr", f"[Cancel] Failed to terminate local process: {exc}\n")
+      json_response(self, {
+        "ok": True,
+        "code": "WGSC-JOB-CANCELED",
+        "job": enrich_job(job),
+      })
       return
 
     if parsed.path == "/api/jobs/clear":
@@ -1938,6 +2208,40 @@ class ApiHandler(SimpleHTTPRequestHandler):
       })
       return
 
+    if parsed.path == "/api/run-remote-algorithm/preview":
+      try:
+        preview = build_remote_algorithm_preview(payload)
+      except RemoteExecutionError as exc:
+        error_response(
+          self,
+          code=exc.code_hint or "WGSC-STEP5-PREVIEW-001",
+          step="preview",
+          message=str(exc),
+          reason=f"stage={exc.stage or 'preview'}",
+          status=400,
+          details={"stage": exc.stage or "preview"},
+          next_action="Fix the remote configuration or command inputs, then preview again.",
+        )
+        return
+      except Exception as exc:
+        error_response(
+          self,
+          code="WGSC-STEP5-PREVIEW-001",
+          step="preview",
+          message=str(exc),
+          status=400,
+          next_action="Fix the algorithm, dataset, output, or remote configuration, then preview again.",
+        )
+        return
+
+      json_response(self, {
+        "ok": True,
+        "code": "WGSC-STEP5-PREVIEW-OK",
+        "step": "preview",
+        "preview": preview,
+      })
+      return
+
     if parsed.path == "/api/run-remote-algorithm":
       family = payload.get("algorithm_family", "")
       if not family:
@@ -2082,7 +2386,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
             timeout_seconds=20,
             family=family,
             include_datasets=True,
-            check_colmap_required=(not use_existing_remote_dataset and auto_colmap),
+            check_colmap_required=auto_colmap,
           )
         except RemoteExecutionError as exc:
           error_response(
@@ -2151,7 +2455,8 @@ class ApiHandler(SimpleHTTPRequestHandler):
         )
         return
 
-      job_id = str(uuid.uuid4())
+      requested_job_id = str(payload.get("job_id", payload.get("preview_job_id", ""))).strip()
+      job_id = requested_job_id if requested_job_id and requested_job_id not in JOBS else str(uuid.uuid4())
       job = {
         "id": job_id,
         "status": "queued",
@@ -2538,6 +2843,22 @@ class ApiHandler(SimpleHTTPRequestHandler):
           status=400,
           manual_anchor="#6-%E5%88%86%E6%AD%A5%E6%B5%81%E7%A8%8B%E8%B0%83%E8%AF%95%E5%85%9C%E5%BA%95",
         )
+      return
+
+    if parsed.path == "/api/load-ply":
+      ply_path = str(payload.get("ply_path", "")).strip()
+      representation = str(payload.get("representation", "")).strip() or None
+
+      if not ply_path:
+        json_response(self, {
+          "ok": False,
+          "error": "Missing ply_path parameter",
+        }, status=400)
+        return
+
+      result = load_ply_file(ply_path, representation)
+      status = 200 if result.get("ok") else 400
+      json_response(self, result, status=status)
       return
 
     json_response(self, {"error": f"Unsupported endpoint: {parsed.path}"}, status=404)

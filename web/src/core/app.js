@@ -1,1487 +1,185 @@
 import {
-  buildDirectSceneConfig,
-  loadSceneManifest,
-  manifestSchemaExample,
-  parseVec3Input,
-} from "../loaders/scene-manifest-loader.js";
-import {
   buildJobLogDownloadUrl,
   buildJobMetricsCsvUrl,
-  exportScenePackage,
-  fetchEnvironmentCheck,
-  fetchDiscoveredResults,
+  cancelJob,
   fetchAlgorithms,
+  fetchDiscoveredResults,
+  fetchEnvironmentCheck,
   fetchHealth,
   fetchJob,
+  fetchJobLogDelta,
   fetchJobLogs,
   fetchJobs,
+  loadPlyFile,
   materializeSession,
   prepareColmapWorkspace,
+  previewRemoteAlgorithm,
   remoteCheck,
   runRemoteAlgorithm,
-  runCapturePipeline,
   streamFrame,
-  submitAlgorithmJob,
-  updateAdapter,
   validateAdapter,
 } from "../api/server-client.js";
-import { resolveRenderer } from "../renderers/renderer-registry.js";
-import { getMethodDefinition } from "../scene/survey-method-registry.js";
-import {
-  applyAlgorithmOptions,
-  bindStaticOptions,
-  renderAdapterDetail,
-  renderEnvironmentCheck,
-  renderManifestSchema,
-  renderJobs,
-  renderRecentScenes,
-  renderMethodRegistry,
-  setOperationOptions,
-  setShareUrl,
-  setOverlayVisible,
-  updateStatus,
-  updateViewerHeader,
-} from "../ui/control-panel.js";
 
-const frame = document.getElementById("viewer-frame");
-let activeRenderer = null;
-let currentScene = null;
-const RECENT_SCENES_KEY = "gaussian-web-recent-scenes";
-let serverAlgorithms = [];
-let serverValidation = new Map();
-let jobPollTimer = null;
+const root = document.getElementById("app-root");
+
+const STATE_KEY = "gaussvision-workbench-state-v1";
+const REMOTE_KEY = "gaussvision-remote-config-v1";
+const MAX_LOG_CHARS = 180_000;
+
+const NAV_ITEMS = [
+  { id: "overview", label: "Overview" },
+  { id: "data", label: "Data" },
+  { id: "realtime", label: "Realtime" },
+  { id: "algorithm", label: "Algorithms" },
+  { id: "browser", label: "Browser" },
+  { id: "analysis", label: "Analysis" },
+];
+
+const PAGE_ALIASES = {
+  train: "algorithm",
+  monitor: "algorithm",
+  debug: "data",
+  viewer: "browser",
+};
+
+const DEFAULT_REMOTE = {
+  host: "",
+  port: 22,
+  username: "",
+  password: "",
+  repo_path: "",
+  workspace_root: "/tmp/web_scan/workspaces",
+  output_root: "/tmp/web_scan/outputs",
+  python: "python3",
+  activate_cmd: "",
+};
+
+const DEFAULT_TRAINING = {
+  iterations: 30000,
+  voxel_size: 0.001,
+  update_init_factor: 16,
+  lmbda: 0.001,
+  mask_lr_final: 0.0001,
+  position_lr_init: 0,
+  position_lr_final: 0,
+  position_lr_delay_mult: 0.01,
+  position_lr_max_steps: 30000,
+  offset_lr_init: 0.01,
+  offset_lr_final: 0.0001,
+  offset_lr_delay_mult: 0.01,
+  offset_lr_max_steps: 30000,
+  mask_lr_init: 0.01,
+  mask_lr_delay_mult: 0.01,
+  mask_lr_max_steps: 30000,
+  feature_lr: 0.0075,
+  opacity_lr: 0.02,
+  scaling_lr: 0.007,
+  rotation_lr: 0.002,
+};
+
+let algorithms = [];
+let validation = new Map();
+let jobs = [];
+let discoveredResults = [];
+let environmentReport = null;
 let cameraStream = null;
 let streamTimer = null;
-let lastJobSceneToken = "";
-let lastMaterializedSession = null;
-let lastColmapWorkspace = null;
-let environmentReport = null;
-let lastRemoteCheckReport = null;
-let suppressFlowToggleSync = false;
-let flowManualState = {};
-let lastJobsSnapshot = [];
-let uploadPreviewObjectUrls = [];
+let busy = false;
+let toastTimer = null;
 
-const FLOW_BLOCK_IDS = [
-  "flow-runtime",
-  "flow-capture",
-  "flow-remote-config",
-  "flow-remote-run",
-  "flow-local-debug",
-];
-const FLOW_MANUAL_STATE_KEY = "gaussian-web-flow-manual-state-v1";
-const DEFAULT_LOG_PAGE_SIZE = 20;
+const state = loadState();
 
-const jobLogState = {
-  jobId: "",
-  page: 1,
-  pageSize: DEFAULT_LOG_PAGE_SIZE,
-  totalPages: 1,
-  tailLines: 120,
-};
-
-const JOB_LOG_LAYOUT_KEY = "gaussian-web-job-log-left-ratio-v1";
-const DEFAULT_JOB_LOG_LEFT_RATIO = 1.2;
-
-let jobLogLeftRatio = DEFAULT_JOB_LOG_LEFT_RATIO;
-
-function loadJobLogLeftRatio() {
-  try {
-    const raw = Number(localStorage.getItem(JOB_LOG_LAYOUT_KEY));
-    if (Number.isFinite(raw) && raw >= 0.7 && raw <= 2.5) {
-      return raw;
-    }
-  } catch {
-    // ignore storage errors
-  }
-  return DEFAULT_JOB_LOG_LEFT_RATIO;
-}
-
-function saveJobLogLeftRatio(nextRatio) {
-  try {
-    localStorage.setItem(JOB_LOG_LAYOUT_KEY, String(nextRatio));
-  } catch {
-    // ignore storage errors
-  }
-}
-
-function applyJobLogLayoutRatio(nextRatio) {
-  const safeRatio = Number.isFinite(nextRatio) ? Math.max(0.7, Math.min(2.5, nextRatio)) : DEFAULT_JOB_LOG_LEFT_RATIO;
-  jobLogLeftRatio = safeRatio;
-  document.documentElement.style.setProperty("--job-log-left-ratio", `${safeRatio.toFixed(3)}fr`);
-  saveJobLogLeftRatio(safeRatio);
-}
-
-function setJobLogsFullscreen(enabled) {
-  document.body.classList.toggle("job-logs-fullscreen", Boolean(enabled));
-  const button = document.getElementById("toggle-job-logs-fullscreen");
-  if (button) {
-    button.textContent = enabled ? "Exit Fullscreen" : "Fullscreen Logs";
-  }
-}
-
-function collectTrainingOptions() {
-  const numberValue = (id, fallback) => {
-    const node = document.getElementById(id);
-    const value = Number(node?.value);
-    return Number.isFinite(value) ? value : fallback;
-  };
+function defaultState() {
   return {
-    iterations: Math.max(1, Math.round(numberValue("train-iterations", 30000))),
-    voxel_size: numberValue("train-voxel-size", 0.001),
-    update_init_factor: Math.max(1, Math.round(numberValue("train-update-init-factor", 16))),
-    lmbda: numberValue("train-lmbda", 0.001),
-    mask_lr_final: numberValue("train-mask-lr-final", 0.0001),
-    position_lr_init: numberValue("train-position-lr-init", 0.0),
-    position_lr_final: numberValue("train-position-lr-final", 0.0),
-    position_lr_delay_mult: numberValue("train-position-lr-delay-mult", 0.01),
-    position_lr_max_steps: Math.max(1, Math.round(numberValue("train-position-lr-max-steps", 30000))),
-    offset_lr_init: numberValue("train-offset-lr-init", 0.01),
-    offset_lr_final: numberValue("train-offset-lr-final", 0.0001),
-    offset_lr_delay_mult: numberValue("train-offset-lr-delay-mult", 0.01),
-    offset_lr_max_steps: Math.max(1, Math.round(numberValue("train-offset-lr-max-steps", 30000))),
-    mask_lr_init: numberValue("train-mask-lr-init", 0.01),
-    mask_lr_delay_mult: numberValue("train-mask-lr-delay-mult", 0.01),
-    mask_lr_max_steps: Math.max(1, Math.round(numberValue("train-mask-lr-max-steps", 30000))),
-    feature_lr: numberValue("train-feature-lr", 0.0075),
-    opacity_lr: numberValue("train-opacity-lr", 0.02),
-    scaling_lr: numberValue("train-scaling-lr", 0.007),
-    rotation_lr: numberValue("train-rotation-lr", 0.002),
+    activePage: initialPage(),
+    apiBaseUrl: window.location.origin,
+    apiOnline: null,
+    sessionId: "session-demo",
+    captureId: "",
+    datasetName: "",
+    uploadedCount: 0,
+    useExistingRemoteDataset: false,
+    selectedRemoteDatasetId: "",
+    remoteDatasetPath: "",
+    autoColmap: true,
+    algorithmFamily: "",
+    operation: "train",
+    outputDir: "",
+    checkpointPath: "",
+    renderMode: "ply",
+    selectedJobId: "",
+    quickPlyPath: "",
+    loadedPly: null,
+    remoteConfig: { ...DEFAULT_REMOTE },
+    training: { ...DEFAULT_TRAINING },
+    sshChecked: false,
+    remoteReport: null,
+    lastPreview: null,
+    lastError: null,
+    logCursor: 0,
+    logText: "",
+    metricsRows: [],
   };
 }
 
-function applyTrainingDefaults() {
-  const defaults = {
-    "train-iterations": "30000",
-    "train-voxel-size": "0.001",
-    "train-update-init-factor": "16",
-    "train-lmbda": "0.001",
-    "train-mask-lr-final": "0.0001",
-    "train-position-lr-init": "0.0",
-    "train-position-lr-final": "0.0",
-    "train-position-lr-delay-mult": "0.01",
-    "train-position-lr-max-steps": "30000",
-    "train-offset-lr-init": "0.01",
-    "train-offset-lr-final": "0.0001",
-    "train-offset-lr-delay-mult": "0.01",
-    "train-offset-lr-max-steps": "30000",
-    "train-mask-lr-init": "0.01",
-    "train-mask-lr-delay-mult": "0.01",
-    "train-mask-lr-max-steps": "30000",
-    "train-feature-lr": "0.0075",
-    "train-opacity-lr": "0.02",
-    "train-scaling-lr": "0.007",
-    "train-rotation-lr": "0.002",
-  };
-  Object.entries(defaults).forEach(([id, value]) => {
-    const node = document.getElementById(id);
-    if (node && !String(node.value || "").trim()) {
-      node.value = value;
-    }
-  });
+function initialPage() {
+  const params = new URLSearchParams(window.location.search);
+  const raw = params.get("page") || "overview";
+  return PAGE_ALIASES[raw] || raw;
 }
 
-const workflowState = {
-  apiChecked: false,
-  adapterReady: false,
-  frameReady: false,
-  sessionReady: false,
-  remoteConfigReady: false,
-  sshChecked: false,
-  jobStarted: false,
-};
-
-function isAdapterValidationReady(validation) {
-  if (!validation) return false;
-  const ready = validation.is_ready ?? false;
-  return Boolean(ready);
-}
-
-function computeRemoteConfigReady() {
-  const remote = collectRemoteConfig();
-  const required = [
-    remote.host,
-    remote.username,
-    remote.password,
-    remote.repo_path,
-    remote.workspace_root,
-    remote.output_root,
-  ];
-  return required.every((item) => Boolean(String(item || "").trim()));
-}
-
-function generateCaptureBatchId() {
-  return `capture-${Date.now()}-${Math.random().toString(16).slice(2, 6)}`;
-}
-
-function getUploadInputNode() {
-  return document.getElementById("stream-image-file");
-}
-
-function getSelectedUploadFiles() {
-  return Array.from(getUploadInputNode()?.files ?? []);
-}
-
-function revokeUploadPreviewObjectUrls() {
-  uploadPreviewObjectUrls.forEach((url) => {
-    try {
-      URL.revokeObjectURL(url);
-    } catch {
-      // ignore URL revoke errors
-    }
-  });
-  uploadPreviewObjectUrls = [];
-}
-
-function formatFileSize(bytes) {
-  const value = Number(bytes || 0);
-  if (!Number.isFinite(value) || value <= 0) return "0 B";
-  if (value < 1024) return `${value} B`;
-  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
-  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-function renderUploadSelectionSummary() {
-  const summaryNode = document.getElementById("upload-file-summary");
-  const previewGrid = document.getElementById("upload-preview-grid");
-  if (!summaryNode || !previewGrid) return;
-
-  revokeUploadPreviewObjectUrls();
-  const files = getSelectedUploadFiles();
-  if (!files.length) {
-    summaryNode.textContent = "No file selected. Camera capture mode is ready.";
-    const empty = document.createElement("p");
-    empty.className = "upload-preview-empty";
-    empty.textContent = "No photos selected yet.";
-    previewGrid.replaceChildren(empty);
-    return;
-  }
-
-  const totalBytes = files.reduce((sum, file) => sum + (Number(file.size) || 0), 0);
-  summaryNode.textContent = `${files.length} image(s) selected · ${formatFileSize(totalBytes)}`;
-
-  const previewLimit = 12;
-  const fragment = document.createDocumentFragment();
-  files.slice(0, previewLimit).forEach((file, index) => {
-    const card = document.createElement("article");
-    card.className = "upload-preview-card";
-
-    const image = document.createElement("img");
-    const objectUrl = URL.createObjectURL(file);
-    uploadPreviewObjectUrls.push(objectUrl);
-    image.src = objectUrl;
-    image.alt = file.name || `selected image ${index + 1}`;
-
-    const name = document.createElement("span");
-    name.className = "upload-preview-name";
-    name.textContent = `${index + 1}. ${file.name || `image_${index + 1}`}`;
-
-    card.appendChild(image);
-    card.appendChild(name);
-    fragment.appendChild(card);
-  });
-
-  if (files.length > previewLimit) {
-    const more = document.createElement("div");
-    more.className = "upload-preview-more";
-    more.textContent = `+${files.length - previewLimit} more`;
-    fragment.appendChild(more);
-  }
-
-  previewGrid.replaceChildren(fragment);
-}
-
-function applyDroppedUploadFiles(files) {
-  const input = getUploadInputNode();
-  if (!input) return;
-
-  const imageFiles = Array.from(files).filter((file) => String(file.type || "").startsWith("image/"));
-  if (!imageFiles.length) return;
-
+function loadState() {
+  const base = defaultState();
   try {
-    const dataTransfer = new DataTransfer();
-    imageFiles.forEach((file) => dataTransfer.items.add(file));
-    input.files = dataTransfer.files;
-    renderUploadSelectionSummary();
-  } catch {
-    // Some browsers disallow programmatic assignment of FileList.
-  }
-}
-
-function clearUploadFileSelection() {
-  const input = getUploadInputNode();
-  if (!input) return;
-  input.value = "";
-  renderUploadSelectionSummary();
-}
-
-function ensureCaptureBatchId(forceNew = false) {
-  const input = document.getElementById("capture-batch-id");
-  if (!input) return "";
-  const current = input.value.trim();
-  if (!current || forceNew) {
-    const next = generateCaptureBatchId();
-    input.value = next;
-    return next;
-  }
-  return current;
-}
-
-function isUseExistingRemoteDataset() {
-  const node = document.getElementById("use-existing-remote-dataset");
-  return Boolean(node?.checked);
-}
-
-function getSelectedRemoteDataset() {
-  const select = document.getElementById("remote-dataset-select");
-  if (!select) {
-    return { id: "", path: "", label: "" };
-  }
-  const selectedOption = select.selectedOptions?.[0] ?? null;
-  return {
-    id: String(select.value || "").trim(),
-    path: String(selectedOption?.dataset?.path || "").trim(),
-    label: String(selectedOption?.textContent || "").trim(),
-  };
-}
-
-function normalizeRemotePath(path) {
-  const raw = String(path || "").trim().replaceAll("\\", "/");
-  return raw.replace(/\/+$/, "");
-}
-
-function getAvailableFamilies() {
-  const families = (Array.isArray(serverAlgorithms) ? serverAlgorithms : [])
-    .map((item) => String(item?.family || "").trim())
-    .filter(Boolean);
-  return Array.from(new Set(families)).sort();
-}
-
-function deriveDatasetCoverage(dataset) {
-  const apiCoverage = dataset?.training_coverage;
-  if (apiCoverage && typeof apiCoverage === "object") {
-    const available = Array.isArray(apiCoverage.available_families)
-      ? apiCoverage.available_families.map((item) => String(item || "").trim()).filter(Boolean)
-      : getAvailableFamilies();
-    const trained = Array.isArray(apiCoverage.trained_families)
-      ? apiCoverage.trained_families.map((item) => String(item || "").trim()).filter(Boolean)
-      : [];
-    const failed = Array.isArray(apiCoverage.failed_families)
-      ? apiCoverage.failed_families.map((item) => String(item || "").trim()).filter(Boolean)
-      : [];
-    const running = Array.isArray(apiCoverage.running_families)
-      ? apiCoverage.running_families.map((item) => String(item || "").trim()).filter(Boolean)
-      : [];
-    const missing = Array.isArray(apiCoverage.missing_families)
-      ? apiCoverage.missing_families.map((item) => String(item || "").trim()).filter(Boolean)
-      : available.filter((item) => !trained.includes(item));
-    return { available, trained, failed, running, missing };
-  }
-
-  const available = getAvailableFamilies();
-  const datasetId = String(dataset?.id || "").trim();
-  const datasetPath = normalizeRemotePath(dataset?.path || "");
-  const trainedSet = new Set();
-  const failedSet = new Set();
-  const runningSet = new Set();
-  (Array.isArray(lastJobsSnapshot) ? lastJobsSnapshot : []).forEach((job) => {
-    if (String(job?.operation || "") !== "remote_train") return;
-    const family = String(job?.algorithm_family || "").trim();
-    if (!family) return;
-    const jobDatasetId = String(job?.remote_result?.remote_dataset_id || job?.remote_dataset_id || "").trim();
-    const jobDatasetPath = normalizeRemotePath(job?.remote_result?.remote_dataset_workspace || job?.remote_dataset_path || "");
-    if (!jobDatasetId && !jobDatasetPath) return;
-    const matchesDataset = (datasetId && jobDatasetId && datasetId === jobDatasetId)
-      || (datasetPath && jobDatasetPath && datasetPath === jobDatasetPath);
-    if (!matchesDataset) return;
-    const status = String(job?.status || "").trim().toLowerCase();
-    if (status === "completed") {
-      trainedSet.add(family);
-    } else if (status === "failed") {
-      failedSet.add(family);
-    } else if (status === "running" || status === "queued") {
-      runningSet.add(family);
-    }
-  });
-
-  const trained = Array.from(trainedSet).sort();
-  return {
-    available,
-    trained,
-    failed: Array.from(failedSet).sort(),
-    running: Array.from(runningSet).sort(),
-    missing: available.filter((item) => !trainedSet.has(item)),
-  };
-}
-
-function summarizeFamilies(families, emptyText = "None") {
-  if (!families?.length) return emptyText;
-  if (families.length <= 3) return families.join(", ");
-  return `${families.slice(0, 3).join(", ")} +${families.length - 3}`;
-}
-
-function renderRemoteDatasetLibrary(report = null) {
-  const container = document.getElementById("remote-dataset-library");
-  if (!container) return;
-
-  const datasets = Array.isArray(report?.datasets) ? report.datasets : [];
-  if (!datasets.length) {
-    container.innerHTML = '<p class="dataset-library-empty">Run Check SSH to load reusable remote datasets.</p>';
-    return;
-  }
-
-  const selected = getSelectedRemoteDataset();
-  const useExisting = isUseExistingRemoteDataset();
-
-  container.innerHTML = datasets
-    .map((dataset) => {
-      const id = String(dataset?.id || "").trim();
-      const name = String(dataset?.name || id || "Unnamed dataset").trim();
-      const frameCount = Number(dataset?.frame_count || 0);
-      const stage = dataset?.stage || {};
-      const hasRaw = Boolean(stage?.raw ?? dataset?.has_input_images);
-      const hasSparse = Boolean(stage?.sparse ?? dataset?.has_sparse_model);
-      const hasUndistorted = Boolean(stage?.undistorted ?? dataset?.has_undistorted_marker);
-      const coverage = deriveDatasetCoverage(dataset);
-
-      const cardClasses = ["dataset-card"];
-      if (id && id === selected.id) cardClasses.push("selected");
-      if (useExisting && id && id === selected.id) cardClasses.push("using-existing");
-
-      return `
-        <article class="${cardClasses.join(" ")}" data-dataset-id="${escapeHtml(id)}">
-          <header class="dataset-card-head">
-            <h4>${escapeHtml(name)}</h4>
-            <p>${escapeHtml(id || "(no id)")}</p>
-          </header>
-          <div class="dataset-stage-row">
-            <span class="dataset-badge ${hasRaw ? "ok" : "missing"}">Stage1 Raw ${hasRaw ? "Ready" : "Missing"}</span>
-            <span class="dataset-badge ${hasSparse ? "ok" : "missing"}">Stage2 Sparse ${hasSparse ? "Ready" : "Missing"}</span>
-            <span class="dataset-badge ${hasUndistorted ? "ok" : "missing"}">Undistorted ${hasUndistorted ? "Yes" : "No"}</span>
-          </div>
-          <p class="dataset-meta">Frames: ${Number.isFinite(frameCount) && frameCount > 0 ? frameCount : "unknown"} · Sparse files: ${Number(dataset?.sparse_file_count || 0)}</p>
-          <p class="dataset-meta">Trained: ${escapeHtml(summarizeFamilies(coverage.trained))}</p>
-          <p class="dataset-meta">Missing: ${escapeHtml(summarizeFamilies(coverage.missing))}</p>
-          <p class="dataset-meta">Failed: ${escapeHtml(summarizeFamilies(coverage.failed))}</p>
-          <button type="button" class="dataset-select-btn" data-select-dataset-id="${escapeHtml(id)}">Use this dataset</button>
-        </article>
-      `;
-    })
-    .join("");
-
-  container.querySelectorAll("[data-select-dataset-id]").forEach((buttonNode) => {
-    buttonNode.addEventListener("click", () => {
-      const datasetId = String(buttonNode.getAttribute("data-select-dataset-id") || "").trim();
-      if (!datasetId) return;
-      const selector = document.getElementById("remote-dataset-select");
-      const useExistingNode = document.getElementById("use-existing-remote-dataset");
-      if (selector) {
-        selector.value = datasetId;
-      }
-      if (useExistingNode) {
-        useExistingNode.checked = true;
-      }
-      refreshRemoteDatasetSummary(lastRemoteCheckReport);
-      refreshWorkflowUI();
-    });
-  });
-}
-
-function populateRemoteDatasetSelector(datasets) {
-  const select = document.getElementById("remote-dataset-select");
-  if (!select) return;
-
-  const previous = String(select.value || "").trim();
-  const safeDatasets = Array.isArray(datasets) ? datasets : [];
-
-  const options = [
-    '<option value="">Upload a new capture and run COLMAP</option>',
-  ];
-
-  safeDatasets.forEach((dataset) => {
-    const id = String(dataset?.id || "").trim();
-    if (!id) return;
-    const path = String(dataset?.path || "").trim();
-    const frameCount = Number(dataset?.frame_count || 0);
-    const stageLabel = String(dataset?.stage_label || dataset?.stage?.label || "").trim();
-    const trainedCount = Number(dataset?.trained_families?.length || 0);
-    const summary = [
-      id,
-      frameCount > 0 ? `${frameCount} frames` : "frames unknown",
-      stageLabel || "stage unknown",
-      trainedCount > 0 ? `${trainedCount} trained` : "not trained",
-    ].join(" · ");
-    options.push(`<option value="${escapeHtml(id)}" data-path="${escapeHtml(path)}">${escapeHtml(summary)}</option>`);
-  });
-
-  select.innerHTML = options.join("");
-  if (previous && safeDatasets.some((dataset) => String(dataset?.id || "").trim() === previous)) {
-    select.value = previous;
-  }
-}
-
-function refreshRemoteDatasetSummary(report = null) {
-  const summary = document.getElementById("remote-dataset-summary");
-  if (!summary) return;
-
-  renderRemoteDatasetLibrary(report);
-
-  const customPath = document.getElementById("remote-dataset-path")?.value.trim() || "";
-  const selected = getSelectedRemoteDataset();
-  const useExisting = isUseExistingRemoteDataset();
-  const availableDatasets = Array.isArray(report?.datasets)
-    ? report.datasets.length
-    : Math.max(0, (document.getElementById("remote-dataset-select")?.options?.length || 1) - 1);
-
-  if (useExisting) {
-    if (customPath) {
-      summary.textContent = `Using custom remote dataset path: ${customPath}`;
-      return;
-    }
-    if (selected.id) {
-      const selectedDataset = (Array.isArray(report?.datasets) ? report.datasets : []).find(
-        (item) => String(item?.id || "").trim() === selected.id,
-      );
-      const coverage = deriveDatasetCoverage(selectedDataset || {});
-      summary.textContent = `Using existing remote dataset: ${selected.id}. Trained ${coverage.trained.length}/${coverage.available.length}, missing ${coverage.missing.length}.`;
-      return;
-    }
-    summary.textContent = "Existing dataset mode is enabled. Please select a dataset or fill custom path.";
-    return;
-  }
-
-  const autoColmap = document.getElementById("auto-colmap")?.checked !== false;
-  summary.textContent = autoColmap
-    ? `New-upload mode: uploaded frames will run remote COLMAP automatically. SSH found ${availableDatasets} existing datasets.`
-    : `New-upload mode: remote COLMAP is disabled. SSH found ${availableDatasets} existing datasets.`;
-}
-
-function loadFlowManualState() {
-  try {
-    const raw = localStorage.getItem(FLOW_MANUAL_STATE_KEY);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object") return {};
-    return parsed;
-  } catch {
-    return {};
-  }
-}
-
-function saveFlowManualState() {
-  localStorage.setItem(FLOW_MANUAL_STATE_KEY, JSON.stringify(flowManualState));
-}
-
-function registerFlowBlockToggleHandlers() {
-  FLOW_BLOCK_IDS.forEach((id) => {
-    const node = document.getElementById(id);
-    if (!node) return;
-    node.addEventListener("toggle", () => {
-      if (suppressFlowToggleSync) return;
-      flowManualState[id] = node.open;
-      saveFlowManualState();
-    });
-  });
-}
-
-function flowStateForBlock(blockId) {
-  const useExisting = isUseExistingRemoteDataset();
-  const remoteDatasetPath = document.getElementById("remote-dataset-path")?.value.trim() || "";
-  const selectedRemoteDataset = getSelectedRemoteDataset();
-  const existingDatasetReady = Boolean(remoteDatasetPath || selectedRemoteDataset.id);
-  if (blockId === "flow-runtime") {
-    if (!workflowState.apiChecked || !workflowState.adapterReady) {
-      return "active";
-    }
-    return "done";
-  }
-  if (blockId === "flow-capture") {
-    if (!workflowState.adapterReady) return "locked";
-    if (useExisting) {
-      return existingDatasetReady ? "done" : "active";
-    }
-    return workflowState.frameReady ? "done" : "active";
-  }
-  if (blockId === "flow-remote-config") {
-    if (!workflowState.adapterReady) return "locked";
-    if (workflowState.remoteConfigReady && workflowState.sshChecked) return "done";
-    return "active";
-  }
-  if (blockId === "flow-remote-run") {
-    if (!workflowState.remoteConfigReady || !workflowState.sshChecked) {
-      return "locked";
-    }
-    if (!useExisting && !workflowState.frameReady) {
-      return "locked";
-    }
-    if (useExisting && !existingDatasetReady) {
-      return "locked";
-    }
-    return workflowState.jobStarted ? "done" : "active";
-  }
-  if (blockId === "flow-local-debug") {
-    if (!workflowState.frameReady) return "locked";
-    if (workflowState.jobStarted || workflowState.sessionReady) return "done";
-    return "locked";
-  }
-  return "locked";
-}
-
-function syncFlowBlocks() {
-  suppressFlowToggleSync = true;
-  FLOW_BLOCK_IDS.forEach((id) => {
-    const node = document.getElementById(id);
-    if (!node) return;
-    const state = flowStateForBlock(id);
-    node.dataset.flowState = state;
-    if (typeof flowManualState[id] === "boolean") {
-      node.open = flowManualState[id];
-      return;
-    }
-    node.open = state === "active";
-  });
-  suppressFlowToggleSync = false;
-}
-
-function setButtonDisabled(id, disabled) {
-  const node = document.getElementById(id);
-  if (node) {
-    node.disabled = disabled;
-  }
-}
-
-function setStepPill(id, state, text) {
-  const node = document.getElementById(id);
-  if (!node) return;
-  node.classList.remove("locked", "active", "done");
-  node.classList.add(state);
-  node.textContent = text;
-}
-
-function formatApiError(error, fallbackCode = "WGSC-UNKNOWN") {
-  if (!error) {
+    const stored = JSON.parse(localStorage.getItem(STATE_KEY) || "{}");
+    const remoteStored = JSON.parse(localStorage.getItem(REMOTE_KEY) || "{}");
     return {
-      code: fallbackCode,
-      message: "Unknown error",
-      reason: "",
-      manualUrl: "",
-      manualAnchor: "",
-      nextAction: "",
+      ...base,
+      ...stored,
+      activePage: initialPage(),
+      remoteConfig: {
+        ...DEFAULT_REMOTE,
+        ...stored.remoteConfig,
+        ...remoteStored,
+      },
+      training: {
+        ...DEFAULT_TRAINING,
+        ...stored.training,
+      },
+      logText: "",
+      logCursor: 0,
+      lastError: null,
     };
-  }
-  return {
-    code: error.code || fallbackCode,
-    message: error.message || "Unknown error",
-    reason: error.reason || "",
-    manualUrl: error.manualUrl || error.payload?.manual_url || "",
-    manualAnchor: error.manualAnchor || error.payload?.manual_anchor || "",
-    nextAction: error.nextAction || error.payload?.next_action || "",
-  };
-}
-
-function setStepResult(stepId, state, title, detail = "") {
-  const node = document.getElementById(`step-result-${stepId}`);
-  if (!node) return;
-  node.classList.remove("idle", "running", "success", "failed");
-  node.classList.add(state);
-  const detailHtml = detail ? `<p>${escapeHtml(detail)}</p>` : "";
-  node.innerHTML = `<strong>${escapeHtml(title)}</strong>${detailHtml}`;
-}
-
-function selectedOperationSupportsRemote() {
-  const adapter = getSelectedAdapter();
-  const operation = document.getElementById("algorithm-operation").value;
-  const operationConfig = adapter?.operations?.[operation];
-  return Boolean(operationConfig?.enabled && operationConfig?.template);
-}
-
-function refreshWorkflowHint() {
-  const node = document.getElementById("workflow-hint");
-  if (!node) return;
-  const useExisting = isUseExistingRemoteDataset();
-  if (!workflowState.apiChecked) {
-    node.textContent = "Step 1: Click 'Check Runtime'.";
-    return;
-  }
-  if (!workflowState.adapterReady) {
-    node.textContent = "Step 2: Validate adapter capability.";
-    return;
-  }
-  if (!workflowState.remoteConfigReady) {
-    node.textContent = "Step 4: Fill remote host/user/password and remote paths, then run Check SSH.";
-    return;
-  }
-  if (!workflowState.sshChecked) {
-    node.textContent = useExisting
-      ? "Step 4: Run Check SSH, then select an existing remote dataset."
-      : "Step 4: Run Check SSH before starting remote job.";
-    return;
-  }
-  if (!selectedOperationSupportsRemote()) {
-    node.textContent = "Step 5: Current operation has no remote template. Switch operation or update adapter config.";
-    return;
-  }
-  const remoteDatasetPath = document.getElementById("remote-dataset-path")?.value.trim() || "";
-  const selectedRemoteDataset = getSelectedRemoteDataset();
-  if (useExisting && !remoteDatasetPath && !selectedRemoteDataset.id) {
-    node.textContent = "Step 5: Existing dataset mode is on. Select a remote dataset or enter remote dataset path.";
-    return;
-  }
-  if (!useExisting && !workflowState.frameReady) {
-    node.textContent = "Step 3: Upload photos (or capture one frame) before Step 5 upload-train mode.";
-    return;
-  }
-  if (!workflowState.jobStarted) {
-    node.textContent = "Step 5: Click One-click Upload and Remote Train.";
-    return;
-  }
-  node.textContent = "Remote workflow is running or completed. You can inspect logs, refresh jobs, and export scene packages.";
-}
-
-function refreshWorkflowUI() {
-  workflowState.remoteConfigReady = computeRemoteConfigReady();
-
-  const useExisting = isUseExistingRemoteDataset();
-  const remoteDatasetPath = document.getElementById("remote-dataset-path")?.value.trim() || "";
-  const selectedRemoteDataset = getSelectedRemoteDataset();
-  const existingDatasetReady = Boolean(remoteDatasetPath || selectedRemoteDataset.id);
-
-  const canAdapter = workflowState.apiChecked;
-  const canCapture = workflowState.adapterReady;
-  const canSession = workflowState.frameReady;
-  const canRunJob = workflowState.sessionReady;
-  const canRefreshJobs = workflowState.apiChecked;
-  const canRemoteCheck = canCapture && workflowState.remoteConfigReady;
-  const canRemoteTrain =
-    canCapture
-    && (useExisting || workflowState.frameReady)
-    && workflowState.remoteConfigReady
-    && workflowState.sshChecked
-    && selectedOperationSupportsRemote()
-    && (!useExisting || existingDatasetReady);
-  const canExport = workflowState.jobStarted;
-
-  setButtonDisabled("check-api", false);
-
-  setButtonDisabled("validate-adapter", !canAdapter);
-  setButtonDisabled("save-adapter", !canAdapter);
-
-  setButtonDisabled("start-camera", !canCapture);
-  setButtonDisabled("send-frame", !canCapture);
-  setButtonDisabled("toggle-stream", !canCapture);
-  setButtonDisabled("stop-camera", !(canCapture && Boolean(cameraStream)));
-
-  setButtonDisabled("materialize-session", !canSession);
-  setButtonDisabled("use-session-workspace", !canSession);
-  setButtonDisabled("prepare-colmap-workspace", !canSession);
-  setButtonDisabled("use-colmap-workspace", !canSession);
-
-  setButtonDisabled("submit-algorithm-job", !canRunJob);
-  setButtonDisabled("run-capture-pipeline", !canRunJob);
-  setButtonDisabled("refresh-jobs", !canRefreshJobs);
-  setButtonDisabled("check-remote-ssh", !canRemoteCheck);
-  setButtonDisabled("one-click-remote-train", !canRemoteTrain);
-
-  setButtonDisabled("export-package", !canExport);
-
-  setStepPill("step-pill-api", workflowState.apiChecked ? "done" : "active", workflowState.apiChecked ? "Done" : "Active");
-
-  if (!workflowState.apiChecked) {
-    setStepPill("step-pill-adapter", "locked", "Locked");
-  } else {
-    setStepPill("step-pill-adapter", workflowState.adapterReady ? "done" : "active", workflowState.adapterReady ? "Done" : "Active");
-  }
-
-  if (!workflowState.adapterReady) {
-    setStepPill("step-pill-capture", "locked", "Locked");
-  } else {
-    if (useExisting && existingDatasetReady) {
-      setStepPill("step-pill-capture", "done", "Skipped");
-    } else {
-      setStepPill("step-pill-capture", workflowState.frameReady ? "done" : "active", workflowState.frameReady ? "Done" : "Active");
-    }
-  }
-
-  if (!workflowState.adapterReady) {
-    setStepPill("step-pill-session", "locked", "Locked");
-  } else {
-    setStepPill(
-      "step-pill-session",
-      workflowState.remoteConfigReady && workflowState.sshChecked ? "done" : "active",
-      workflowState.remoteConfigReady && workflowState.sshChecked ? "Done" : "Active",
-    );
-  }
-
-  if (
-    !workflowState.remoteConfigReady
-    || !workflowState.sshChecked
-    || (!useExisting && !workflowState.frameReady)
-    || (useExisting && !existingDatasetReady)
-  ) {
-    setStepPill("step-pill-job", "locked", "Locked");
-  } else {
-    setStepPill("step-pill-job", workflowState.jobStarted ? "done" : "active", workflowState.jobStarted ? "Done" : "Active");
-  }
-
-  refreshWorkflowHint();
-  syncFlowBlocks();
-}
-
-function showProcessedPlaceholder(message = "Waiting for server response") {
-  const placeholder = document.getElementById("processed-placeholder");
-  const image = document.getElementById("processed-frame");
-  const viewer = document.getElementById("processed-viewer-frame");
-  placeholder.querySelector("p").textContent = message;
-  placeholder.classList.remove("hidden");
-  image.classList.add("hidden");
-  viewer.classList.add("hidden");
-}
-
-function showProcessedImage(url) {
-  const placeholder = document.getElementById("processed-placeholder");
-  const image = document.getElementById("processed-frame");
-  const viewer = document.getElementById("processed-viewer-frame");
-  image.src = url + `?t=${Date.now()}`;
-  image.classList.remove("hidden");
-  viewer.classList.add("hidden");
-  viewer.removeAttribute("src");
-  placeholder.classList.add("hidden");
-}
-
-function showProcessedViewer(url) {
-  const placeholder = document.getElementById("processed-placeholder");
-  const image = document.getElementById("processed-frame");
-  const viewer = document.getElementById("processed-viewer-frame");
-  viewer.src = url + (url.includes("?") ? "&" : "?") + `t=${Date.now()}`;
-  viewer.classList.remove("hidden");
-  image.classList.add("hidden");
-  image.removeAttribute("src");
-  placeholder.classList.add("hidden");
-}
-
-async function mountJobResult(job) {
-  if (!job) return;
-  const token = job.manifest_url ?? job.point_cloud_url ?? "";
-  if (!token || token === lastJobSceneToken) return;
-
-  if (job.manifest_url) {
-    await handleManifestLoad(job.manifest_url);
-    lastJobSceneToken = job.manifest_url;
-    return;
-  }
-
-  if (job.point_cloud_url) {
-    const scene = buildDirectSceneConfig({
-      sourceUrl: job.point_cloud_url,
-      representation: job.representation ?? "sh",
-      algorithmFamily: job.algorithm_family ?? "unknown",
-    });
-    scene.title = `${job.algorithm_family ?? "Algorithm"} Output`;
-    scene.sceneId = job.id ?? "job-output";
-    await mountScene(scene);
-    lastJobSceneToken = job.point_cloud_url;
-  }
-}
-
-function getApiBaseUrl() {
-  return document.getElementById("api-base-url").value.trim();
-}
-
-function parseExtraArgs() {
-  const raw = document.getElementById("server-extra-args").value.trim();
-  if (!raw) return {};
-  return JSON.parse(raw);
-}
-
-function collectPreprocessOptions() {
-  return {
-    parser: document.getElementById("preprocess-parser").value,
-    downsample: Number(document.getElementById("preprocess-downsample").value || 1),
-    mask_path: document.getElementById("preprocess-mask-path").value.trim(),
-    reorient: document.getElementById("preprocess-reorient").checked,
-    image_uint8: document.getElementById("preprocess-image-uint8").checked,
-    async_caching: document.getElementById("preprocess-async-caching").checked,
-  };
-}
-
-function collectEditorOptions() {
-  return {
-    translation: parseVec3Input(document.getElementById("edit-translation").value, [0, 0, 0]),
-    rotation: parseVec3Input(document.getElementById("edit-rotation").value, [0, 0, 0]),
-    scale: parseVec3Input(document.getElementById("edit-scale").value, [1, 1, 1]),
-    background: document.getElementById("edit-background").value,
-  };
-}
-
-function loadRecentScenes() {
-  try {
-    return JSON.parse(localStorage.getItem(RECENT_SCENES_KEY) || "[]");
   } catch {
-    return [];
+    return base;
   }
 }
 
-function getSelectedAdapter() {
-  const family = document.getElementById("algorithm-family").value;
-  return serverAlgorithms.find((item) => item.family === family) ?? getMethodDefinition(family);
-}
-
-function syncAdapterDetail() {
-  const adapter = getSelectedAdapter();
-  const validation = adapter ? serverValidation.get(adapter.family) : null;
-  renderAdapterDetail(adapter, validation);
-  const familyReport = environmentReport?.family === adapter?.family ? environmentReport : null;
-  renderEnvironmentCheck(familyReport);
-  if (adapter?.repo_path !== undefined) {
-    document.getElementById("server-repo-path").value = adapter.repo_path ?? "";
-  }
-  if (adapter?.default_cwd !== undefined) {
-    document.getElementById("server-default-cwd").value = adapter.default_cwd ?? "";
-  }
-}
-
-function currentRuntimeContext() {
-  const extraArgs = parseExtraArgs();
-  return {
-    family: document.getElementById("algorithm-family").value,
-    repoPath: document.getElementById("server-repo-path").value.trim(),
-    cwd: document.getElementById("server-default-cwd").value.trim() || extraArgs.cwd || "",
-    workspace: extraArgs.workspace ?? "",
-    checkpointPath: extraArgs.checkpoint_path ?? "",
-  };
-}
-
-function buildPathConfirmationPayload({ family, operation, checkpointPath, outputDir }) {
-  return {
-    confirmed: true,
-    confirmed_at: new Date().toISOString(),
-    family: family ?? "",
-    operation: operation ?? "",
-    checkpoint_path: (checkpointPath ?? "").trim(),
-    output_dir: (outputDir ?? "").trim(),
-  };
-}
-
-function confirmPathSettingsOrThrow({ family, operation, checkpointPath, outputDir }) {
-  const checkpointValue = (checkpointPath ?? "").trim();
-  const outputValue = (outputDir ?? "").trim();
-
-  if (!outputValue) {
-    throw new Error("output_dir is required. Please fill Output Dir before submitting the job.");
-  }
-
-  const warning = checkpointValue
-    ? ""
-    : "\nWarning: checkpoint_path is empty. Continue only if this operation does not require checkpoint input.";
-
-  const message = [
-    "Please confirm path settings before submitting:",
-    `Family: ${family ?? "-"}`,
-    `Operation: ${operation ?? "-"}`,
-    `checkpoint_path: ${checkpointValue || "(empty)"}`,
-    `output_dir: ${outputValue}`,
-    warning,
-    "",
-    "Click OK to continue, or Cancel to edit paths.",
-  ].join("\n");
-
-  const confirmed = window.confirm(message);
-  if (!confirmed) {
-    throw new Error("Job submission canceled. Please confirm checkpoint_path/output_dir first.");
-  }
-
-  return buildPathConfirmationPayload({
-    family,
-    operation,
-    checkpointPath: checkpointValue,
-    outputDir: outputValue,
-  });
-}
-
-function collectRemoteConfig() {
-  const port = Number(document.getElementById("remote-port").value || 22);
-  return {
-    host: document.getElementById("remote-host").value.trim(),
-    port: Number.isFinite(port) && port > 0 ? port : 22,
-    username: document.getElementById("remote-username").value.trim(),
-    password: document.getElementById("remote-password").value,
-    repo_path: document.getElementById("remote-repo-path").value.trim(),
-    workspace_root: document.getElementById("remote-workspace-root").value.trim(),
-    output_root: document.getElementById("remote-output-root").value.trim(),
-    python: document.getElementById("remote-python").value.trim() || "python3",
-    activate_cmd: document.getElementById("remote-activate-cmd").value.trim(),
-  };
-}
-
-async function handleRemoteSshCheck() {
-  const runtime = currentRuntimeContext();
-  const autoColmap = document.getElementById("auto-colmap")?.checked !== false;
+function persistState() {
   const payload = {
-    remote: collectRemoteConfig(),
-    timeout_seconds: 20,
-    algorithm_family: runtime.family,
-    check_colmap_required: !isUseExistingRemoteDataset() && autoColmap,
+    ...state,
+    logText: "",
+    logCursor: 0,
+    lastError: null,
+    remoteReport: state.remoteReport,
+    lastPreview: state.lastPreview,
   };
-  updateStatus({ viewer: "remote-connecting" });
-  const result = await remoteCheck(getApiBaseUrl(), payload);
-  lastRemoteCheckReport = result.result;
-  populateRemoteDatasetSelector(result.result?.datasets || []);
-  refreshRemoteDatasetSummary(result.result);
-  workflowState.sshChecked = true;
-  updateStatus({ viewer: "remote-completed" });
-  const datasetCount = Array.isArray(result.result?.datasets) ? result.result.datasets.length : 0;
-  setStepResult(
-    "step4",
-    "success",
-    "Step 4 passed",
-    `${result.result?.summary || "SSH preflight checks passed."} Found ${datasetCount} remote datasets.`,
-  );
-  refreshWorkflowUI();
-  return result;
+  localStorage.setItem(STATE_KEY, JSON.stringify(payload));
 }
 
-function invalidateRemoteSshCheck() {
-  workflowState.sshChecked = false;
-  lastRemoteCheckReport = null;
-  populateRemoteDatasetSelector([]);
-  refreshRemoteDatasetSummary();
-}
-
-function setExtraArgs(nextArgs) {
-  document.getElementById("server-extra-args").value = JSON.stringify(nextArgs, null, 2);
-}
-
-function applyJobMetrics(job) {
-  if (!job) return;
-  let viewerState = job.status;
-  if (job.operation === "remote_train") {
-    const remoteStateMap = {
-      connecting: "remote-connecting",
-      resolving_dataset_workspace: "remote-connecting",
-      using_existing_dataset: "remote-connecting",
-      uploading_workspace: "remote-uploading",
-      executing_remote_colmap: "remote-training",
-      saving_named_dataset: "remote-uploading",
-      executing_remote_command: "remote-training",
-      downloading_output: "remote-downloading",
-      completed: "remote-completed",
-      failed: "remote-error",
-    };
-    viewerState = remoteStateMap[job.remote_stage] ?? (job.status === "failed" ? "remote-error" : job.status);
-  }
-  updateStatus({
-    job: job.id,
-    viewer: viewerState,
-    algoFps: job.metrics?.fps ?? "-",
-    loss: job.metrics?.loss ?? "-",
-    psnr: job.metrics?.psnr ?? "-",
-    iter: job.metrics?.iter ?? "-",
-  });
-  if (job.viewer_url) {
-    showProcessedViewer(job.viewer_url);
-  } else if (job.result_url) {
-    showProcessedImage(job.result_url);
-  }
-  void mountJobResult(job);
-}
-
-function startJobPolling(jobId) {
-  if (jobPollTimer) {
-    window.clearInterval(jobPollTimer);
-  }
-  jobPollTimer = window.setInterval(async () => {
-    try {
-      const job = await fetchJob(getApiBaseUrl(), jobId);
-      applyJobMetrics(job);
-      if (job.status === "completed" || job.status === "failed") {
-        window.clearInterval(jobPollTimer);
-        jobPollTimer = null;
-        await refreshJobs();
-      }
-    } catch {
-      window.clearInterval(jobPollTimer);
-      jobPollTimer = null;
+function setPage(page, options = {}) {
+  state.activePage = page;
+  persistState();
+  if (!options.silent) {
+    const url = new URL(window.location.href);
+    url.searchParams.set("page", page);
+    if (page !== "result") {
+      url.searchParams.delete("job");
     }
-  }, 2000);
-}
-
-async function startCamera() {
-  if (cameraStream) return cameraStream;
-  cameraStream = await navigator.mediaDevices.getUserMedia({
-    video: true,
-    audio: false,
-  });
-  const video = document.getElementById("local-stream");
-  video.srcObject = cameraStream;
-  refreshWorkflowUI();
-  return cameraStream;
-}
-
-function stopCamera() {
-  if (cameraStream) {
-    cameraStream.getTracks().forEach((track) => track.stop());
-    cameraStream = null;
+    window.history.pushState({}, "", url);
   }
-  const video = document.getElementById("local-stream");
-  video.srcObject = null;
-  if (streamTimer) {
-    window.clearInterval(streamTimer);
-    streamTimer = null;
-  }
-  document.getElementById("toggle-stream").textContent = "Start Stream";
-  refreshWorkflowUI();
-}
-
-async function imageFileToDataUrl(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = () => reject(reader.error);
-    reader.readAsDataURL(file);
-  });
-}
-
-async function captureCurrentFrame() {
-  await startCamera();
-  const video = document.getElementById("local-stream");
-  const canvas = document.createElement("canvas");
-  canvas.width = video.videoWidth || 1280;
-  canvas.height = video.videoHeight || 720;
-  const context = canvas.getContext("2d");
-  context.drawImage(video, 0, 0, canvas.width, canvas.height);
-  return {
-    imageData: canvas.toDataURL("image/png"),
-    filename: `frame_${Date.now()}.png`,
-  };
-}
-
-async function collectFramesForUpload() {
-  const files = getSelectedUploadFiles();
-  if (!files.length) {
-    return [await captureCurrentFrame()];
-  }
-
-  const frames = [];
-  for (const file of files) {
-    frames.push({
-      imageData: await imageFileToDataUrl(file),
-      filename: file.name || `upload_${Date.now()}.png`,
-    });
-  }
-  return frames;
-}
-
-async function sendCurrentFrame(options = {}) {
-  const triggerProcessing = options.triggerProcessing !== false;
-  const placeholderMessage = options.placeholderMessage ?? "Frame uploaded, waiting for server processing";
-  showProcessedPlaceholder(placeholderMessage);
-  const frames = await collectFramesForUpload();
-  const runtime = currentRuntimeContext();
-  const sessionId = document.getElementById("stream-session-id").value.trim() || "default-session";
-  const captureId = ensureCaptureBatchId();
-
-  let lastResult = null;
-  for (let index = 0; index < frames.length; index += 1) {
-    const frame = frames[index];
-    const payload = {
-      session_id: sessionId,
-      capture_id: captureId,
-      algorithm_family: triggerProcessing ? runtime.family : "",
-      repo_path: runtime.repoPath,
-      cwd: runtime.cwd,
-      workspace: runtime.workspace,
-      checkpoint_path: runtime.checkpointPath,
-      image_data: frame.imageData,
-      filename: frame.filename,
-    };
-    const result = await streamFrame(getApiBaseUrl(), payload);
-    lastResult = result;
-
-    if (result.capture_id) {
-      const captureNode = document.getElementById("capture-batch-id");
-      if (captureNode) {
-        captureNode.value = result.capture_id;
-      }
-    }
-
-    if (frames.length > 1) {
-      setStepResult("step3", "running", "Step 3 running", `Uploading images ${index + 1}/${frames.length} ...`);
-    }
-  }
-
-  const result = lastResult;
-  if (!result) {
-    throw new Error("No frame was uploaded.");
-  }
-
-  if (result.viewer_url) {
-    showProcessedViewer(result.viewer_url);
-  } else if (result.output_url) {
-    showProcessedImage(result.output_url);
-  }
-  if (result.job?.id) {
-    applyJobMetrics(result.job);
-    startJobPolling(result.job.id);
-  }
-  updateStatus({
-    viewer: result.job ? "stream-processing" : "frame-uploaded",
-    source: result.input_url ?? "-",
-  });
-  const uploadedText = frames.length > 1 ? `${frames.length} images` : "1 frame";
-  setStepResult(
-    "step3",
-    "success",
-    "Step 3 passed",
-    `Uploaded ${uploadedText} to session ${sessionId}, capture ${result.capture_id || captureId}.`,
-  );
-  if (!workflowState.frameReady) {
-    workflowState.frameReady = true;
-    workflowState.sessionReady = false;
-    workflowState.jobStarted = false;
-    refreshWorkflowUI();
-  }
-  return {
-    ...result,
-    uploaded_count: frames.length,
-  };
-}
-
-async function handleMaterializeSession() {
-  const sessionId = document.getElementById("stream-session-id").value.trim() || "default-session";
-  const captureId = ensureCaptureBatchId();
-  const datasetName = document.getElementById("dataset-name")?.value.trim() || sessionId;
-  const result = await materializeSession(getApiBaseUrl(), {
-    session_id: sessionId,
-    title: sessionId,
-    capture_id: captureId,
-    dataset_name: datasetName,
-  });
-  lastMaterializedSession = result.result;
-  updateStatus({
-    viewer: "session-materialized",
-    source: result.result.dataset_root,
-  });
-  return result.result;
-}
-
-function applyMaterializedSession(result) {
-  if (!result) return;
-  document.getElementById("server-input-path").value = result.input_dir;
-  const family = document.getElementById("algorithm-family").value;
-  const outputDir = `/web/generated/runs/${result.session_id}/${family}/${result.dataset_id || "dataset"}`;
-  document.getElementById("server-output-dir").value = outputDir;
-  const nextArgs = {
-    ...parseExtraArgs(),
-    workspace: result.dataset_root,
-  };
-  setExtraArgs(nextArgs);
-  updateStatus({
-    viewer: "session-ready",
-    source: result.dataset_root,
-  });
-  workflowState.sessionReady = true;
-  workflowState.jobStarted = false;
-  refreshWorkflowUI();
-}
-
-async function handlePrepareColmapWorkspace() {
-  const sessionId = document.getElementById("stream-session-id").value.trim() || "default-session";
-  const captureId = ensureCaptureBatchId();
-  const datasetName = document.getElementById("dataset-name")?.value.trim() || sessionId;
-  const runtime = currentRuntimeContext();
-  const result = await prepareColmapWorkspace(getApiBaseUrl(), {
-    session_id: sessionId,
-    capture_id: captureId,
-    dataset_name: datasetName,
-    algorithm_family: runtime.family,
-    repo_path: runtime.repoPath,
-  });
-  lastColmapWorkspace = result.result;
-  updateStatus({
-    viewer: "colmap-workspace-ready",
-    source: result.result.workspace_root,
-  });
-  return result.result;
-}
-
-function applyColmapWorkspace(result) {
-  if (!result) return;
-  document.getElementById("server-input-path").value = result.input_dir;
-  const outputDir = `/web/generated/runs/${result.session_id}/${result.family}/${result.dataset_id || "dataset"}`;
-  document.getElementById("server-output-dir").value = outputDir;
-  const nextArgs = {
-    ...parseExtraArgs(),
-    workspace: result.workspace_root,
-    colmap_command: result.suggested_command,
-  };
-  setExtraArgs(nextArgs);
-  updateStatus({
-    viewer: "colmap-workspace-applied",
-    source: result.workspace_root,
-  });
-  workflowState.sessionReady = true;
-  workflowState.jobStarted = false;
-  refreshWorkflowUI();
-}
-
-function saveRecentScene(scene) {
-  const scenes = loadRecentScenes();
-  const next = scenes.filter((item) => item.manifestUrl !== scene.manifestUrl && item.source?.url !== scene.source?.url);
-  next.push({
-    title: scene.title,
-    sceneId: scene.sceneId,
-    algorithm: scene.algorithm,
-    source: scene.source,
-    manifestUrl: scene.manifestUrl ?? "",
-    representation: scene.representation,
-  });
-  localStorage.setItem(RECENT_SCENES_KEY, JSON.stringify(next.slice(-12)));
-  renderRecentScenes(loadRecentScenes());
-}
-
-function sceneShareUrl(scene) {
-  const url = new URL(window.location.href);
-  url.searchParams.delete("manifest");
-  url.searchParams.delete("source");
-  url.searchParams.delete("representation");
-  url.searchParams.delete("family");
-  if (scene?.manifestUrl) {
-    url.searchParams.set("manifest", scene.manifestUrl);
-    return url.toString();
-  }
-  if (scene?.source?.url) {
-    url.searchParams.set("source", scene.source.url);
-    url.searchParams.set("representation", scene.representation ?? scene.renderer ?? "sh");
-    url.searchParams.set("family", scene.algorithm?.family ?? "unknown");
-    return url.toString();
-  }
-  return url.toString();
-}
-
-function setSchemaPreview() {
-  renderManifestSchema(manifestSchemaExample());
-}
-
-function updateFromScene(scene) {
-  const method = getMethodDefinition(scene.algorithm?.family);
-  updateStatus({
-    renderer: scene.renderer,
-    algorithm: method?.label ?? scene.algorithm?.name ?? scene.algorithm?.family,
-    scene: scene.title ?? scene.sceneId,
-    source: scene.source?.url ?? "-",
-    viewer: "loading",
-    webUrl: sceneShareUrl(scene) || "-",
-  });
-  updateViewerHeader({
-    title: scene.title ?? "Untitled Scene",
-    subtitle:
-      method?.notes ??
-      `representation=${scene.representation ?? scene.renderer}, source=${scene.source?.format ?? "unknown"}`,
-  });
-  setShareUrl(sceneShareUrl(scene));
-}
-
-async function mountScene(scene) {
-  if (!scene.source?.url) {
-    throw new Error("Scene source URL is required.");
-  }
-
-  if (activeRenderer) {
-    activeRenderer.dispose({ frame });
-  }
-
-  const renderer = resolveRenderer(scene.renderer);
-  activeRenderer = renderer;
-  currentScene = scene;
-  updateFromScene(scene);
-  saveRecentScene(scene);
-  setOverlayVisible(false);
-  await renderer.mount({ frame, scene });
-}
-
-async function handleManifestLoad(manifestUrl) {
-  const scene = await loadSceneManifest(manifestUrl);
-  scene.manifestUrl = manifestUrl;
-  await mountScene(scene);
-}
-
-async function handleDirectLoad() {
-  const sourceUrl = document.getElementById("source-url").value.trim();
-  const representation = document.getElementById("representation").value;
-  const algorithmFamily = document.getElementById("algorithm-family").value;
-
-  if (!sourceUrl) {
-    throw new Error("Model URL is required.");
-  }
-
-  const scene = buildDirectSceneConfig({
-    sourceUrl,
-    representation,
-    algorithmFamily,
-  });
-  scene.metadata = {
-    ...scene.metadata,
-    viewerBackend: document.getElementById("viewer-backend").value,
-    preprocess: collectPreprocessOptions(),
-    editor: collectEditorOptions(),
-  };
-  await mountScene(scene);
-}
-
-async function handleApiHealthCheck() {
-  const health = await fetchHealth(getApiBaseUrl());
-  updateStatus({
-    viewer: "api-ready",
-    source: health.root_dir,
-  });
-  const algorithms = await fetchAlgorithms(getApiBaseUrl());
-  if (Array.isArray(algorithms.algorithms)) {
-    serverAlgorithms = algorithms.algorithms;
-    serverValidation = new Map((algorithms.validation ?? []).map((item) => [item.family, item]));
-    applyAlgorithmOptions(algorithms.algorithms);
-    const currentMethod = algorithms.algorithms.find(
-      (item) => item.family === document.getElementById("algorithm-family").value,
-    ) ?? algorithms.algorithms[0];
-    if (currentMethod) {
-      document.getElementById("algorithm-family").value = currentMethod.family;
-      document.getElementById("representation").value = currentMethod.representation;
-      setOperationOptions(currentMethod);
-      syncAdapterDetail();
-    }
-  }
-  const family = document.getElementById("algorithm-family").value;
-  const env = await fetchEnvironmentCheck(getApiBaseUrl(), family);
-  environmentReport = env.report;
-  renderEnvironmentCheck(environmentReport);
-
-  const runtimeReady = Boolean(environmentReport?.runtime_ready ?? environmentReport?.web_runnable);
-
-  workflowState.apiChecked = runtimeReady;
-  workflowState.adapterReady = runtimeReady && isAdapterValidationReady(serverValidation.get(family));
-  invalidateRemoteSshCheck();
-
-  if (runtimeReady) {
-    setStepResult("step1", "success", "Step 1 passed", environmentReport?.summary || "Runtime check passed.");
-    updateStatus({ viewer: "api-ready" });
-  } else {
-    const firstRequiredFail = (environmentReport?.checks || []).find((item) => item.required && !item.ok);
-    const reason = firstRequiredFail?.message || environmentReport?.summary || "Runtime check failed.";
-    setStepResult("step1", "failed", "Step 1 failed", reason);
-    updateStatus({ viewer: "api-error" });
-  }
-
-  if (workflowState.adapterReady) {
-    setStepResult("step2", "success", "Step 2 passed", "Adapter capability is ready.");
-  } else {
-    setStepResult("step2", "idle", "Step 2 pending", "Validate adapter capability.");
-  }
-
-  if (!workflowState.adapterReady) {
-    workflowState.frameReady = false;
-    workflowState.sessionReady = false;
-    workflowState.jobStarted = false;
-  }
-  refreshWorkflowUI();
+  render();
+  afterRender();
 }
 
 function escapeHtml(value) {
@@ -1493,1150 +191,1704 @@ function escapeHtml(value) {
     .replaceAll("'", "&#39;");
 }
 
-function findJobById(jobId) {
-  return (lastJobsSnapshot ?? []).find((item) => item.id === jobId) ?? null;
+function summarize(value, length = 64) {
+  const text = String(value ?? "").trim();
+  if (text.length <= length) return text || "-";
+  return `${text.slice(0, length - 1)}…`;
 }
 
-function setJobLogMeta(text) {
-  const node = document.getElementById("job-log-meta");
-  if (node) {
-    node.textContent = text;
-  }
+function formatBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (!Number.isFinite(value) || value <= 0) return "0 B";
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
+  return `${(value / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
-async function copyCurrentJobLogTail() {
-  const textarea = document.getElementById("job-log-tail");
-  if (!textarea) return;
-  const raw = textarea.value || "";
-  if (!raw.trim()) {
-    setJobLogMeta("No log content to copy.");
-    return;
-  }
-  try {
-    await navigator.clipboard.writeText(raw);
-    setJobLogMeta(`Copied ${raw.length} chars from raw log tail.`);
-  } catch {
-    textarea.focus();
-    textarea.select();
-    document.execCommand("copy");
-    setJobLogMeta(`Copied ${raw.length} chars from raw log tail.`);
-  }
+function statusClass(status) {
+  const normalized = String(status || "").toLowerCase();
+  if (["completed", "ok", "ready", "canceled"].includes(normalized)) return "ok";
+  if (["running", "queued"].includes(normalized)) return "warn";
+  if (["failed", "error"].includes(normalized)) return "bad";
+  return "";
 }
 
-function renderJobMetricsRows(rows) {
-  const body = document.getElementById("job-metrics-rows");
-  if (!body) return;
-  if (!rows?.length) {
-    body.innerHTML = `
-      <tr>
-        <td colspan="8">No metrics yet.</td>
-      </tr>
-    `;
-    return;
-  }
-
-  body.innerHTML = rows
-    .map(
-      (row) => `
-        <tr>
-          <td>${escapeHtml(row.timestamp || "-")}</td>
-          <td>${escapeHtml(row.channel || "-")}</td>
-          <td>${escapeHtml(row.iter || "-")}</td>
-          <td>${escapeHtml(row.loss || "-")}</td>
-          <td>${escapeHtml(row.psnr || "-")}</td>
-          <td>${escapeHtml(row.ssim || "-")}</td>
-          <td>${escapeHtml(row.lpips || "-")}</td>
-          <td>${escapeHtml(row.fps || "-")}</td>
-        </tr>
-      `,
-    )
-    .join("");
+function isTerminal(status) {
+  return ["completed", "failed", "canceled"].includes(String(status || "").toLowerCase());
 }
 
-function renderJobLogTail(lines) {
-  const textarea = document.getElementById("job-log-tail");
-  if (!textarea) return;
-  textarea.value = (lines ?? []).join("");
-  textarea.scrollTop = textarea.scrollHeight;
+function selectedAlgorithm() {
+  return algorithms.find((item) => item.family === state.algorithmFamily) || algorithms[0] || null;
 }
 
-function updateJobMetricsPager(page, totalPages, totalRows) {
-  const prev = document.getElementById("job-metrics-prev");
-  const next = document.getElementById("job-metrics-next");
-  const label = document.getElementById("job-metrics-page");
-  if (prev) prev.disabled = page <= 1;
-  if (next) next.disabled = page >= totalPages;
-  if (label) {
-    label.textContent = `Page ${page} / ${totalPages} · ${totalRows} rows`;
-  }
+function supportedOperations(adapter = selectedAlgorithm()) {
+  if (!adapter?.operations) return [];
+  return Object.entries(adapter.operations)
+    .filter(([, config]) => config?.enabled)
+    .map(([name]) => name);
 }
 
-function setJobLogDownloadLinks(jobId, job = null, payload = null) {
-  const logLink = document.getElementById("download-job-log");
-  const csvLink = document.getElementById("download-job-csv");
-  if (!logLink || !csvLink) return;
-
-  if (!jobId) {
-    logLink.href = "#";
-    csvLink.href = "#";
-    logLink.classList.add("disabled-link");
-    csvLink.classList.add("disabled-link");
-    return;
-  }
-
-  const apiBase = getApiBaseUrl();
-  const resolvedLogUrl = payload?.logs_download_url || job?.logs_download_url || buildJobLogDownloadUrl(apiBase, jobId);
-  const resolvedCsvUrl = payload?.metrics_csv_url || job?.metrics_csv_url || buildJobMetricsCsvUrl(apiBase, jobId);
-  logLink.href = resolvedLogUrl;
-  csvLink.href = resolvedCsvUrl;
-  logLink.classList.remove("disabled-link");
-  csvLink.classList.remove("disabled-link");
+function selectedOperationConfig() {
+  const adapter = selectedAlgorithm();
+  return adapter?.operations?.[state.operation] || {};
 }
 
-function ensureJobLogsPanelVisible() {
-  const systemBoard = document.getElementById("system-board");
-  if (systemBoard) {
-    systemBoard.open = true;
-  }
-  const logsPanel = document.getElementById("job-logs-panel");
-  if (logsPanel) {
-    logsPanel.open = true;
-    logsPanel.scrollIntoView({ behavior: "smooth", block: "nearest" });
-  }
+function operationSupportsRemote() {
+  return Boolean(selectedOperationConfig()?.template);
 }
 
-function populateJobLogSelector(jobs) {
-  const select = document.getElementById("log-job-id");
-  if (!select) return;
-
-  const previousJobId = jobLogState.jobId;
-  const orderedJobs = jobs.slice().reverse();
-  select.innerHTML = [
-    '<option value="">Select Job</option>',
-    ...orderedJobs.map((job) => `<option value="${job.id}">${job.algorithm_family} · ${job.id.slice(0, 8)} · ${job.status}</option>`),
-  ].join("");
-
-  let nextJobId = previousJobId;
-  if (nextJobId && !orderedJobs.some((job) => job.id === nextJobId)) {
-    nextJobId = "";
-  }
-  if (!nextJobId && orderedJobs.length) {
-    nextJobId = orderedJobs[0].id;
-    jobLogState.page = 1;
-  }
-
-  jobLogState.jobId = nextJobId;
-  select.value = nextJobId;
-  setJobLogDownloadLinks(nextJobId, findJobById(nextJobId));
+function selectedDataset() {
+  const datasets = Array.isArray(state.remoteReport?.datasets) ? state.remoteReport.datasets : [];
+  return datasets.find((item) => String(item.id || "") === String(state.selectedRemoteDatasetId || "")) || null;
 }
 
-async function loadJobLogs(page = 1) {
-  const selectedJobId = jobLogState.jobId;
-  if (!selectedJobId) {
-    setJobLogMeta("No job selected.");
-    renderJobMetricsRows([]);
-    renderJobLogTail([]);
-    updateJobMetricsPager(1, 1, 0);
-    setJobLogDownloadLinks("");
-    return;
-  }
-
-  const requestedPage = Number.isFinite(page) && page > 0 ? page : 1;
-  const payload = await fetchJobLogs(getApiBaseUrl(), selectedJobId, {
-    page: requestedPage,
-    pageSize: jobLogState.pageSize,
-    tailLines: jobLogState.tailLines,
-  });
-
-  const metricsPage = payload.metrics_page ?? {};
-  const resolvedPage = Number(metricsPage.page || requestedPage);
-  const totalPages = Number(metricsPage.total_pages || 1);
-  const totalRows = Number(metricsPage.total || 0);
-  const rows = Array.isArray(metricsPage.rows) ? metricsPage.rows : [];
-
-  jobLogState.page = resolvedPage;
-  jobLogState.totalPages = totalPages;
-
-  renderJobMetricsRows(rows);
-  renderJobLogTail(payload.log_tail_lines ?? []);
-  setJobLogMeta(
-    `Job ${selectedJobId} · Status ${payload.status ?? "-"} · Metrics rows ${totalRows} · Tail ${jobLogState.tailLines} lines`,
+function datasetHasColmap(dataset) {
+  if (!dataset) return false;
+  const stage = dataset.stage || {};
+  return Boolean(
+    stage.sparse
+    || stage.undistorted
+    || dataset.has_sparse_model
+    || dataset.has_undistorted_marker
+    || dataset.sparse_file_count > 0,
   );
-  updateJobMetricsPager(resolvedPage, totalPages, totalRows);
-  setJobLogDownloadLinks(selectedJobId, findJobById(selectedJobId), payload);
+}
+
+function datasetNameForPayload() {
+  if (state.useExistingRemoteDataset) {
+    const dataset = selectedDataset();
+    return String(dataset?.name || dataset?.id || state.remoteDatasetPath || state.datasetName || "remote-dataset").trim();
+  }
+  return String(state.datasetName || `${state.sessionId}-${state.captureId || "capture"}`).trim();
+}
+
+function ensureCaptureId(force = false) {
+  if (!state.captureId || force) {
+    state.captureId = `capture-${Date.now()}-${Math.random().toString(16).slice(2, 6)}`;
+    persistState();
+  }
+  return state.captureId;
+}
+
+function outputDirForPayload() {
+  if (state.outputDir) return state.outputDir;
+  const suffix = state.useExistingRemoteDataset
+    ? (state.selectedRemoteDatasetId || "existing-dataset")
+    : (state.captureId || "capture");
+  return `/web/generated/runs/${state.sessionId}/${state.algorithmFamily || "algorithm"}/${suffix}`;
+}
+
+function getJob(jobId = state.selectedJobId) {
+  return jobs.find((item) => item.id === jobId) || null;
+}
+
+function setBusy(next) {
+  busy = Boolean(next);
+}
+
+function showToast(message) {
+  const node = document.getElementById("toast");
+  if (!node) return;
+  node.textContent = message;
+  node.hidden = false;
+  window.clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(() => {
+    node.hidden = true;
+  }, 3600);
+}
+
+function setError(error, fallback = "Action failed") {
+  const payload = error?.payload || {};
+  state.lastError = {
+    code: payload.code || error?.code || "",
+    message: payload.message || payload.error || error?.message || fallback,
+    details: payload.details || {},
+    nextAction: payload.next_action || "",
+    status: error?.status || "",
+  };
+  persistState();
+  render();
+  afterRender();
+}
+
+async function guarded(action, fallback) {
+  try {
+    setBusy(true);
+    state.lastError = null;
+    const result = await action();
+    persistState();
+    render();
+    afterRender();
+    return result;
+  } catch (error) {
+    setError(error, fallback);
+    return null;
+  } finally {
+    setBusy(false);
+  }
+}
+
+function buildRunPayload(extra = {}) {
+  const dataset = selectedDataset();
+  const customPath = String(state.remoteDatasetPath || "").trim();
+  const selectedPath = String(dataset?.path || "").trim();
+  const remoteDatasetPath = customPath || selectedPath;
+  return {
+    algorithm_family: state.algorithmFamily,
+    operation: state.operation || "train",
+    session_id: state.sessionId || "default-session",
+    capture_id: state.captureId,
+    dataset_name: datasetNameForPayload(),
+    auto_materialize: !state.useExistingRemoteDataset,
+    auto_colmap: Boolean(state.autoColmap),
+    use_existing_remote_dataset: Boolean(state.useExistingRemoteDataset),
+    remote_dataset_id: customPath ? "" : (state.selectedRemoteDatasetId || ""),
+    remote_dataset_path: remoteDatasetPath,
+    workspace: "",
+    output_dir: outputDirForPayload(),
+    checkpoint_path: state.checkpointPath || "",
+    input_path: "",
+    preview_job_id: state.lastPreview?.preview_job_id || "",
+    remote: { ...state.remoteConfig },
+    require_remote_check: true,
+    ...state.training,
+    ...extra,
+  };
+}
+
+function render() {
+  root.innerHTML = `
+    <div class="workbench">
+      ${renderTopbar()}
+      <div class="layout">
+        <aside class="rail">${renderLeftRail()}</aside>
+        <main class="main-column">${renderMain()}</main>
+      </div>
+    </div>
+    <div id="modal-layer" class="modal-layer" hidden></div>
+    <div id="toast" class="toast" hidden></div>
+  `;
+}
+
+function renderTopbar() {
+  return `
+    <header class="topbar">
+      <div class="brand-mark">
+        <div class="brand-cube">WG</div>
+        <div>
+          <h1 class="brand-title">WebGSC</h1>
+          <p class="brand-subtitle">Remote training and 3D results workbench</p>
+        </div>
+      </div>
+      <nav class="nav-tabs">
+        ${NAV_ITEMS.map((item) => `
+          <button class="nav-tab ${state.activePage === item.id ? "active" : ""}" data-page="${item.id}" type="button">${item.label}</button>
+        `).join("")}
+      </nav>
+      <div class="api-chip">
+        <span class="status-dot ${state.apiOnline ? "ok" : state.apiOnline === false ? "bad" : "warn"}">${state.apiOnline ? "Online" : state.apiOnline === false ? "Offline" : "Checking"}</span>
+        <button data-action="refresh-all" type="button" ${busy ? "disabled" : ""}>Refresh</button>
+      </div>
+    </header>
+  `;
+}
+
+function renderLeftRail() {
+  const adapter = selectedAlgorithm();
+  const showAlgorithmPicker = state.activePage === "algorithm";
+  const activeJobs = jobs.filter((job) => ["queued", "running"].includes(String(job.status || "").toLowerCase()));
+  return `
+    <section class="panel pad">
+      <p class="eyebrow">Project</p>
+      <h2>Campus Reconstruction Demo</h2>
+      <p class="panel-copy">Remote training first. Local mode is reserved for PLY viewing and data handoff.</p>
+      <div class="metric-grid" style="grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 14px;">
+        <div class="metric"><span class="muted">Algorithms</span><strong>${algorithms.length || "-"}</strong></div>
+        <div class="metric"><span class="muted">Jobs</span><strong>${jobs.length || "-"}</strong></div>
+      </div>
+    </section>
+    <section class="panel">
+      <div class="panel-head">
+        <h3>Algorithm Family</h3>
+        <span class="badge">${escapeHtml(adapter?.label || "Not selected")}</span>
+      </div>
+      ${showAlgorithmPicker ? `<div class="algorithm-list card">
+        ${algorithms.length ? algorithms.slice(0, 10).map((item) => `
+          <article class="selectable-card ${item.family === state.algorithmFamily ? "active" : ""}">
+            <strong>${escapeHtml(item.label || item.family)}</strong>
+            <p class="panel-copy">${escapeHtml(item.category || "-")} · ${escapeHtml(item.representation || "-")}</p>
+            <button data-action="select-algorithm" data-family="${escapeHtml(item.family)}" type="button">Select</button>
+          </article>
+        `).join("") : `<p class="panel-copy">Waiting for /api/algorithms.</p>`}
+      </div>` : `<div class="card grid">
+        <p class="panel-copy">Current: ${escapeHtml(adapter?.label || adapter?.family || "Not selected")}</p>
+        <p class="panel-copy">Open the Algorithms page when you want to expand the full selector.</p>
+        <button data-page="algorithm" type="button">Choose Algorithm</button>
+      </div>`}
+    </section>
+    <section class="panel">
+      <div class="panel-head">
+        <h3>Current Data</h3>
+        <span class="badge ${state.useExistingRemoteDataset ? "ok" : "warn"}">${state.useExistingRemoteDataset ? "Remote reuse" : "New upload"}</span>
+      </div>
+      <div class="card grid">
+        <p class="panel-copy">Session: ${escapeHtml(state.sessionId || "-")}</p>
+        <p class="panel-copy">Capture: ${escapeHtml(state.captureId || "-")}</p>
+        <p class="panel-copy">Dataset: ${escapeHtml(datasetNameForPayload())}</p>
+        <p class="panel-copy">Uploaded: ${state.uploadedCount || 0} image(s)</p>
+      </div>
+    </section>
+    <section class="panel">
+      <div class="panel-head">
+        <h3>Active Jobs</h3>
+        <span class="badge warn">${activeJobs.length}</span>
+      </div>
+      <div class="job-list card">
+        ${activeJobs.length ? activeJobs.slice(0, 4).map((job) => renderMiniJob(job)).join("") : `<p class="panel-copy">No jobs are running.</p>`}
+      </div>
+    </section>
+    ${renderStatusRail()}
+  `;
+}
+
+function renderMiniJob(job) {
+  return `
+    <article class="selectable-card">
+      <strong>${escapeHtml(job.algorithm_family || "-")}</strong>
+      <p class="panel-copy">${escapeHtml(job.status || "-")} · ${escapeHtml(job.remote_stage || job.operation || "-")}</p>
+      <button data-action="select-job" data-job-id="${escapeHtml(job.id)}" type="button">View</button>
+    </article>
+  `;
+}
+
+function renderStatusRail() {
+  return `
+    <section class="panel">
+      <div class="panel-head">
+        <h3>Platform Status</h3>
+        <span class="status-dot ${state.apiOnline ? "ok" : state.apiOnline === false ? "bad" : "warn"}">${state.apiOnline ? "Online" : state.apiOnline === false ? "Offline" : "Checking"}</span>
+      </div>
+      <div class="card grid">
+        <p class="panel-copy">API: ${escapeHtml(state.apiBaseUrl)}</p>
+        <p class="panel-copy">SSH: ${state.sshChecked ? "Precheck passed" : "Not checked or expired"}</p>
+        <p class="panel-copy">COLMAP: ${state.autoColmap ? "Automatic" : "Manual confirmation"}</p>
+      </div>
+    </section>
+    <section class="panel">
+      <div class="panel-head">
+        <h3>Environment Check</h3>
+        <button data-action="check-runtime" type="button">Check</button>
+      </div>
+      <div class="card grid">
+        ${renderEnvironmentChecks()}
+      </div>
+    </section>
+    <section class="panel">
+      <div class="panel-head">
+        <h3>Current Job</h3>
+        <button data-action="refresh-jobs" type="button">Refresh</button>
+      </div>
+      <div class="card">
+        ${renderCurrentJobSummary()}
+      </div>
+    </section>
+    ${state.lastError ? `
+      <section class="panel">
+        <div class="panel-head"><h3>Error Details</h3><span class="badge bad">${escapeHtml(state.lastError.code || "ERROR")}</span></div>
+        <div class="error-box">
+          <p>${escapeHtml(state.lastError.message)}</p>
+          ${state.lastError.nextAction ? `<p class="panel-copy">Next action: ${escapeHtml(state.lastError.nextAction)}</p>` : ""}
+          ${Object.keys(state.lastError.details || {}).length ? `<pre>${escapeHtml(JSON.stringify(state.lastError.details, null, 2))}</pre>` : ""}
+        </div>
+      </section>
+    ` : ""}
+  `;
+}
+
+function renderEnvironmentChecks() {
+  const checks = environmentReport?.checks || [];
+  if (!checks.length) return `<p class="panel-copy">Click Check to read the local web runtime and algorithm environment.</p>`;
+  return checks.map((item) => `
+    <div class="status-dot ${item.ok ? "ok" : item.required ? "bad" : "warn"}">
+      ${escapeHtml(item.name || "-")} · ${escapeHtml(item.message || (item.ok ? "OK" : "Failed"))}
+    </div>
+  `).join("");
+}
+
+function renderCurrentJobSummary() {
+  const job = getJob();
+  if (!job) return `<p class="panel-copy">No job selected. The latest submitted job will be selected automatically.</p>`;
+  return `
+    <div class="grid">
+      <span class="badge ${statusClass(job.status)}">${escapeHtml(job.status || "-")}</span>
+      <strong>${escapeHtml(job.algorithm_family || "-")}</strong>
+      <p class="panel-copy">ID: ${escapeHtml(job.id)}</p>
+      <p class="panel-copy">Stage: ${escapeHtml(job.remote_stage || "-")}</p>
+      <p class="panel-copy">FPS ${escapeHtml(job.metrics?.fps || "-")} · PSNR ${escapeHtml(job.metrics?.psnr || "-")} · Loss ${escapeHtml(job.metrics?.loss || "-")}</p>
+      <div class="button-row">
+        <button data-action="select-job" data-job-id="${escapeHtml(job.id)}" type="button">Logs</button>
+        <button data-action="open-result" data-job-id="${escapeHtml(job.id)}" type="button">Results</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderMain() {
+  if (state.activePage === "overview") return renderOverviewPage();
+  if (state.activePage === "data") return renderDataPage();
+  if (state.activePage === "realtime") return renderRealtimePage();
+  if (state.activePage === "algorithm") return renderAlgorithmPage();
+  if (state.activePage === "browser") return renderBrowserPage();
+  if (state.activePage === "analysis") return renderAnalysisPage();
+  if (state.activePage === "result") return renderResultPage();
+  return renderOverviewPage();
+}
+
+function renderOverviewPage() {
+  const running = jobs.filter((job) => ["queued", "running"].includes(String(job.status || "").toLowerCase())).length;
+  const completed = jobs.filter((job) => job.status === "completed").length;
+  return `
+    <section class="panel hero">
+      <p class="eyebrow">Remote-first Gaussian Workflow</p>
+      <h1>The web training page is now a progressive 3D training workbench</h1>
+      <p>Move from capture, remote precheck, command confirmation, job monitoring, and PLY/image results through a clear dependency-driven flow without exposing every field at once.</p>
+      <div class="action-row">
+        <button class="primary" data-page="data" type="button">Prepare Data</button>
+        <button data-page="algorithm" type="button">Open Training</button>
+        <button data-page="browser" type="button">Open PLY Browser</button>
+      </div>
+    </section>
+    <section class="metric-grid">
+      <div class="metric"><span class="muted">Platform</span><strong>${state.apiOnline ? "OK" : state.apiOnline === false ? "Offline" : "..."}</strong></div>
+      <div class="metric"><span class="muted">Total Jobs</span><strong>${jobs.length}</strong></div>
+      <div class="metric"><span class="muted">Running</span><strong>${running}</strong></div>
+      <div class="metric"><span class="muted">Completed</span><strong>${completed}</strong></div>
+    </section>
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Training Pipeline</h2>
+        <span class="badge">Capture -> Upload -> Session Prep -> COLMAP -> Train -> Render -> View</span>
+      </div>
+      <div class="card step-flow">
+        ${["Capture", "Upload", "Session Prep", "COLMAP", "Train", "Render", "View"].map((label, index) => `
+          <div class="step ${index < pipelineProgressIndex() ? "done" : index === pipelineProgressIndex() ? "active" : ""}">
+            <span class="badge">${index + 1}</span>
+            <h3>${label}</h3>
+            <p class="panel-copy">${pipelineHint(label)}</p>
+          </div>
+        `).join("")}
+      </div>
+    </section>
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Recent Jobs</h2>
+        <button data-page="algorithm" type="button">Open Job Monitor</button>
+      </div>
+      <div class="card">${renderJobsTable(jobs.slice(0, 6))}</div>
+    </section>
+  `;
+}
+
+function pipelineProgressIndex() {
+  const job = getJob();
+  if (job?.status === "completed") return 6;
+  if (job?.status === "running") return 4;
+  if (state.sshChecked) return 3;
+  if (state.uploadedCount > 0 || state.useExistingRemoteDataset) return 2;
+  return 0;
+}
+
+function pipelineHint(label) {
+  const hints = {
+    "Capture": "Camera or image input",
+    "Upload": "Write into session/capture",
+    "Session Prep": "Auto-materialize dataset",
+    "COLMAP": "Remote sparse recovery",
+    "Train": "Remote queue execution",
+    "Render": "Return results and metrics",
+    "View": "PLY first, images as fallback",
+    "Data Input": "Capture or select input data",
+    "Data Prep": "Materialize and prepare workspace",
+    "SSH Precheck": "Verify remote access and dependencies",
+    "Command Review": "Preview paths and shell command",
+    "Remote Submit": "Create remote training job",
+    "Logs and Metrics": "Follow logs and metrics",
+    "Result Page": "Open PLY or image result",
+  };
+  return hints[label] || "";
+}
+
+function renderDataPage() {
+  return `
+    <section class="panel">
+      <div class="panel-head">
+        <div>
+          <h2>Data Input and Dataset Management</h2>
+          <p class="panel-copy">Phase one keeps only the data selection, upload, remote reuse, and COLMAP state needed for training.</p>
+        </div>
+        <button data-action="open-dataset-modal" type="button">Name Dataset</button>
+      </div>
+      <div class="card split">
+        <div class="grid">
+          ${renderSessionFields()}
+          ${renderUploadBox()}
+          <div class="button-row">
+            <button class="primary" data-action="upload-images" type="button">Upload to Session</button>
+            <button data-action="new-capture" type="button">New Capture</button>
+          </div>
+        </div>
+        <div class="grid">
+          ${renderRemoteDatasetControls()}
+        </div>
+      </div>
+    </section>
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Advanced Data Prep</h2>
+        <span class="badge warn">Debug fallback</span>
+      </div>
+      <div class="card grid two">
+        <button data-action="materialize-session" type="button" ${state.uploadedCount ? "" : "disabled"}>Manual Session Materialize</button>
+        <button data-action="prepare-colmap" type="button" ${state.uploadedCount ? "" : "disabled"}>Manual COLMAP Workspace</button>
+      </div>
+    </section>
+  `;
+}
+
+function renderSessionFields() {
+  return `
+    <div class="form-grid">
+      <label>Session ID
+        <input data-bind="sessionId" value="${escapeHtml(state.sessionId)}" />
+      </label>
+      <label>Capture ID
+        <input data-bind="captureId" value="${escapeHtml(state.captureId)}" placeholder="Auto-generated" />
+      </label>
+      <label class="wide">Dataset Name
+        <input data-bind="datasetName" value="${escapeHtml(state.datasetName)}" placeholder="Click Name Dataset, or confirm before submit" />
+      </label>
+    </div>
+  `;
+}
+
+function renderUploadBox() {
+  return `
+    <div class="dropzone">
+      <strong>Select images or capture from camera</strong>
+      <p class="panel-copy">Multiple images are sent one by one through /api/stream-frame for backend compatibility.</p>
+      <input id="image-upload-input" type="file" accept="image/*" multiple />
+      <div id="upload-preview-grid" class="preview-grid"></div>
+    </div>
+  `;
+}
+
+function renderRemoteDatasetControls() {
+  const datasets = Array.isArray(state.remoteReport?.datasets) ? state.remoteReport.datasets : [];
+  return `
+    <label class="wide">
+      <span><input data-bind="useExistingRemoteDataset" type="checkbox" ${state.useExistingRemoteDataset ? "checked" : ""} /> Use an existing remote dataset and skip local upload/materialize</span>
+    </label>
+    <label>Remote Dataset
+      <select data-bind="selectedRemoteDatasetId">
+        <option value="">Not selected</option>
+        ${datasets.map((item) => `
+          <option value="${escapeHtml(item.id || "")}" ${state.selectedRemoteDatasetId === item.id ? "selected" : ""}>
+            ${escapeHtml(item.name || item.id || "unnamed")} · ${datasetHasColmap(item) ? "COLMAP OK" : "Needs COLMAP"}
+          </option>
+        `).join("")}
+      </select>
+    </label>
+    <label>Custom Remote Data Path
+      <input data-bind="remoteDatasetPath" value="${escapeHtml(state.remoteDatasetPath)}" placeholder="/tmp/web_scan/workspaces/datasets/.../workspace" />
+    </label>
+    <label class="wide">
+      <span><input data-bind="autoColmap" type="checkbox" ${state.autoColmap ? "checked" : ""} /> Run remote COLMAP automatically when sparse/undistorted data is missing</span>
+    </label>
+    <div class="dataset-list">
+      ${datasets.length ? datasets.slice(0, 6).map((item) => renderDatasetCard(item)).join("") : `<p class="panel-copy">Remote datasets appear here after the SSH precheck on the Algorithms page.</p>`}
+    </div>
+  `;
+}
+
+function renderDatasetCard(dataset) {
+  const active = dataset.id && dataset.id === state.selectedRemoteDatasetId;
+  const colmapOk = datasetHasColmap(dataset);
+  return `
+    <article class="selectable-card ${active ? "active" : ""}">
+      <strong>${escapeHtml(dataset.name || dataset.id || "Unnamed dataset")}</strong>
+      <p class="panel-copy">${escapeHtml(summarize(dataset.path, 76))}</p>
+      <div class="button-row">
+        <span class="badge ${colmapOk ? "ok" : "warn"}">${colmapOk ? "COLMAP Ready" : "Will need COLMAP"}</span>
+        <span class="badge">${Number(dataset.frame_count || 0) || "?"} frames</span>
+      </div>
+      <button data-action="use-dataset" data-dataset-id="${escapeHtml(dataset.id || "")}" type="button">Use This Dataset</button>
+    </article>
+  `;
+}
+
+function renderRealtimePage() {
+  return `
+    <section class="panel">
+      <div class="panel-head">
+        <div>
+          <h2>Realtime Capture and Result Echo</h2>
+          <p class="panel-copy">Keep camera capture, image upload, automatic streaming, and the processing flow.</p>
+        </div>
+        <span class="badge ok">LIVE READY</span>
+      </div>
+      <div class="card">
+        ${renderUploadBox()}
+        <div class="button-row">
+          <button data-action="start-camera" type="button">Start Camera</button>
+          <button data-action="stop-camera" type="button">Stop</button>
+          <button class="primary" data-action="upload-images" type="button">Send Current Input</button>
+          <button data-action="toggle-stream" type="button">${streamTimer ? "Stop Auto Upload" : "Auto Stream Upload"}</button>
+        </div>
+        <div class="split" style="margin-top: 14px;">
+          <div>
+            <p class="eyebrow">Live Preview</p>
+            <video id="local-stream" class="video-frame" autoplay playsinline muted></video>
+          </div>
+          <div>
+            <p class="eyebrow">Result Echo</p>
+            ${renderProcessedResult()}
+          </div>
+        </div>
+      </div>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><h2>Processing Flow</h2><span class="badge">${state.sessionId}</span></div>
+      <div class="card step-flow">
+        ${["Capture", "Upload", "Session Prep", "COLMAP", "Train", "Render", "View"].map((label, index) => `
+          <div class="step ${index < pipelineProgressIndex() ? "done" : index === pipelineProgressIndex() ? "active" : ""}">
+            <h3>${label}</h3>
+            <p class="panel-copy">${pipelineHint(label)}</p>
+          </div>
+        `).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function renderProcessedResult() {
+  const job = getJob();
+  if (job?.viewer_url) return `<iframe class="viewer-frame" src="${escapeHtml(job.viewer_url)}"></iframe>`;
+  if (job?.result_url) return `<img class="result-image" src="${escapeHtml(job.result_url)}" alt="result" />`;
+  return `<div class="viewer-frame" style="display:grid;place-items:center;"><p class="panel-copy">Waiting for upload or training results.</p></div>`;
+}
+
+function renderAlgorithmPage() {
+  const adapter = selectedAlgorithm();
+  const ops = supportedOperations(adapter);
+  const canSubmit = canSubmitRemoteJob();
+  return `
+    <section class="panel">
+      <div class="panel-head">
+        <div>
+          <h2>Algorithm Management and Remote Job Scheduling</h2>
+          <p class="panel-copy">Remote training is the only training entry. Local APIs stay available for debug compatibility only.</p>
+        </div>
+        <span class="badge ${operationSupportsRemote() ? "ok" : "bad"}">${operationSupportsRemote() ? "Remote Template OK" : "No Remote Template"}</span>
+      </div>
+      <div class="card grid">
+        <div class="step-flow">
+          ${["Data Input", "Data Prep", "SSH Precheck", "Command Review", "Remote Submit", "Logs and Metrics", "Result Page"].map((label, index) => `
+            <div class="step ${index < pipelineProgressIndex() ? "done" : index === pipelineProgressIndex() ? "active" : ""}">
+              <h3>${label}</h3>
+              <p class="panel-copy">${pipelineHint(label) || "Move by dependency"}</p>
+            </div>
+          `).join("")}
+        </div>
+        <div class="split">
+          <div class="grid">
+            <div class="form-grid">
+              <label>Algorithm Family
+                <select data-bind="algorithmFamily">
+                  ${algorithms.map((item) => `<option value="${escapeHtml(item.family)}" ${state.algorithmFamily === item.family ? "selected" : ""}>${escapeHtml(item.label || item.family)}</option>`).join("")}
+                </select>
+              </label>
+              <label>Operation
+                <select data-bind="operation">
+                  ${ops.map((op) => `<option value="${escapeHtml(op)}" ${state.operation === op ? "selected" : ""}>${escapeHtml(op)}</option>`).join("")}
+                </select>
+              </label>
+              <label>Local Result Output Directory
+                <input data-bind="outputDir" value="${escapeHtml(state.outputDir)}" placeholder="${escapeHtml(outputDirForPayload())}" />
+              </label>
+              <label>Checkpoint Path
+                <input data-bind="checkpointPath" value="${escapeHtml(state.checkpointPath)}" placeholder="Only required by some templates" />
+              </label>
+            </div>
+            ${renderTrainingFields()}
+            ${renderCommandPreview()}
+          </div>
+          <div class="grid">
+            ${renderRemoteConfigForm()}
+            <div class="button-row">
+              <button data-action="save-remote-config" type="button">Save Remote Config</button>
+              <button data-action="restore-remote-config" type="button">Restore Last Config</button>
+            </div>
+            <p class="panel-copy">Note: the password is saved only in this browser localStorage, visible on this machine, and never written to the codebase.</p>
+            <div class="button-row">
+              <button data-action="check-remote" type="button" ${busy ? "disabled" : ""}>SSH / COLMAP Precheck</button>
+              <button data-action="preview-command" type="button" ${state.sshChecked ? "" : "disabled"}>Generate Command Preview</button>
+              <button class="primary" data-action="submit-remote" type="button" ${canSubmit ? "" : "disabled"}>Submit Remote Job</button>
+            </div>
+            ${renderRemoteChecks()}
+          </div>
+        </div>
+      </div>
+    </section>
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Job Monitor</h2>
+        <div class="button-row">
+          <button data-action="refresh-jobs" type="button">Refresh Jobs</button>
+          ${state.selectedJobId ? `<button data-action="load-log-reset" type="button">Reload Logs</button>` : ""}
+        </div>
+      </div>
+      <div class="card grid">
+        ${renderJobsTable(jobs)}
+        ${renderLogPanel()}
+      </div>
+    </section>
+  `;
+}
+
+function renderTrainingFields() {
+  return `
+    <details class="panel pad">
+      <summary>Training Parameters and Advanced Fields</summary>
+      <div class="form-grid" style="margin-top: 14px;">
+        ${Object.entries(DEFAULT_TRAINING).map(([key]) => `
+          <label>${escapeHtml(key)}
+            <input data-training="${escapeHtml(key)}" type="number" step="any" value="${escapeHtml(state.training[key])}" />
+          </label>
+        `).join("")}
+      </div>
+    </details>
+  `;
+}
+
+function renderRemoteConfigForm() {
+  const remote = state.remoteConfig;
+  return `
+    <section class="panel pad">
+      <h3>Remote Environment Config</h3>
+      <div class="form-grid" style="margin-top: 14px;">
+        <label>Host<input data-remote="host" value="${escapeHtml(remote.host)}" placeholder="192.168.1.20" /></label>
+        <label>Port<input data-remote="port" type="number" value="${escapeHtml(remote.port)}" /></label>
+        <label>Username<input data-remote="username" value="${escapeHtml(remote.username)}" placeholder="ubuntu" /></label>
+        <label>Password<input data-remote="password" type="password" value="${escapeHtml(remote.password)}" /></label>
+        <label class="wide">Repo Path<input data-remote="repo_path" value="${escapeHtml(remote.repo_path)}" placeholder="/home/ubuntu/HAC-plus-main" /></label>
+        <label>Workspace Root<input data-remote="workspace_root" value="${escapeHtml(remote.workspace_root)}" /></label>
+        <label>Output Root<input data-remote="output_root" value="${escapeHtml(remote.output_root)}" /></label>
+        <label>Python<input data-remote="python" value="${escapeHtml(remote.python)}" /></label>
+        <label class="wide">Activate Command<input data-remote="activate_cmd" value="${escapeHtml(remote.activate_cmd)}" placeholder="source ~/.bashrc && conda activate env" /></label>
+      </div>
+    </section>
+  `;
+}
+
+function renderCommandPreview() {
+  const preview = state.lastPreview;
+  if (!preview) {
+    return `
+      <section class="panel pad">
+        <h3>Command Review</h3>
+        <p class="panel-copy">Generate a command preview after SSH precheck. Submission opens a custom confirmation dialog instead of the native browser confirm.</p>
+      </section>
+    `;
+  }
+  return `
+    <section class="panel pad">
+      <div class="button-row" style="justify-content: space-between;">
+        <h3>Command Review</h3>
+        <span class="badge ok">Preview Ready</span>
+      </div>
+      <div class="command-box grid" style="margin-top: 12px;">
+        <p class="panel-copy">Remote Workspace: ${escapeHtml(preview.remote_workspace)}</p>
+        <p class="panel-copy">Remote Output: ${escapeHtml(preview.remote_output_dir)}</p>
+        <p class="panel-copy">Local Output: ${escapeHtml(preview.local_output_dir)}</p>
+        ${preview.missing_inputs?.length ? `<p class="badge bad">Missing template inputs: ${escapeHtml(preview.missing_inputs.join(", "))}</p>` : `<p class="badge ok">Template inputs complete</p>`}
+        <pre>${escapeHtml(preview.shell_command || preview.remote_command || "")}</pre>
+      </div>
+    </section>
+  `;
+}
+
+function renderRemoteChecks() {
+  const checks = state.remoteReport?.checks || [];
+  if (!checks.length) {
+    return `<section class="panel pad"><p class="panel-copy">No remote precheck result yet.</p></section>`;
+  }
+  return `
+    <section class="panel pad">
+      <h3>Remote Precheck Result</h3>
+      <div class="grid" style="margin-top: 12px;">
+        ${checks.map((item) => `
+          <div class="status-dot ${item.ok ? "ok" : item.required ? "bad" : "warn"}">${escapeHtml(item.name)} · ${escapeHtml(item.message)}</div>
+        `).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function canSubmitRemoteJob() {
+  if (!state.sshChecked || !operationSupportsRemote()) return false;
+  if (state.useExistingRemoteDataset) {
+    const dataset = selectedDataset();
+    const hasDataset = Boolean(state.remoteDatasetPath || state.selectedRemoteDatasetId);
+    if (!hasDataset) return false;
+    if (dataset && !datasetHasColmap(dataset) && !state.autoColmap) return false;
+    return Boolean(state.lastPreview);
+  }
+  return state.uploadedCount > 0 && Boolean(state.lastPreview);
+}
+
+function renderJobsTable(items) {
+  if (!items.length) return `<p class="panel-copy">No jobs yet.</p>`;
+  return `
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Job</th><th>Status</th><th>Metrics</th><th>Dataset</th><th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${items.map((job) => `
+            <tr>
+              <td>
+                <strong>${escapeHtml(job.algorithm_family || "-")}</strong>
+                <p class="panel-copy">${escapeHtml(summarize(job.id, 18))}</p>
+              </td>
+              <td><span class="badge ${statusClass(job.status)}">${escapeHtml(job.status || "-")}</span><p class="panel-copy">${escapeHtml(job.remote_stage || job.operation || "-")}</p></td>
+              <td>FPS ${escapeHtml(job.metrics?.fps || "-")}<br />PSNR ${escapeHtml(job.metrics?.psnr || "-")}<br />Loss ${escapeHtml(job.metrics?.loss || "-")}</td>
+              <td>${escapeHtml(summarize(job.remote_result?.remote_dataset_id || job.remote_dataset_id || job.dataset_name || "-", 32))}</td>
+              <td>
+                <div class="button-row">
+                  <button data-action="select-job" data-job-id="${escapeHtml(job.id)}" type="button">Logs</button>
+                  <button data-action="open-result" data-job-id="${escapeHtml(job.id)}" type="button">Results</button>
+                  <button data-action="rerun-job" data-job-id="${escapeHtml(job.id)}" type="button">Rerun</button>
+                  <button class="danger" data-action="cancel-job" data-job-id="${escapeHtml(job.id)}" type="button" ${isTerminal(job.status) ? "disabled" : ""}>Cancel</button>
+                </div>
+              </td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderLogPanel() {
+  const job = getJob();
+  if (!job) return `<p class="panel-copy">Select a job to stream incremental logs here.</p>`;
+  const logUrl = buildJobLogDownloadUrl(state.apiBaseUrl, job.id);
+  const csvUrl = buildJobMetricsCsvUrl(state.apiBaseUrl, job.id);
+  const downloadsEnabled = isTerminal(job.status);
+  return `
+    <section class="panel pad">
+      <div class="button-row" style="justify-content: space-between;">
+        <div>
+          <h3>Logs and Metrics</h3>
+          <p class="panel-copy">${escapeHtml(job.id)} · ${escapeHtml(job.status || "-")}</p>
+        </div>
+        <div class="button-row">
+          <a class="button-link ${downloadsEnabled ? "" : "disabled"}" href="${downloadsEnabled ? escapeHtml(logUrl) : "#"}" download>Download Logs</a>
+          <a class="button-link ${downloadsEnabled ? "" : "disabled"}" href="${downloadsEnabled ? escapeHtml(csvUrl) : "#"}" download>Download metrics.csv</a>
+        </div>
+      </div>
+      <pre id="log-tail" class="logs">${escapeHtml(state.logText || "Waiting for log output...")}</pre>
+    </section>
+  `;
+}
+
+function renderBrowserPage() {
+  return `
+    <section class="panel">
+      <div class="panel-head">
+        <div>
+          <h2>PLY / Image Result Browser</h2>
+          <p class="panel-copy">Local training is removed. Local mode only keeps PLY viewing and result fallback browsing.</p>
+        </div>
+        <button data-action="discover-results" type="button">Discover Results</button>
+      </div>
+      <div class="card grid">
+        <div class="form-grid">
+          <label class="wide">PLY Path
+            <input data-bind="quickPlyPath" value="${escapeHtml(state.quickPlyPath)}" placeholder="/abs/path/to/model.ply" />
+          </label>
+        </div>
+        <div class="button-row">
+          <button class="primary" data-action="load-ply" type="button">Load PLY</button>
+          <button data-action="open-selected-result" type="button" ${state.selectedJobId ? "" : "disabled"}>Open Current Job Result</button>
+        </div>
+        ${renderViewerSurface(state.loadedPly?.viewer_url, state.loadedPly?.point_cloud_url, state.loadedPly?.result_url)}
+      </div>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><h2>Discovered Results</h2><span class="badge">${discoveredResults.length}</span></div>
+      <div class="card dataset-list">
+        ${discoveredResults.length ? discoveredResults.map((item) => `
+          <article class="selectable-card">
+            <strong>${escapeHtml(summarize(item.output_dir, 84))}</strong>
+            <p class="panel-copy">${escapeHtml(item.point_cloud_url || item.result_url || item.viewer_url || "-")}</p>
+            <button data-action="open-discovered-result" data-output-dir="${escapeHtml(item.output_dir)}" type="button">Open</button>
+          </article>
+        `).join("") : `<p class="panel-copy">Click Discover Results to scan generated/runs, streams, and datasets.</p>`}
+      </div>
+    </section>
+  `;
+}
+
+function renderViewerSurface(viewerUrl, pointCloudUrl, imageUrl) {
+  if (viewerUrl) return `<iframe class="viewer-frame tall" src="${escapeHtml(viewerUrl)}"></iframe>`;
+  if (imageUrl) return `<img class="result-image" src="${escapeHtml(imageUrl)}" alt="result" />`;
+  return `
+    <div class="viewer-frame tall" style="display:grid;place-items:center;">
+      <div>
+        <h3>Waiting for viewer assets</h3>
+        <p class="panel-copy">${pointCloudUrl ? escapeHtml(pointCloudUrl) : "PLY is preferred; images can be used as fallback."}</p>
+      </div>
+    </div>
+  `;
+}
+
+function renderAnalysisPage() {
+  const job = getJob();
+  return `
+    <section class="panel">
+      <div class="panel-head">
+        <div>
+          <h2>Training Metrics Analysis</h2>
+          <p class="panel-copy">Parse metrics.csv and job metrics to show FPS, Loss, PSNR, SSIM, LPIPS, and Iter.</p>
+        </div>
+        <button data-action="load-analysis" type="button" ${job ? "" : "disabled"}>Load Metrics</button>
+      </div>
+      <div class="card grid">
+        <label>Select Job
+          <select data-bind="selectedJobId">
+            <option value="">Not selected</option>
+            ${jobs.map((item) => `<option value="${escapeHtml(item.id)}" ${state.selectedJobId === item.id ? "selected" : ""}>${escapeHtml(item.algorithm_family || "-")} · ${escapeHtml(item.status || "-")} · ${escapeHtml(item.id.slice(0, 8))}</option>`).join("")}
+          </select>
+        </label>
+        <div class="metric-grid">
+          ${jobs.slice(0, 4).map((item) => `
+            <div class="metric">
+              <span class="muted">${escapeHtml(item.algorithm_family || "-")} · ${escapeHtml(item.status || "-")}</span>
+              <strong>${escapeHtml(item.metrics?.psnr || item.metrics?.fps || "-")}</strong>
+              <p class="panel-copy">PSNR/FPS · ${escapeHtml(item.id.slice(0, 8))}</p>
+            </div>
+          `).join("") || `<p class="panel-copy">No jobs to compare yet.</p>`}
+        </div>
+        <canvas id="metrics-chart" class="chart"></canvas>
+        ${renderMetricsTable(state.metricsRows)}
+      </div>
+    </section>
+  `;
+}
+
+function renderMetricsTable(rows) {
+  if (!rows.length) return `<p class="panel-copy">No metrics yet. While running, use the log panel for live tail output; after completion, download metrics.csv.</p>`;
+  return `
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Time</th><th>Iter</th><th>Loss</th><th>PSNR</th><th>SSIM</th><th>LPIPS</th><th>FPS</th></tr></thead>
+        <tbody>
+          ${rows.slice(-80).reverse().map((row) => `
+            <tr>
+              <td>${escapeHtml(row.timestamp || "-")}</td>
+              <td>${escapeHtml(row.iter || "-")}</td>
+              <td>${escapeHtml(row.loss || "-")}</td>
+              <td>${escapeHtml(row.psnr || "-")}</td>
+              <td>${escapeHtml(row.ssim || "-")}</td>
+              <td>${escapeHtml(row.lpips || "-")}</td>
+              <td>${escapeHtml(row.fps || "-")}</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderResultPage() {
+  const params = new URLSearchParams(window.location.search);
+  const jobId = params.get("job") || state.selectedJobId;
+  const job = getJob(jobId);
+  const mode = state.renderMode || "ply";
+  const viewerUrl = mode === "ply" ? job?.viewer_url : "";
+  const imageUrl = mode === "image" ? job?.result_url : "";
+  return `
+    <section class="panel">
+      <div class="panel-head">
+        <div>
+          <h2>Result Page</h2>
+          <p class="panel-copy">${job ? `${job.algorithm_family} · ${job.id}` : "Job not found. Try opening it from discovered results."}</p>
+        </div>
+        <div class="button-row">
+          <button data-bind-render="ply" class="${mode === "ply" ? "primary" : ""}" data-action="set-render-mode" data-mode="ply" type="button">PLY</button>
+          <button data-bind-render="image" class="${mode === "image" ? "primary" : ""}" data-action="set-render-mode" data-mode="image" type="button">Image Fallback</button>
+          <button data-page="algorithm" type="button">Back to Jobs</button>
+        </div>
+      </div>
+      <div class="card grid">
+        ${job ? renderViewerSurface(viewerUrl, job.point_cloud_url, imageUrl || job.result_url) : `<p class="panel-copy">No renderable job yet. Finish training first or load a PLY from the Browser page.</p>`}
+        ${job && mode === "ply" && !job.viewer_url ? `<div class="error-box"><p>This job has no available PLY viewer. Switch to image fallback, or check whether the output directory contains point_cloud.ply / latest.ply.</p></div>` : ""}
+      </div>
+    </section>
+  `;
+}
+
+function bindStaticEvents() {
+  root.addEventListener("click", handleClick);
+  root.addEventListener("change", handleChange);
+  root.addEventListener("input", handleInput);
+  window.addEventListener("popstate", () => {
+    state.activePage = initialPage();
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("job")) state.selectedJobId = params.get("job");
+    render();
+    afterRender();
+  });
+}
+
+async function handleClick(event) {
+  const pageButton = event.target.closest("[data-page]");
+  if (pageButton) {
+    setPage(pageButton.dataset.page);
+    return;
+  }
+
+  const actionNode = event.target.closest("[data-action]");
+  if (!actionNode) return;
+  const action = actionNode.dataset.action;
+  const jobId = actionNode.dataset.jobId || "";
+  if (busy) return;
+
+  if (action === "refresh-all") await refreshAll();
+  if (action === "refresh-jobs") await guarded(refreshJobs, "Failed to refresh jobs");
+  if (action === "check-runtime") await guarded(checkRuntime, "Environment check failed");
+  if (action === "select-algorithm") selectAlgorithm(actionNode.dataset.family);
+  if (action === "open-dataset-modal") await askDatasetName();
+  if (action === "new-capture") newCapture();
+  if (action === "upload-images") await guarded(uploadImages, "Image upload failed");
+  if (action === "materialize-session") await guarded(materializeCurrentSession, "Session materialize failed");
+  if (action === "prepare-colmap") await guarded(prepareCurrentColmap, "COLMAP workspace prep failed");
+  if (action === "use-dataset") useDataset(actionNode.dataset.datasetId);
+  if (action === "start-camera") await guarded(startCamera, "Failed to start camera");
+  if (action === "stop-camera") stopCamera();
+  if (action === "toggle-stream") await guarded(toggleStream, "Auto upload failed");
+  if (action === "save-remote-config") saveRemoteConfig();
+  if (action === "restore-remote-config") restoreRemoteConfig();
+  if (action === "check-remote") await guarded(checkRemote, "Remote precheck failed");
+  if (action === "preview-command") await guarded(previewCommand, "Command preview failed");
+  if (action === "submit-remote") await guarded(submitRemote, "Remote job submission failed");
+  if (action === "select-job") selectJob(jobId);
+  if (action === "load-log-reset") await guarded(() => loadLog(true), "Failed to load logs");
+  if (action === "cancel-job") await guarded(() => cancelSelectedJob(jobId), "Failed to cancel job");
+  if (action === "open-result") openResult(jobId);
+  if (action === "open-selected-result") openResult(state.selectedJobId);
+  if (action === "rerun-job") rerunJob(jobId);
+  if (action === "load-ply") await guarded(loadQuickPly, "Failed to load PLY");
+  if (action === "discover-results") await guarded(discoverResults, "Failed to discover results");
+  if (action === "open-discovered-result") openDiscovered(actionNode.dataset.outputDir);
+  if (action === "load-analysis") await guarded(loadAnalysisRows, "Failed to load metrics");
+  if (action === "set-render-mode") {
+    state.renderMode = actionNode.dataset.mode || "ply";
+    persistState();
+    render();
+    afterRender();
+  }
+}
+
+function handleInput(event) {
+  const node = event.target;
+  if (node.matches("[data-bind]")) {
+    updateBoundValue(node);
+  }
+  if (node.matches("[data-remote]")) {
+    const key = node.dataset.remote;
+    state.remoteConfig[key] = key === "port" ? Number(node.value || 22) : node.value;
+    invalidateRemoteState();
+    persistState();
+  }
+  if (node.matches("[data-training]")) {
+    state.training[node.dataset.training] = Number(node.value);
+    state.lastPreview = null;
+    persistState();
+  }
+}
+
+function handleChange(event) {
+  const node = event.target;
+  if (node.matches("[data-bind]")) {
+    updateBoundValue(node);
+    if (node.dataset.bind === "algorithmFamily") {
+      normalizeOperation();
+      invalidateRemoteState();
+      render();
+      afterRender();
+    }
+    if (node.dataset.bind === "operation" || node.dataset.bind === "useExistingRemoteDataset" || node.dataset.bind === "autoColmap") {
+      invalidateRemoteState();
+      render();
+      afterRender();
+    }
+    if (node.dataset.bind === "selectedJobId") {
+      state.logText = "";
+      state.logCursor = 0;
+      loadLog(true).catch(() => {});
+      if (state.activePage === "analysis") {
+        loadAnalysisRows()
+          .then(() => {
+            render();
+            afterRender();
+          })
+          .catch(() => {});
+      }
+    }
+  }
+  if (node.id === "image-upload-input") {
+    renderSelectedFiles(node.files || []);
+  }
+}
+
+function updateBoundValue(node) {
+  const key = node.dataset.bind;
+  if (node.type === "checkbox") {
+    state[key] = node.checked;
+  } else {
+    state[key] = node.value;
+  }
+  if (["sessionId", "captureId", "datasetName", "remoteDatasetPath", "outputDir", "checkpointPath"].includes(key)) {
+    state.lastPreview = null;
+  }
+  persistState();
+}
+
+function afterRender() {
+  const video = document.getElementById("local-stream");
+  if (video && cameraStream) {
+    video.srcObject = cameraStream;
+  }
+  const logNode = document.getElementById("log-tail");
+  if (logNode) {
+    logNode.scrollTop = logNode.scrollHeight;
+  }
+  if (state.activePage === "analysis") {
+    drawMetricsChart();
+  }
+}
+
+function selectAlgorithm(family) {
+  state.algorithmFamily = family || state.algorithmFamily;
+  normalizeOperation();
+  invalidateRemoteState();
+  persistState();
+  render();
+  afterRender();
+}
+
+function normalizeOperation() {
+  const ops = supportedOperations();
+  if (!ops.includes(state.operation)) {
+    state.operation = ops[0] || "train";
+  }
+}
+
+function invalidateRemoteState() {
+  state.sshChecked = false;
+  state.lastPreview = null;
+  state.lastError = null;
+}
+
+async function refreshAll() {
+  await guarded(async () => {
+    await Promise.allSettled([refreshHealth(), refreshAlgorithms(), refreshJobs(), discoverResults(false)]);
+    if (state.algorithmFamily) {
+      await checkRuntime(false);
+    }
+  }, "Failed to refresh workbench");
+}
+
+async function refreshHealth() {
+  try {
+    await fetchHealth(state.apiBaseUrl);
+    state.apiOnline = true;
+  } catch (error) {
+    state.apiOnline = false;
+    throw error;
+  }
+}
+
+async function refreshAlgorithms() {
+  const data = await fetchAlgorithms(state.apiBaseUrl);
+  algorithms = data.algorithms || [];
+  validation = new Map((data.validation || []).map((item) => [item.family, item]));
+  if (!state.algorithmFamily && algorithms[0]) {
+    state.algorithmFamily = algorithms[0].family;
+  }
+  normalizeOperation();
+}
+
+async function checkRuntime(shouldRender = true) {
+  const data = await fetchEnvironmentCheck(state.apiBaseUrl, state.algorithmFamily);
+  environmentReport = data.report;
+  if (state.algorithmFamily) {
+    try {
+      const adapterResult = await validateAdapter(state.apiBaseUrl, state.algorithmFamily);
+      validation.set(state.algorithmFamily, adapterResult.validation);
+    } catch {
+      // Runtime checks should remain visible even if adapter validation fails.
+    }
+  }
+  if (shouldRender) {
+    render();
+    afterRender();
+  }
 }
 
 async function refreshJobs() {
-  const apiBase = getApiBaseUrl();
-  const [data, discovered] = await Promise.all([
-    fetchJobs(apiBase),
-    fetchDiscoveredResults(apiBase, { limit: 30, maxScanDirs: 1800 }).catch(() => ({ results: [], latest: null })),
-  ]);
-  const jobs = data.jobs ?? [];
-  lastJobsSnapshot = jobs;
-  renderJobs(jobs);
-  refreshRemoteDatasetSummary(lastRemoteCheckReport);
-  populateJobLogSelector(jobs);
-  if (jobLogState.jobId) {
-    await loadJobLogs(jobLogState.page);
+  const data = await fetchJobs(state.apiBaseUrl);
+  jobs = data.jobs || [];
+  if (!state.selectedJobId && jobs[0]) {
+    state.selectedJobId = jobs[0].id;
   }
-  const runningJob = jobs.slice().reverse().find((item) => item.status === "running" || item.status === "queued");
-  if (runningJob) {
-    applyJobMetrics(runningJob);
-  } else {
-    const latestDiscovered = discovered?.latest ?? (Array.isArray(discovered?.results) ? discovered.results[0] : null);
-    if (latestDiscovered) {
-      applyJobMetrics(latestDiscovered);
-    }
-  }
-  return jobs;
+  persistState();
 }
 
-async function handleExportPackage() {
-  const payload = {
-    input_path: document.getElementById("server-input-path").value.trim(),
-    output_dir: document.getElementById("server-output-dir").value.trim(),
-    scene_id: document.getElementById("server-scene-id").value.trim() || "exported-scene",
-    title: document.getElementById("server-scene-id").value.trim() || "Exported Scene",
-    representation: document.getElementById("representation").value,
-    algorithm_family: document.getElementById("algorithm-family").value,
-    web_base_url: window.location.origin,
-    preprocess: collectPreprocessOptions(),
-    editor: collectEditorOptions(),
-    viewer_backend: document.getElementById("viewer-backend").value,
-  };
-  const result = await exportScenePackage(getApiBaseUrl(), payload);
-  updateStatus({
-    viewer: "exported",
-    source: result.result.scene_dir,
-    webUrl: result.share_url,
-  });
-  setShareUrl(result.share_url);
-  document.getElementById("manifest-url").value = result.manifest_url;
-  if (typeof result.manifest_url === "string") {
-    await handleManifestLoad(result.manifest_url);
+async function discoverResults(shouldRender = true) {
+  const data = await fetchDiscoveredResults(state.apiBaseUrl, { limit: 40, maxScanDirs: 2500 });
+  discoveredResults = data.results || [];
+  if (shouldRender) {
+    render();
+    afterRender();
   }
 }
 
-async function handleSubmitAlgorithmJob() {
-  const extraArgs = parseExtraArgs();
-  const trainingOptions = collectTrainingOptions();
-  const algorithmFamily = document.getElementById("algorithm-family").value;
-  const operation = document.getElementById("algorithm-operation").value;
-  const outputDir = document.getElementById("server-output-dir").value.trim();
-  const checkpointPath = extraArgs.checkpoint_path ?? "";
-  const pathConfirmation = confirmPathSettingsOrThrow({
-    family: algorithmFamily,
-    operation,
-    checkpointPath,
-    outputDir,
+async function askDatasetName() {
+  const value = await openInputModal({
+    title: "Name Dataset",
+    description: "Give this dataset a clear name. Remote datasets will keep the same name when possible for reuse and reruns.",
+    defaultValue: datasetNameForPayload(),
+    placeholder: "office-apr24-batch01",
   });
-
-  const payload = {
-    algorithm_family: algorithmFamily,
-    operation,
-    input_path: document.getElementById("server-input-path").value.trim(),
-    output_dir: outputDir,
-    cwd: extraArgs.cwd ?? "",
-    workspace: extraArgs.workspace ?? "",
-    checkpoint_path: checkpointPath,
-    repo_path: document.getElementById("server-repo-path").value.trim(),
-    source: document.getElementById("server-input-path").value.trim(),
-    preprocess: collectPreprocessOptions(),
-    editor: collectEditorOptions(),
-    viewer_backend: document.getElementById("viewer-backend").value,
-    ...trainingOptions,
-    path_confirmation: pathConfirmation,
-  };
-  const result = await submitAlgorithmJob(getApiBaseUrl(), payload);
-  applyJobMetrics(result.job);
-  jobLogState.jobId = result.job?.id ?? jobLogState.jobId;
-  jobLogState.page = 1;
-  await refreshJobs();
-  startJobPolling(result.job.id);
-  workflowState.jobStarted = true;
-  refreshWorkflowUI();
+  if (value) {
+    state.datasetName = value;
+    state.lastPreview = null;
+    persistState();
+    render();
+    afterRender();
+  }
 }
 
-async function handleRunCapturePipeline() {
-  const runtime = currentRuntimeContext();
-  const trainingOptions = collectTrainingOptions();
-  const sessionId = document.getElementById("stream-session-id").value.trim() || "default-session";
-  const outputDir =
-    document.getElementById("server-output-dir").value.trim() ||
-    `/web/generated/runs/${sessionId}/${runtime.family}`;
-  const result = await runCapturePipeline(getApiBaseUrl(), {
-    session_id: sessionId,
-    algorithm_family: runtime.family,
-    output_dir: outputDir,
-    repo_path: runtime.repoPath,
-    checkpoint_path: runtime.checkpointPath,
-    ...trainingOptions,
-    execute_immediately: true,
-  });
-  document.getElementById("server-output-dir").value = result.pipeline.output_dir;
-  const nextArgs = {
-    ...parseExtraArgs(),
-    workspace: result.pipeline.workspace.workspace_root,
-    capture_pipeline_script: result.pipeline.script_path,
-    colmap_command: result.pipeline.workspace.suggested_command,
-  };
-  setExtraArgs(nextArgs);
-  if (result.job?.id) {
-    applyJobMetrics(result.job);
-    jobLogState.jobId = result.job.id;
-    jobLogState.page = 1;
-    await refreshJobs();
-    startJobPolling(result.job.id);
-  }
-  updateStatus({
-    viewer: "capture-pipeline-running",
-    source: result.pipeline.workspace.workspace_root,
-  });
-  workflowState.jobStarted = true;
-  refreshWorkflowUI();
+function newCapture() {
+  ensureCaptureId(true);
+  state.uploadedCount = 0;
+  state.lastPreview = null;
+  persistState();
+  render();
+  afterRender();
 }
 
-async function handleOneClickRemoteTrain() {
-  const runtime = currentRuntimeContext();
-  const trainingOptions = collectTrainingOptions();
-  const sessionId = document.getElementById("stream-session-id").value.trim() || "default-session";
-  const operation = document.getElementById("algorithm-operation").value;
-  const useExisting = isUseExistingRemoteDataset();
-  const selectedRemoteDataset = getSelectedRemoteDataset();
-  const remoteDatasetPath = document.getElementById("remote-dataset-path")?.value.trim() || "";
-  const effectiveRemoteDatasetPath = remoteDatasetPath || selectedRemoteDataset.path;
-  const autoColmap = document.getElementById("auto-colmap")?.checked !== false;
-  const captureId = ensureCaptureBatchId();
-  const datasetName = document.getElementById("dataset-name")?.value.trim() || `${sessionId}-${captureId}`;
-
-  if (!workflowState.sshChecked) {
-    throw new Error("Step 4 is not completed. Please run 'Check SSH' first.");
-  }
-  if (!selectedOperationSupportsRemote()) {
-    throw new Error(`Operation ${operation} is not available for remote execution in ${runtime.family}.`);
-  }
-  if (useExisting && !selectedRemoteDataset.id && !effectiveRemoteDatasetPath) {
-    throw new Error("Existing dataset mode is enabled. Please select a remote dataset or provide remote dataset path.");
-  }
-
-  setStepResult("step5", "running", "Step 5 running", `Submitting remote ${runtime.family}/${operation} job...`);
-  if (!useExisting) {
-    updateStatus({ viewer: "remote-uploading" });
-    await sendCurrentFrame({
-      triggerProcessing: false,
-      placeholderMessage: "Frame uploaded, preparing remote training",
-    });
-  }
-
-  const outputNode = document.getElementById("server-output-dir");
-  const outputSuffix = useExisting ? (selectedRemoteDataset.id || "existing-dataset") : captureId;
-  const outputDir = outputNode.value.trim() || `/web/generated/runs/${sessionId}/${runtime.family}/${outputSuffix}`;
-  outputNode.value = outputDir;
-
-  const pathConfirmation = confirmPathSettingsOrThrow({
-    family: runtime.family,
-    operation,
-    checkpointPath: runtime.checkpointPath,
-    outputDir,
-  });
-
-  updateStatus({ viewer: "remote-connecting" });
-  const result = await runRemoteAlgorithm(getApiBaseUrl(), {
-    algorithm_family: runtime.family,
-    operation,
-    session_id: sessionId,
-    capture_id: captureId,
-    dataset_name: datasetName,
-    auto_materialize: !useExisting,
-    auto_colmap: autoColmap,
-    use_existing_remote_dataset: useExisting,
-    remote_dataset_id: selectedRemoteDataset.id,
-    remote_dataset_path: effectiveRemoteDatasetPath,
-    workspace: useExisting ? runtime.workspace : "",
-    checkpoint_path: runtime.checkpointPath,
-    output_dir: outputDir,
-    path_confirmation: pathConfirmation,
-    ...trainingOptions,
-    remote: collectRemoteConfig(),
-    require_remote_check: true,
-  });
-
-  if (result.materialized?.dataset_root) {
-    const nextArgs = {
-      ...parseExtraArgs(),
-      workspace: result.materialized.dataset_root,
-    };
-    setExtraArgs(nextArgs);
-    workflowState.sessionReady = true;
-  }
-
-  if (result.job?.id) {
-    applyJobMetrics(result.job);
-    jobLogState.jobId = result.job.id;
-    jobLogState.page = 1;
-    await refreshJobs();
-    startJobPolling(result.job.id);
-  }
-
-  workflowState.frameReady = true;
-  workflowState.sessionReady = true;
-  workflowState.jobStarted = true;
-  const modeText = useExisting
-    ? `remote dataset ${selectedRemoteDataset.id || effectiveRemoteDatasetPath}`
-    : `capture ${captureId}`;
-  setStepResult("step5", "success", "Step 5 queued", `Job ${result.job?.id || "-"} queued successfully using ${modeText}.`);
-  refreshWorkflowUI();
-  updateStatus({
-    viewer: "remote-training",
-    job: result.job?.id ?? "-",
-  });
+async function startCamera() {
+  if (cameraStream) return;
+  cameraStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+  afterRender();
 }
 
-async function bootstrapFromQuery() {
-  const params = new URLSearchParams(window.location.search);
-  const manifest = params.get("manifest");
-  if (manifest) {
-    await handleManifestLoad(manifest);
+function stopCamera() {
+  if (cameraStream) {
+    cameraStream.getTracks().forEach((track) => track.stop());
+    cameraStream = null;
+  }
+  if (streamTimer) {
+    window.clearInterval(streamTimer);
+    streamTimer = null;
+  }
+  render();
+  afterRender();
+}
+
+async function toggleStream() {
+  if (streamTimer) {
+    window.clearInterval(streamTimer);
+    streamTimer = null;
+    render();
+    afterRender();
     return;
   }
-  const source = params.get("source");
-  if (source) {
-    document.getElementById("source-url").value = source;
-    document.getElementById("representation").value = params.get("representation") ?? "sh";
-    document.getElementById("algorithm-family").value = params.get("family") ?? "vanilla-3dgs";
-    await handleDirectLoad();
-  }
+  await startCamera();
+  await uploadImages();
+  streamTimer = window.setInterval(() => {
+    uploadImages().catch((error) => setError(error, "Auto upload failed"));
+  }, 5000);
 }
 
-function bindEvents() {
-  showProcessedPlaceholder();
-  registerFlowBlockToggleHandlers();
-
-  const uploadInput = getUploadInputNode();
-  const uploadDropzone = document.getElementById("upload-dropzone");
-  const clearUploadButton = document.getElementById("clear-upload-files");
-
-  if (uploadInput) {
-    uploadInput.addEventListener("change", () => {
-      renderUploadSelectionSummary();
-      const fileCount = getSelectedUploadFiles().length;
-      if (fileCount > 0) {
-        setStepResult("step3", "idle", "Step 3 pending", `Selected ${fileCount} image(s). Click Send Frame to upload.`);
-      }
-    });
-  }
-
-  if (clearUploadButton) {
-    clearUploadButton.addEventListener("click", () => {
-      clearUploadFileSelection();
-      setStepResult("step3", "idle", "Step 3 pending", "Upload a frame or select photos.");
-    });
-  }
-
-  if (uploadDropzone) {
-    const preventDefault = (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-    };
-
-    ["dragenter", "dragover"].forEach((eventName) => {
-      uploadDropzone.addEventListener(eventName, (event) => {
-        preventDefault(event);
-        uploadDropzone.classList.add("dragover");
-      });
-    });
-
-    ["dragleave", "dragend", "drop"].forEach((eventName) => {
-      uploadDropzone.addEventListener(eventName, (event) => {
-        preventDefault(event);
-        uploadDropzone.classList.remove("dragover");
-      });
-    });
-
-    uploadDropzone.addEventListener("drop", (event) => {
-      const droppedFiles = Array.from(event.dataTransfer?.files ?? []);
-      if (!droppedFiles.length) return;
-      applyDroppedUploadFiles(droppedFiles);
-      const fileCount = getSelectedUploadFiles().length;
-      if (fileCount > 0) {
-        setStepResult("step3", "idle", "Step 3 pending", `Selected ${fileCount} image(s) by drag-and-drop.`);
-      }
-    });
-  }
-
-  window.addEventListener("beforeunload", () => {
-    revokeUploadPreviewObjectUrls();
+async function imageFileToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
   });
+}
 
-  document.getElementById("api-base-url").addEventListener("change", () => {
-    workflowState.apiChecked = false;
-    workflowState.adapterReady = false;
-    workflowState.frameReady = false;
-    workflowState.sessionReady = false;
-    workflowState.remoteConfigReady = false;
-    invalidateRemoteSshCheck();
-    workflowState.jobStarted = false;
-    setStepResult("step1", "idle", "Step 1 pending", "Click Check Runtime.");
-    setStepResult("step2", "idle", "Step 2 pending", "Validate adapter capability.");
-    setStepResult("step3", "idle", "Step 3 pending", "Upload a frame.");
-    setStepResult("step4", "idle", "Step 4 pending", "Fill remote config and check SSH.");
-    setStepResult("step5", "idle", "Step 5 pending", "Start remote job.");
-    refreshWorkflowUI();
-  });
-
-  const resetAdapterStage = () => {
-    workflowState.adapterReady = false;
-    workflowState.frameReady = false;
-    workflowState.sessionReady = false;
-    workflowState.remoteConfigReady = false;
-    invalidateRemoteSshCheck();
-    workflowState.jobStarted = false;
-    setStepResult("step2", "idle", "Step 2 pending", "Adapter config changed. Re-validate adapter.");
-    setStepResult("step3", "idle", "Step 3 pending", "Upload a frame.");
-    setStepResult("step4", "idle", "Step 4 pending", "Fill remote config and check SSH.");
-    setStepResult("step5", "idle", "Step 5 pending", "Start remote job.");
-    refreshWorkflowUI();
+async function captureCameraFrame() {
+  await startCamera();
+  const video = document.getElementById("local-stream");
+  if (video && (!video.videoWidth || !video.videoHeight)) {
+    await new Promise((resolve) => {
+      const timer = window.setTimeout(resolve, 900);
+      video.addEventListener("loadedmetadata", () => {
+        window.clearTimeout(timer);
+        resolve();
+      }, { once: true });
+    });
+  }
+  const canvas = document.createElement("canvas");
+  canvas.width = video?.videoWidth || 1280;
+  canvas.height = video?.videoHeight || 720;
+  canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
+  return {
+    imageData: canvas.toDataURL("image/png"),
+    filename: `frame_${Date.now()}.png`,
   };
+}
 
-  document.getElementById("server-repo-path").addEventListener("change", resetAdapterStage);
-  document.getElementById("server-default-cwd").addEventListener("change", resetAdapterStage);
-
-  document.getElementById("stream-session-id").addEventListener("change", () => {
-    ensureCaptureBatchId(true);
-    workflowState.frameReady = false;
-    workflowState.sessionReady = false;
-    workflowState.remoteConfigReady = false;
-    invalidateRemoteSshCheck();
-    workflowState.jobStarted = false;
-    setStepResult("step3", "idle", "Step 3 pending", "Session changed. Upload a new frame.");
-    setStepResult("step4", "idle", "Step 4 pending", "Run SSH check again for this session.");
-    setStepResult("step5", "idle", "Step 5 pending", "Start remote job.");
-    refreshWorkflowUI();
-  });
-
-  document.getElementById("new-capture-batch").addEventListener("click", () => {
-    ensureCaptureBatchId(true);
-    setStepResult("step3", "idle", "Step 3 pending", "Capture batch switched. Upload a new frame batch.");
-    workflowState.frameReady = false;
-    workflowState.sessionReady = false;
-    workflowState.jobStarted = false;
-    refreshWorkflowUI();
-  });
-
-  document.getElementById("preset-scene").addEventListener("change", (event) => {
-    document.getElementById("manifest-url").value = event.target.value;
-  });
-
-  document.getElementById("algorithm-family").addEventListener("change", (event) => {
-    const method = getSelectedAdapter();
-    if (method) {
-      document.getElementById("representation").value = method.representation;
-      setOperationOptions(method);
-      syncAdapterDetail();
-      fetchEnvironmentCheck(getApiBaseUrl(), method.family)
-        .then((env) => {
-          environmentReport = env.report;
-          renderEnvironmentCheck(environmentReport);
-        })
-        .catch(() => { });
-
-      if (workflowState.apiChecked) {
-        workflowState.adapterReady = isAdapterValidationReady(serverValidation.get(method.family));
-      } else {
-        workflowState.adapterReady = false;
-      }
-      workflowState.frameReady = false;
-      workflowState.sessionReady = false;
-      workflowState.remoteConfigReady = false;
-      invalidateRemoteSshCheck();
-      workflowState.jobStarted = false;
-      if (workflowState.adapterReady) {
-        setStepResult("step2", "success", "Step 2 passed", "Adapter capability is ready for this family.");
-      } else {
-        setStepResult("step2", "idle", "Step 2 pending", "Algorithm changed. Re-validate adapter.");
-      }
-      setStepResult("step3", "idle", "Step 3 pending", "Upload a frame.");
-      setStepResult("step4", "idle", "Step 4 pending", "Fill remote config and check SSH.");
-      setStepResult("step5", "idle", "Step 5 pending", "Start remote job.");
-      refreshWorkflowUI();
-    }
-  });
-
-  document.getElementById("algorithm-operation").addEventListener("change", () => {
-    invalidateRemoteSshCheck();
-    setStepResult("step4", "idle", "Step 4 pending", "Operation changed. Re-run Check SSH.");
-    setStepResult("step5", "idle", "Step 5 pending", "Start remote job.");
-    refreshWorkflowUI();
-  });
-
-  [
-    "remote-host",
-    "remote-port",
-    "remote-username",
-    "remote-password",
-    "remote-repo-path",
-    "remote-workspace-root",
-    "remote-output-root",
-    "remote-python",
-    "remote-activate-cmd",
-  ].forEach((id) => {
-    document.getElementById(id).addEventListener("input", () => {
-      invalidateRemoteSshCheck();
-      setStepResult("step4", "idle", "Step 4 pending", "Remote config changed. Run Check SSH.");
-      setStepResult("step5", "idle", "Step 5 pending", "Start remote job.");
-      refreshWorkflowUI();
-    });
-  });
-
-  document.getElementById("use-existing-remote-dataset").addEventListener("change", () => {
-    refreshRemoteDatasetSummary(lastRemoteCheckReport);
-    refreshWorkflowUI();
-  });
-
-  document.getElementById("remote-dataset-select").addEventListener("change", () => {
-    const select = document.getElementById("remote-dataset-select");
-    const useExistingNode = document.getElementById("use-existing-remote-dataset");
-    if (useExistingNode && String(select?.value || "").trim()) {
-      useExistingNode.checked = true;
-    }
-    refreshRemoteDatasetSummary(lastRemoteCheckReport);
-    refreshWorkflowUI();
-  });
-
-  document.getElementById("remote-dataset-path").addEventListener("input", () => {
-    const customPath = document.getElementById("remote-dataset-path")?.value.trim() || "";
-    const useExistingNode = document.getElementById("use-existing-remote-dataset");
-    if (useExistingNode && customPath) {
-      useExistingNode.checked = true;
-    }
-    refreshRemoteDatasetSummary(lastRemoteCheckReport);
-    refreshWorkflowUI();
-  });
-
-  document.getElementById("auto-colmap").addEventListener("change", () => {
-    if (!isUseExistingRemoteDataset()) {
-      invalidateRemoteSshCheck();
-      setStepResult("step4", "idle", "Step 4 pending", "COLMAP option changed. Run Check SSH.");
-    }
-    refreshRemoteDatasetSummary(lastRemoteCheckReport);
-    refreshWorkflowUI();
-  });
-
-  document.getElementById("load-manifest").addEventListener("click", async () => {
-    try {
-      const manifestUrl = document.getElementById("manifest-url").value.trim();
-      if (!manifestUrl) {
-        throw new Error("Manifest URL is required.");
-      }
-      await handleManifestLoad(manifestUrl);
-    } catch (error) {
-      updateStatus({ viewer: "error" });
-      setOverlayVisible(true, error.message);
-    }
-  });
-
-  document.getElementById("load-direct").addEventListener("click", async () => {
-    try {
-      await handleDirectLoad();
-    } catch (error) {
-      updateStatus({ viewer: "error" });
-      setOverlayVisible(true, error.message);
-    }
-  });
-
-  document.getElementById("check-api").addEventListener("click", async () => {
-    try {
-      setStepResult("step1", "running", "Step 1 running", "Checking runtime and environment...");
-      await handleApiHealthCheck();
-    } catch (error) {
-      const info = formatApiError(error, "WGSC-STEP1-RUNTIME-FAIL");
-      setStepResult("step1", "failed", `Step 1 failed (${info.code})`, info.message);
-      updateStatus({ viewer: "api-error" });
-      setOverlayVisible(true, error.message);
-    }
-  });
-
-  document.getElementById("check-remote-ssh").addEventListener("click", async () => {
-    try {
-      setStepResult("step4", "running", "Step 4 running", "Checking SSH connectivity and remote paths...");
-      await handleRemoteSshCheck();
-    } catch (error) {
-      const info = formatApiError(error, "WGSC-STEP4-SSH-UNKNOWN-001");
-      invalidateRemoteSshCheck();
-      setStepResult("step4", "failed", `Step 4 failed (${info.code})`, info.message);
-      updateStatus({ viewer: "remote-error" });
-      setOverlayVisible(true, `${info.message}${info.nextAction ? `\nNext: ${info.nextAction}` : ""}`);
-      refreshWorkflowUI();
-    }
-  });
-
-  document.getElementById("export-package").addEventListener("click", async () => {
-    try {
-      await handleExportPackage();
-    } catch (error) {
-      updateStatus({ viewer: "export-error" });
-      setOverlayVisible(true, error.message);
-    }
-  });
-
-  document.getElementById("submit-algorithm-job").addEventListener("click", async () => {
-    try {
-      await handleSubmitAlgorithmJob();
-    } catch (error) {
-      updateStatus({ viewer: "job-error" });
-      setOverlayVisible(true, error.message);
-    }
-  });
-
-  document.getElementById("run-capture-pipeline").addEventListener("click", async () => {
-    try {
-      await handleRunCapturePipeline();
-    } catch (error) {
-      updateStatus({ viewer: "pipeline-error" });
-      setOverlayVisible(true, error.message);
-    }
-  });
-
-  document.getElementById("one-click-remote-train").addEventListener("click", async () => {
-    try {
-      await handleOneClickRemoteTrain();
-    } catch (error) {
-      const info = formatApiError(error, "WGSC-STEP5-RUN-001");
-      setStepResult("step5", "failed", `Step 5 failed (${info.code})`, info.message);
-      updateStatus({ viewer: "remote-error" });
-      setOverlayVisible(true, error.message);
-    }
-  });
-
-  document.getElementById("start-camera").addEventListener("click", async () => {
-    try {
-      await startCamera();
-      updateStatus({ viewer: "camera-ready" });
-    } catch (error) {
-      updateStatus({ viewer: "camera-error" });
-      setOverlayVisible(true, error.message);
-    }
-  });
-
-  document.getElementById("stop-camera").addEventListener("click", () => {
-    stopCamera();
-    updateStatus({ viewer: "camera-stopped" });
-  });
-
-  document.getElementById("send-frame").addEventListener("click", async () => {
-    try {
-      setStepResult("step3", "running", "Step 3 running", "Uploading selected image(s)...");
-      await sendCurrentFrame();
-    } catch (error) {
-      const info = formatApiError(error, "WGSC-STEP3-FRAME-001");
-      setStepResult("step3", "failed", `Step 3 failed (${info.code})`, info.message);
-      updateStatus({ viewer: "stream-error" });
-      setOverlayVisible(true, error.message);
-    }
-  });
-
-  document.getElementById("toggle-stream").addEventListener("click", async (event) => {
-    try {
-      if (streamTimer) {
-        window.clearInterval(streamTimer);
-        streamTimer = null;
-        event.target.textContent = "Start Stream";
-        updateStatus({ viewer: "stream-stopped" });
-        return;
-      }
-      if (getSelectedUploadFiles().length) {
-        throw new Error("Start Stream uses camera frames only. Clear selected photos first, or click Send Frame for batch upload.");
-      }
-      await startCamera();
-      const intervalMs = Number(document.getElementById("stream-interval-ms").value || 1000);
-      await sendCurrentFrame();
-      streamTimer = window.setInterval(() => {
-        sendCurrentFrame().catch(() => { });
-      }, intervalMs);
-      event.target.textContent = "Stop Stream";
-      updateStatus({ viewer: "stream-running" });
-    } catch (error) {
-      updateStatus({ viewer: "stream-error" });
-      setOverlayVisible(true, error.message);
-    }
-  });
-
-  document.getElementById("materialize-session").addEventListener("click", async () => {
-    try {
-      const result = await handleMaterializeSession();
-      applyMaterializedSession(result);
-    } catch (error) {
-      updateStatus({ viewer: "session-error" });
-      setOverlayVisible(true, error.message);
-    }
-  });
-
-  document.getElementById("use-session-workspace").addEventListener("click", async () => {
-    try {
-      if (!lastMaterializedSession) {
-        lastMaterializedSession = await handleMaterializeSession();
-      }
-      applyMaterializedSession(lastMaterializedSession);
-    } catch (error) {
-      updateStatus({ viewer: "session-error" });
-      setOverlayVisible(true, error.message);
-    }
-  });
-
-  document.getElementById("prepare-colmap-workspace").addEventListener("click", async () => {
-    try {
-      const result = await handlePrepareColmapWorkspace();
-      applyColmapWorkspace(result);
-    } catch (error) {
-      updateStatus({ viewer: "colmap-error" });
-      setOverlayVisible(true, error.message);
-    }
-  });
-
-  document.getElementById("use-colmap-workspace").addEventListener("click", async () => {
-    try {
-      if (!lastColmapWorkspace) {
-        lastColmapWorkspace = await handlePrepareColmapWorkspace();
-      }
-      applyColmapWorkspace(lastColmapWorkspace);
-    } catch (error) {
-      updateStatus({ viewer: "colmap-error" });
-      setOverlayVisible(true, error.message);
-    }
-  });
-
-  document.getElementById("refresh-jobs").addEventListener("click", async () => {
-    try {
-      await refreshJobs();
-    } catch (error) {
-      updateStatus({ viewer: "job-error" });
-      setOverlayVisible(true, error.message);
-    }
-  });
-
-  document.getElementById("log-job-id").addEventListener("change", async (event) => {
-    jobLogState.jobId = event.target.value;
-    jobLogState.page = 1;
-    try {
-      await loadJobLogs(1);
-    } catch (error) {
-      setJobLogMeta(`Failed to load logs: ${error.message}`);
-    }
-  });
-
-  document.getElementById("refresh-job-log").addEventListener("click", async () => {
-    try {
-      await loadJobLogs(jobLogState.page);
-    } catch (error) {
-      setJobLogMeta(`Failed to load logs: ${error.message}`);
-    }
-  });
-
-  document.getElementById("job-log-tail-lines").addEventListener("change", async (event) => {
-    const value = Number(event.target.value || 120);
-    jobLogState.tailLines = Number.isFinite(value) ? Math.max(20, Math.min(1200, value)) : 120;
-    try {
-      await loadJobLogs(jobLogState.page);
-    } catch (error) {
-      setJobLogMeta(`Failed to load logs: ${error.message}`);
-    }
-  });
-
-  document.getElementById("copy-job-log").addEventListener("click", async () => {
-    await copyCurrentJobLogTail();
-  });
-
-  const jobLogsLayout = document.querySelector(".job-logs-layout");
-  const jobLogsDivider = document.getElementById("job-logs-divider");
-  if (jobLogsDivider && jobLogsLayout) {
-    let dragging = false;
-    const updateFromPointer = (clientX) => {
-      const rect = jobLogsLayout.getBoundingClientRect();
-      if (!rect.width) return;
-      const fraction = Math.max(0.22, Math.min(0.78, (clientX - rect.left) / rect.width));
-      const ratio = fraction / Math.max(0.0001, 1 - fraction);
-      applyJobLogLayoutRatio(ratio);
-    };
-
-    jobLogsDivider.addEventListener("pointerdown", (event) => {
-      if (event.button !== 0) return;
-      dragging = true;
-      jobLogsDivider.setPointerCapture(event.pointerId);
-      document.body.classList.add("job-logs-resizing");
-      updateFromPointer(event.clientX);
-    });
-
-    jobLogsDivider.addEventListener("pointermove", (event) => {
-      if (!dragging) return;
-      updateFromPointer(event.clientX);
-    });
-
-    const finishDrag = () => {
-      if (!dragging) return;
-      dragging = false;
-      document.body.classList.remove("job-logs-resizing");
-    };
-
-    jobLogsDivider.addEventListener("pointerup", finishDrag);
-    jobLogsDivider.addEventListener("pointercancel", finishDrag);
-    window.addEventListener("pointerup", finishDrag);
+async function uploadImages() {
+  ensureCaptureId();
+  const input = document.getElementById("image-upload-input");
+  const files = Array.from(input?.files || []);
+  if (!state.datasetName) {
+    await askDatasetName();
   }
+  const frames = files.length
+    ? await Promise.all(files.map(async (file) => ({
+      imageData: await imageFileToDataUrl(file),
+      filename: file.name || `upload_${Date.now()}.png`,
+    })))
+    : [await captureCameraFrame()];
 
-  const fullscreenButton = document.getElementById("toggle-job-logs-fullscreen");
-  if (fullscreenButton) {
-    fullscreenButton.addEventListener("click", () => {
-      setJobLogsFullscreen(!document.body.classList.contains("job-logs-fullscreen"));
+  let lastResult = null;
+  for (let index = 0; index < frames.length; index += 1) {
+    const frame = frames[index];
+    lastResult = await streamFrame(state.apiBaseUrl, {
+      session_id: state.sessionId,
+      capture_id: state.captureId,
+      algorithm_family: "",
+      image_data: frame.imageData,
+      filename: frame.filename,
     });
+    if (lastResult.capture_id) state.captureId = lastResult.capture_id;
   }
+  state.uploadedCount += frames.length;
+  state.useExistingRemoteDataset = false;
+  state.lastPreview = null;
+  showToast(`Uploaded ${frames.length} image(s) to ${state.sessionId}/${state.captureId}`);
+}
 
-  document.getElementById("job-metrics-prev").addEventListener("click", async () => {
-    if (jobLogState.page <= 1) return;
-    try {
-      await loadJobLogs(jobLogState.page - 1);
-    } catch (error) {
-      setJobLogMeta(`Failed to load logs: ${error.message}`);
-    }
+function renderSelectedFiles(files) {
+  const grid = document.getElementById("upload-preview-grid");
+  if (!grid) return;
+  const safeFiles = Array.from(files || []);
+  if (!safeFiles.length) {
+    grid.innerHTML = `<p class="panel-copy">No images selected. Upload will use the current camera frame.</p>`;
+    return;
+  }
+  grid.innerHTML = safeFiles.slice(0, 12).map((file) => {
+    const url = URL.createObjectURL(file);
+    window.setTimeout(() => URL.revokeObjectURL(url), 20_000);
+    return `<img src="${url}" alt="${escapeHtml(file.name)}" title="${escapeHtml(file.name)}" />`;
+  }).join("");
+}
+
+async function materializeCurrentSession() {
+  if (!state.datasetName) await askDatasetName();
+  const data = await materializeSession(state.apiBaseUrl, {
+    session_id: state.sessionId,
+    capture_id: state.captureId,
+    dataset_name: datasetNameForPayload(),
+    title: datasetNameForPayload(),
   });
+  showToast(`Materialize completed: ${data.result?.dataset_root || "-"}`);
+}
 
-  document.getElementById("job-metrics-next").addEventListener("click", async () => {
-    if (jobLogState.page >= jobLogState.totalPages) return;
-    try {
-      await loadJobLogs(jobLogState.page + 1);
-    } catch (error) {
-      setJobLogMeta(`Failed to load logs: ${error.message}`);
-    }
+async function prepareCurrentColmap() {
+  if (!state.datasetName) await askDatasetName();
+  const data = await prepareColmapWorkspace(state.apiBaseUrl, {
+    session_id: state.sessionId,
+    capture_id: state.captureId,
+    dataset_name: datasetNameForPayload(),
+    algorithm_family: state.algorithmFamily,
   });
+  showToast(`COLMAP workspace ready: ${data.result?.workspace_root || "-"}`);
+}
 
-  ["download-job-log", "download-job-csv"].forEach((id) => {
-    document.getElementById(id).addEventListener("click", (event) => {
-      if (!jobLogState.jobId) {
-        event.preventDefault();
-      }
+function useDataset(datasetId) {
+  state.selectedRemoteDatasetId = datasetId || "";
+  state.useExistingRemoteDataset = Boolean(datasetId);
+  state.lastPreview = null;
+  persistState();
+  render();
+  afterRender();
+}
+
+function saveRemoteConfig() {
+  localStorage.setItem(REMOTE_KEY, JSON.stringify(state.remoteConfig));
+  showToast("Remote config saved in this browser.");
+}
+
+function restoreRemoteConfig() {
+  const saved = JSON.parse(localStorage.getItem(REMOTE_KEY) || "{}");
+  state.remoteConfig = { ...DEFAULT_REMOTE, ...saved };
+  invalidateRemoteState();
+  persistState();
+  render();
+  afterRender();
+  showToast("Restored the last remote config.");
+}
+
+async function checkRemote() {
+  if (!state.algorithmFamily) throw new Error("Select an algorithm first.");
+  const data = await remoteCheck(state.apiBaseUrl, {
+    remote: state.remoteConfig,
+    timeout_seconds: 20,
+    algorithm_family: state.algorithmFamily,
+    check_colmap_required: Boolean(state.autoColmap),
+  });
+  state.remoteReport = data.result;
+  state.sshChecked = true;
+  state.lastPreview = null;
+  showToast("SSH / remote paths / COLMAP precheck passed.");
+}
+
+async function previewCommand() {
+  validateDatasetReadiness();
+  if (!state.datasetName && !state.useExistingRemoteDataset) {
+    await askDatasetName();
+  }
+  const payload = buildRunPayload();
+  const data = await previewRemoteAlgorithm(state.apiBaseUrl, payload);
+  state.lastPreview = data.preview;
+  state.outputDir = data.preview?.local_output_dir || state.outputDir;
+  showToast("Command preview generated.");
+}
+
+function validateDatasetReadiness() {
+  if (!state.useExistingRemoteDataset && state.uploadedCount <= 0) {
+    throw new Error("Upload images from the Data or Realtime page before submitting remote training.");
+  }
+  if (state.useExistingRemoteDataset) {
+    const dataset = selectedDataset();
+    if (!state.selectedRemoteDatasetId && !state.remoteDatasetPath) {
+      throw new Error("Select an existing remote dataset or enter a custom remote data path first.");
+    }
+    if (dataset && !datasetHasColmap(dataset) && !state.autoColmap) {
+      throw new Error("This remote dataset lacks COLMAP sparse/undistorted data. Enable auto COLMAP or use a processed dataset.");
+    }
+  }
+}
+
+async function submitRemote() {
+  validateDatasetReadiness();
+  if (!state.sshChecked) throw new Error("Complete the SSH / remote environment precheck first.");
+  if (!state.lastPreview) await previewCommand();
+  const confirmed = await openConfirmModal(state.lastPreview);
+  if (!confirmed) return;
+
+  const pathConfirmation = {
+    ...state.lastPreview.path_confirmation,
+    confirmed: true,
+    confirmed_at: new Date().toISOString(),
+  };
+  const data = await runRemoteAlgorithm(state.apiBaseUrl, buildRunPayload({
+    output_dir: state.lastPreview.local_output_dir || outputDirForPayload(),
+    path_confirmation: pathConfirmation,
+  }));
+  if (data.job?.id) {
+    state.selectedJobId = data.job.id;
+    state.logCursor = 0;
+    state.logText = "";
+    await refreshJobs();
+    await loadLog(true);
+  }
+  showToast(`Remote job submitted: ${data.job?.id || "-"}`);
+}
+
+function selectJob(jobId) {
+  state.selectedJobId = jobId;
+  state.logCursor = 0;
+  state.logText = "";
+  persistState();
+  render();
+  afterRender();
+  loadLog(true).catch(() => {});
+}
+
+async function loadLog(reset = false) {
+  if (!state.selectedJobId) return;
+  if (reset) {
+    state.logCursor = 0;
+    state.logText = "";
+  }
+  const data = await fetchJobLogDelta(state.apiBaseUrl, state.selectedJobId, state.logCursor);
+  state.logCursor = Number(data.cursor || state.logCursor || 0);
+  if (data.log_text) {
+    state.logText = `${state.logText}${data.log_text}`.slice(-MAX_LOG_CHARS);
+  }
+  persistState();
+  const logNode = document.getElementById("log-tail");
+  if (logNode) {
+    logNode.textContent = state.logText || "Waiting for log output...";
+    logNode.scrollTop = logNode.scrollHeight;
+  }
+}
+
+async function cancelSelectedJob(jobId) {
+  const id = jobId || state.selectedJobId;
+  if (!id) return;
+  await cancelJob(state.apiBaseUrl, id);
+  await refreshJobs();
+  await loadLog(false);
+  showToast("Cancel requested. Logs and generated outputs will be retained.");
+}
+
+function openResult(jobId) {
+  if (!jobId) return;
+  state.selectedJobId = jobId;
+  state.activePage = "result";
+  persistState();
+  const url = new URL(window.location.href);
+  url.searchParams.set("page", "result");
+  url.searchParams.set("job", jobId);
+  window.history.pushState({}, "", url);
+  render();
+  afterRender();
+}
+
+function rerunJob(jobId) {
+  const job = getJob(jobId);
+  if (!job) return;
+  state.algorithmFamily = job.algorithm_family || state.algorithmFamily;
+  state.operation = job.requested_operation || "train";
+  state.sessionId = job.session_id || state.sessionId;
+  state.captureId = job.capture_id || state.captureId;
+  state.datasetName = job.dataset_name || state.datasetName;
+  state.useExistingRemoteDataset = Boolean(job.use_existing_remote_dataset);
+  state.selectedRemoteDatasetId = job.remote_dataset_id || "";
+  state.remoteDatasetPath = job.remote_dataset_path || "";
+  state.outputDir = "";
+  state.lastPreview = null;
+  setPage("algorithm");
+}
+
+async function loadQuickPly() {
+  if (!state.quickPlyPath) throw new Error("Enter a PLY file path.");
+  const data = await loadPlyFile(state.apiBaseUrl, {
+    ply_path: state.quickPlyPath,
+    representation: selectedAlgorithm()?.representation || "sh",
+  });
+  state.loadedPly = data;
+  if (!data.ok) throw new Error(data.error || "PLY load failed");
+  showToast("PLY loaded.");
+}
+
+function openDiscovered(outputDir) {
+  const item = discoveredResults.find((result) => result.output_dir === outputDir);
+  if (!item) return;
+  state.loadedPly = {
+    ok: true,
+    viewer_url: item.viewer_url,
+    point_cloud_url: item.point_cloud_url,
+    result_url: item.result_url,
+  };
+  state.activePage = "browser";
+  persistState();
+  render();
+  afterRender();
+}
+
+async function loadAnalysisRows() {
+  const job = getJob();
+  if (!job) throw new Error("Select a job.");
+  try {
+    const url = buildJobMetricsCsvUrl(state.apiBaseUrl, job.id);
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+    state.metricsRows = parseCsv(await response.text());
+  } catch {
+    const data = await fetchJobLogs(state.apiBaseUrl, job.id, { page: 1, pageSize: 200, tailLines: 80 });
+    state.metricsRows = data.metrics_page?.rows || [];
+  }
+  persistState();
+}
+
+function parseCsv(text) {
+  const lines = String(text || "").trim().split(/\r?\n/);
+  if (lines.length < 2) return [];
+  const headers = lines[0].split(",").map((item) => item.trim());
+  return lines.slice(1).map((line) => {
+    const cells = line.split(",");
+    return Object.fromEntries(headers.map((header, index) => [header, cells[index] || ""]));
+  });
+}
+
+function drawMetricsChart() {
+  const canvas = document.getElementById("metrics-chart");
+  if (!canvas) return;
+  const rect = canvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.max(640, Math.floor(rect.width * dpr));
+  canvas.height = Math.floor(260 * dpr);
+  const ctx = canvas.getContext("2d");
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, rect.width, 260);
+  ctx.fillStyle = "#030913";
+  ctx.fillRect(0, 0, rect.width, 260);
+  const rows = state.metricsRows.filter((row) => Number(row.psnr || row.loss || row.fps));
+  if (!rows.length) {
+    ctx.fillStyle = "#8ea4c5";
+    ctx.fillText("No drawable metrics yet", 24, 38);
+    return;
+  }
+  const series = [
+    { key: "psnr", color: "#2f7dff" },
+    { key: "loss", color: "#ff5570" },
+    { key: "fps", color: "#2be48f" },
+  ];
+  ctx.strokeStyle = "rgba(142,164,197,0.2)";
+  for (let y = 40; y < 230; y += 38) {
+    ctx.beginPath();
+    ctx.moveTo(42, y);
+    ctx.lineTo(rect.width - 20, y);
+    ctx.stroke();
+  }
+  series.forEach((serie, serieIndex) => {
+    const values = rows.map((row) => Number(row[serie.key])).filter((value) => Number.isFinite(value));
+    if (!values.length) return;
+    const min = Math.min(...values);
+    const max = Math.max(...values);
+    const span = max - min || 1;
+    ctx.strokeStyle = serie.color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    rows.forEach((row, index) => {
+      const value = Number(row[serie.key]);
+      if (!Number.isFinite(value)) return;
+      const x = 42 + (index / Math.max(1, rows.length - 1)) * (rect.width - 70);
+      const y = 220 - ((value - min) / span) * 170;
+      if (index === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
     });
+    ctx.stroke();
+    ctx.fillStyle = serie.color;
+    ctx.fillText(serie.key.toUpperCase(), 48 + serieIndex * 82, 24);
   });
+}
 
-  document.getElementById("job-list").addEventListener("click", async (event) => {
-    const trigger = event.target.closest("[data-log-job-id]");
-    if (!trigger) return;
-    const jobId = trigger.dataset.logJobId;
-    if (!jobId) return;
-    ensureJobLogsPanelVisible();
-    jobLogState.jobId = jobId;
-    jobLogState.page = 1;
-    const select = document.getElementById("log-job-id");
-    if (select) {
-      if (!Array.from(select.options).some((option) => option.value === jobId)) {
-        const linkedJob = findJobById(jobId);
-        const label = linkedJob
-          ? `${linkedJob.algorithm_family} · ${jobId.slice(0, 8)} · ${linkedJob.status}`
-          : `Job · ${jobId.slice(0, 8)}`;
-        const option = document.createElement("option");
-        option.value = jobId;
-        option.textContent = label;
-        select.appendChild(option);
-      }
-      select.value = jobId;
-    }
-    try {
-      await loadJobLogs(1);
-    } catch (error) {
-      setJobLogMeta(`Failed to load logs: ${error.message}`);
-    }
-  });
+function saveRemoteField(key, value) {
+  state.remoteConfig[key] = key === "port" ? Number(value || 22) : value;
+  invalidateRemoteState();
+  persistState();
+}
 
-  document.getElementById("validate-adapter").addEventListener("click", async () => {
-    try {
-      const family = document.getElementById("algorithm-family").value;
-      setStepResult("step2", "running", "Step 2 running", `Validating adapter ${family}...`);
-      const result = await validateAdapter(getApiBaseUrl(), family);
-      serverValidation.set(family, result.validation);
-      syncAdapterDetail();
-      updateStatus({ viewer: "adapter-validated" });
-
-      const ready = isAdapterValidationReady(result.validation);
-      workflowState.adapterReady = ready;
-      invalidateRemoteSshCheck();
-      if (!ready) {
-        setStepResult("step2", "failed", "Step 2 failed", "Adapter has no enabled operations.");
-        workflowState.frameReady = false;
-        workflowState.sessionReady = false;
-        workflowState.jobStarted = false;
-      } else {
-        setStepResult("step2", "success", "Step 2 passed", "Adapter capability is valid.");
-      }
-      refreshWorkflowUI();
-    } catch (error) {
-      const info = formatApiError(error, "WGSC-STEP2-ADAPTER-001");
-      setStepResult("step2", "failed", `Step 2 failed (${info.code})`, info.message);
-      updateStatus({ viewer: "adapter-error" });
-      setOverlayVisible(true, error.message);
-    }
-  });
-
-  document.getElementById("save-adapter").addEventListener("click", async () => {
-    try {
-      const family = document.getElementById("algorithm-family").value;
-      setStepResult("step2", "running", "Step 2 running", `Saving adapter ${family}...`);
-      const result = await updateAdapter(getApiBaseUrl(), {
-        family,
-        repo_path: document.getElementById("server-repo-path").value.trim(),
-        default_cwd: document.getElementById("server-default-cwd").value.trim(),
-      });
-      await handleApiHealthCheck();
-      serverValidation.set(family, result.validation);
-      syncAdapterDetail();
-      updateStatus({ viewer: "adapter-saved" });
-
-      const ready = isAdapterValidationReady(result.validation);
-      workflowState.adapterReady = ready;
-      invalidateRemoteSshCheck();
-      if (!ready) {
-        setStepResult("step2", "failed", "Step 2 failed", "Adapter save succeeded but capability is not ready.");
-        workflowState.frameReady = false;
-        workflowState.sessionReady = false;
-        workflowState.jobStarted = false;
-      } else {
-        setStepResult("step2", "success", "Step 2 passed", "Adapter saved and validated.");
-      }
-      refreshWorkflowUI();
-    } catch (error) {
-      const info = formatApiError(error, "WGSC-STEP2-ADAPTER-SAVE-001");
-      setStepResult("step2", "failed", `Step 2 failed (${info.code})`, info.message);
-      updateStatus({ viewer: "adapter-error" });
-      setOverlayVisible(true, error.message);
-    }
-  });
-
-  document.getElementById("recent-scenes").addEventListener("click", async (event) => {
-    const item = event.target.closest("[data-scene-index]");
-    if (!item) return;
-    const scenes = loadRecentScenes().slice().reverse();
-    const scene = scenes[Number(item.dataset.sceneIndex)];
-    if (!scene) return;
-    try {
-      if (scene.manifestUrl) {
-        await handleManifestLoad(scene.manifestUrl);
-      } else if (scene.source?.url) {
-        document.getElementById("source-url").value = scene.source.url;
-        document.getElementById("representation").value = scene.representation ?? "sh";
-        document.getElementById("algorithm-family").value = scene.algorithm?.family ?? "vanilla-3dgs";
-        await handleDirectLoad();
-      }
-    } catch (error) {
-      updateStatus({ viewer: "recent-scene-error" });
-      setOverlayVisible(true, error.message);
-    }
-  });
-
-  window.addEventListener("message", (event) => {
-    if (!event.data || event.data.type !== "gaussian-viewer-stats") return;
-    updateStatus({
-      fps: event.data.fps ?? "-",
-      vertices: event.data.vertices ?? "-",
-      progress: event.data.progress ?? "-",
-      viewer: event.data.status ?? "running",
+function openInputModal({ title, description, defaultValue, placeholder }) {
+  const layer = document.getElementById("modal-layer");
+  layer.hidden = false;
+  layer.innerHTML = `
+    <div class="modal">
+      <div class="panel-head"><h2>${escapeHtml(title)}</h2></div>
+      <div class="modal-body grid">
+        <p class="panel-copy">${escapeHtml(description)}</p>
+        <label>Name
+          <input id="modal-input" value="${escapeHtml(defaultValue)}" placeholder="${escapeHtml(placeholder)}" />
+        </label>
+      </div>
+      <div class="modal-footer">
+        <button data-modal-cancel type="button">Cancel</button>
+        <button class="primary" data-modal-ok type="button">Confirm</button>
+      </div>
+    </div>
+  `;
+  return new Promise((resolve) => {
+    const input = document.getElementById("modal-input");
+    input.focus();
+    layer.querySelector("[data-modal-cancel]").addEventListener("click", () => {
+      layer.hidden = true;
+      resolve("");
+    });
+    layer.querySelector("[data-modal-ok]").addEventListener("click", () => {
+      const value = input.value.trim();
+      layer.hidden = true;
+      resolve(value);
     });
   });
 }
 
-function bootstrapDefaults() {
-  flowManualState = loadFlowManualState();
-  applyJobLogLayoutRatio(loadJobLogLeftRatio());
-  setJobLogsFullscreen(false);
-  applyTrainingDefaults();
-
-  document.getElementById("manifest-url").value = "./scenes/megs2-sg.scene.json";
-  document.getElementById("source-url").value = "";
-  document.getElementById("viewer-backend").value = "webgl2";
-  document.getElementById("preprocess-parser").value = "colmap";
-  document.getElementById("preprocess-downsample").value = "1";
-  document.getElementById("preprocess-mask-path").value = "";
-  document.getElementById("preprocess-reorient").checked = true;
-  document.getElementById("preprocess-image-uint8").checked = false;
-  document.getElementById("preprocess-async-caching").checked = false;
-  document.getElementById("edit-translation").value = "0,0,0";
-  document.getElementById("edit-rotation").value = "0,0,0";
-  document.getElementById("edit-scale").value = "1,1,1";
-  document.getElementById("edit-background").value = "black";
-  document.getElementById("api-base-url").value = window.location.origin;
-  document.getElementById("server-input-path").value = "";
-  document.getElementById("server-output-dir").value = "";
-  document.getElementById("server-scene-id").value = "";
-  document.getElementById("server-repo-path").value = "";
-  document.getElementById("server-default-cwd").value = "";
-  document.getElementById("remote-host").value = "";
-  document.getElementById("remote-port").value = "22";
-  document.getElementById("remote-username").value = "";
-  document.getElementById("remote-password").value = "";
-  document.getElementById("remote-repo-path").value = "";
-  document.getElementById("remote-workspace-root").value = "/tmp/web_scan/workspaces";
-  document.getElementById("remote-output-root").value = "/tmp/web_scan/outputs";
-  document.getElementById("remote-python").value = "python3";
-  document.getElementById("remote-activate-cmd").value = "";
-  document.getElementById("stream-session-id").value = "session-demo";
-  const uploadInput = getUploadInputNode();
-  if (uploadInput) {
-    uploadInput.value = "";
-  }
-  document.getElementById("capture-batch-id").value = "";
-  document.getElementById("dataset-name").value = "";
-  document.getElementById("use-existing-remote-dataset").checked = false;
-  document.getElementById("auto-colmap").checked = true;
-  document.getElementById("remote-dataset-path").value = "";
-  document.getElementById("stream-interval-ms").value = "1000";
-  document.getElementById("server-extra-args").value = JSON.stringify(
-    {
-      checkpoint_path: "",
-      workspace: "",
-      cwd: "",
-    },
-    null,
-    2,
-  );
-  renderJobs([]);
-  renderRecentScenes(loadRecentScenes());
-  renderAdapterDetail(null, null);
-  renderJobMetricsRows([]);
-  renderJobLogTail([]);
-  setJobLogMeta("No job selected.");
-  updateJobMetricsPager(1, 1, 0);
-  setJobLogDownloadLinks("");
-  populateRemoteDatasetSelector([]);
-  ensureCaptureBatchId(true);
-  refreshRemoteDatasetSummary();
-  renderUploadSelectionSummary();
-  lastJobsSnapshot = [];
-  jobLogState.jobId = "";
-  jobLogState.page = 1;
-  jobLogState.totalPages = 1;
-  jobLogState.tailLines = 120;
-  document.getElementById("job-log-tail-lines").value = "120";
-
-  workflowState.apiChecked = false;
-  workflowState.adapterReady = false;
-  workflowState.frameReady = false;
-  workflowState.sessionReady = false;
-  workflowState.remoteConfigReady = false;
-  workflowState.sshChecked = false;
-  workflowState.jobStarted = false;
-  setStepResult("step1", "idle", "Step 1 pending", "Check runtime.");
-  setStepResult("step2", "idle", "Step 2 pending", "Validate adapter capability.");
-  setStepResult("step3", "idle", "Step 3 pending", "Choose upload or an existing remote dataset.");
-  setStepResult("step4", "idle", "Step 4 pending", "Fill remote config and run Check SSH.");
-  setStepResult("step5", "idle", "Step 5 pending", "Start remote job.");
-  refreshWorkflowUI();
+function openConfirmModal(preview) {
+  const layer = document.getElementById("modal-layer");
+  layer.hidden = false;
+  layer.innerHTML = `
+    <div class="modal">
+      <div class="panel-head"><h2>Pre-submit Review</h2><span class="badge warn">Path and command review</span></div>
+      <div class="modal-body grid">
+        <p>Review the paths and remote command below. Confirming will submit the remote training job.</p>
+        <div class="command-box grid">
+          <p class="panel-copy">Dataset: ${escapeHtml(preview.dataset_name || datasetNameForPayload())}</p>
+          <p class="panel-copy">Operation: ${escapeHtml(preview.algorithm_family)} / ${escapeHtml(preview.operation)}</p>
+          <p class="panel-copy">Local Output: ${escapeHtml(preview.local_output_dir)}</p>
+          <p class="panel-copy">Remote Workspace: ${escapeHtml(preview.remote_workspace)}</p>
+          <p class="panel-copy">Remote Output: ${escapeHtml(preview.remote_output_dir)}</p>
+          <pre>${escapeHtml(preview.shell_command || preview.remote_command || "")}</pre>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button data-modal-cancel type="button">Cancel</button>
+        <button class="primary" data-modal-ok type="button">Confirm and Submit</button>
+      </div>
+    </div>
+  `;
+  return new Promise((resolve) => {
+    layer.querySelector("[data-modal-cancel]").addEventListener("click", () => {
+      layer.hidden = true;
+      resolve(false);
+    });
+    layer.querySelector("[data-modal-ok]").addEventListener("click", () => {
+      layer.hidden = true;
+      resolve(true);
+    });
+  });
 }
 
-bindStaticOptions();
-renderMethodRegistry();
-setSchemaPreview();
-bindEvents();
-bootstrapDefaults();
-setOverlayVisible(true, "Waiting for scene to load");
-bootstrapFromQuery().catch((error) => {
-  updateStatus({ viewer: "query-error" });
-  setOverlayVisible(true, error.message);
-});
-setOverlayVisible(true, "Waiting for scene");
-;
+async function poll() {
+  try {
+    await refreshJobs();
+    if (state.selectedJobId) {
+      await loadLog(false);
+    }
+    const editing = document.activeElement?.matches?.("input, textarea, select");
+    if (!editing && ["overview", "algorithm", "result", "analysis"].includes(state.activePage)) {
+      render();
+      afterRender();
+    }
+  } catch {
+    // Keep the UI usable when the backend is temporarily offline.
+  }
+}
+
+async function bootstrap() {
+  bindStaticEvents();
+  render();
+  afterRender();
+  await refreshAll();
+  render();
+  afterRender();
+  window.setInterval(poll, 5000);
+}
+
+bootstrap().catch((error) => setError(error, "Workbench startup failed"));

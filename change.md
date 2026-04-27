@@ -1,5 +1,227 @@
 # Web Scan 调试与修复记录（中文）
 
+## 2026-04-27 结果浏览与项目成果加载手册补充
+
+本次项目修改主要围绕“训练结果如何快速打开、发现、回看”展开，同时补充了 COLMAP 匹配策略和界面可读性调整。涉及文件包括：
+
+- `web/server/api_server.py`
+- `web/server/remote_executor.py`
+- `web/src/api/server-client.js`
+- `web/src/core/app.js`
+- `web/index.html`
+- `web/app.html`
+- `web/styles.css`
+- `web/tools/test_result_loader.py`
+
+### 1. 页面入口与命名调整
+
+- 页面标题与品牌从 `WebGSC` 统一为 `Web-GSC`。
+- 顶部品牌标识从 `WG` 调整为 `GSC`。
+- 导航文案调整：
+   - `Data` 改为 `Off Line`
+   - `Realtime` 改为 `On Line`
+- 左侧栏移除重复的项目介绍与算法选择卡片，保留当前数据状态、任务状态和快速操作信息，减少训练/浏览页面的干扰。
+- Algorithm 页面中的 `Algorithm Family` 文案简化为 `Algorithm`。
+
+### 2. Browser 页面新的操作方式
+
+Browser 页面从“只能加载单个 PLY”升级为“打开结果文件夹或单个结果文件”。
+
+操作步骤：
+
+1. 打开 Web-GSC 页面后进入 `Browser`。
+2. 在 `Result Folder / File Path` 中输入以下任意一种路径：
+   - 单个 `.ply` 模型文件；
+   - 单个图片文件，例如 `.png`、`.jpg`、`.jpeg`、`.bmp`、`.gif`、`.webp`、`.tif`、`.tiff`；
+   - 单个 `scene_manifest.json`；
+   - 某次训练输出目录或项目结果目录。
+3. 点击 `Open Result`。
+4. 页面会自动判断结果类型：
+   - PLY / manifest 会打开 3D viewer；
+   - 图片结果会直接显示图片；
+   - 无法识别时显示明确失败原因。
+
+兼容说明：
+
+- 旧按钮动作 `load-ply` 仍被前端兼容，但新页面按钮已改为 `Open Result`。
+- `Open Current Job Result` 会继续打开当前 job 的输出结果。
+- `Discover Results` 会扫描本地生成目录和已知项目目录，结果卡片会显示算法族、结果类型和实际解析到的资源路径。
+
+### 3. 后端新增结果加载接口
+
+新增接口：
+
+```http
+POST /api/load-result
+Content-Type: application/json
+
+{
+  "path": "/abs/path/to/project-output-or-model.ply",
+  "family": "hac-plus-plus",
+  "representation": "sh"
+}
+```
+
+字段说明：
+
+- `path`：必填。可以是文件或目录。
+- `family`：可选。用于指定算法族；不传时后端会尝试从路径或项目根目录推断。
+- `representation`：可选。用于覆盖 viewer 表示方式；未传时按算法族默认选择。
+
+成功返回的常见字段：
+
+- `type`：`ply`、`manifest` 或 `image`
+- `family`：推断出的算法族
+- `representation`：`sh` 或 `sg`
+- `point_cloud_url`：PLY 可访问地址
+- `manifest_url`：manifest 可访问地址
+- `result_url`：图片可访问地址
+- `viewer_url`：3D viewer 地址
+- `resolved_path`：最终解析到的本地文件路径
+- `file_size`：文件大小
+
+失败返回的常见字段：
+
+- `ok: false`
+- `reason` / `error`
+- `path`
+- `resolved_path`
+
+### 4. 结果识别优先级
+
+后端新增通用结果识别逻辑 `load_result_path()`，用于统一 Browser、job artifact 和结果发现能力。
+
+目录识别顺序：
+
+1. 优先寻找 PLY：
+   - 当前目录下的 `point_cloud.ply`
+   - 当前目录下的 `latest.ply`
+   - 当前目录下的 `scene.ply`
+   - `point_cloud/iteration_<N>/` 下最新迭代的 PLY
+2. 再寻找 `scene_manifest.json`。
+3. 最后寻找渲染图片。
+
+算法族特殊规则：
+
+- `reduced-3dgs`：
+   - PLY 优先级为 `point_cloud_quantised_half.ply`、`point_cloud_quantised.ply`、`point_cloud.ply`、`latest.ply`、`scene.ply`。
+   - 图片回退路径会扫描 `test/*/renders/*` 与 `train/*/renders/*`。
+- `compgs`：
+   - 图片回退路径会扫描 `eval/rendered/*` 与 `eval_training/rendered/*`。
+- 其他常规 3DGS 项目：
+   - 图片回退路径会扫描 `test/ours_*/renders/*` 与 `train/ours_*/renders/*`。
+- `fcgs`：
+   - 如果目录看起来只有 bitstream（例如存在 `0.0001/` 这类压缩结果目录），但没有解码后的 PLY，会提示先解码为 `point_cloud.ply`、`latest.ply` 或 `scene.ply`。
+
+### 5. 支持扫描的本地项目目录
+
+`Discover Results` 除了原有生成目录外，还会扫描以下项目目录（存在时才扫描）：
+
+- `CompGS-main` -> `compgs`
+- `ContextGS-main` -> `contextgs`
+- `FCGS-main` -> `fcgs`
+- `HAC-plus-main` -> `hac-plus-plus`
+- `MEGS-2-main` -> `megs2`
+- `Scaffold-GS-main` -> `scaffold-gs`
+- `reduced-3dgs-main` -> `reduced-3dgs`
+
+原有生成目录仍会扫描：
+
+- `web/generated/runs`
+- `web/generated/streams`
+- `web/generated/datasets`
+
+扫描时会跳过以下目录，避免遍历过慢或误扫依赖：
+
+- `.git`
+- `__pycache__`
+- `assets`
+- `docs`
+- `node_modules`
+- `submodules`
+- `SIBR_viewers`
+- 其他以 `.` 开头的隐藏目录
+
+### 6. 外部文件缓存规则
+
+如果加载的结果文件位于项目根目录外，后端会把文件复制到：
+
+- `web/generated/result_cache/ply`
+- `web/generated/result_cache/images`
+- `web/generated/result_cache/manifests`
+
+缓存文件名会根据原始路径、修改时间和文件大小生成稳定哈希，避免同名文件互相覆盖。项目内文件则直接返回相对 URL，不额外复制。
+
+### 7. COLMAP 匹配策略调整
+
+本地与远程 COLMAP 预处理都从：
+
+```bash
+colmap exhaustive_matcher
+```
+
+调整为：
+
+```bash
+colmap sequential_matcher
+```
+
+影响位置：
+
+- 本地 `prepare_colmap_workspace()`：`web/server/api_server.py`
+- 远程 `_build_remote_colmap_script()`：`web/server/remote_executor.py`
+
+操作含义：
+
+- 更适合连续拍摄、视频抽帧、顺序采集的数据。
+- 大批量图像时通常比 exhaustive matching 更轻，避免全量两两匹配带来的时间和资源压力。
+- 如果数据不是连续采集，而是无序图片集，后续可再按项目需要切回 exhaustive 或增加配置项。
+
+### 8. 前端 API 客户端调整
+
+`web/src/api/server-client.js` 新增：
+
+```js
+loadResultPath(apiBaseUrl, payload)
+```
+
+前端 `Browser` 页面现在调用 `/api/load-result`，不再只调用 `/api/load-ply`。旧的 PLY 加载后端接口仍保留，且内部复用新的 PLY payload 逻辑。
+
+### 9. 样式与可读性调整
+
+`web/styles.css` 做了以下界面补充：
+
+- 全局字号提升到 `17px`，正文行高提升到 `1.55`。
+- 按钮、输入框、label 字号和内边距略增大。
+- 品牌块宽度和标题字号调整，适配 `GSC` 文案。
+- 左侧栏宽度略收窄，避免主内容区被挤压。
+- 新增 `.rail-facts` 两列布局，用于展示 session、capture、dataset、active jobs 等当前数据摘要。
+- 小屏下 `.rail-facts` 自动回落为单列。
+
+### 10. 验证脚本
+
+新增结果加载回归脚本：
+
+```bash
+python3 web/tools/test_result_loader.py
+```
+
+脚本覆盖：
+
+- PLY 优先于图片；
+- 图片 fallback；
+- `reduced-3dgs` 优先选择 `point_cloud_quantised_half.ply`；
+- `compgs` 图片回退路径；
+- `fcgs` bitstream 提示；
+- 空目录失败提示；
+- `discover_runtime_results()` 可发现生成目录中的结果。
+
+运行通过时输出：
+
+```text
+result loader tests passed
+```
+
 ## 2026-04-20 远程训练自动化升级（批次隔离 + 历史复用）
 
 - 后端远程能力（`web/server/remote_executor.py`）

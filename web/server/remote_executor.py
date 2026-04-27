@@ -700,7 +700,7 @@ def _build_remote_colmap_script(workspace_dir: str) -> str:
       f"--image_path {_quote(input_dir)} "
       "--ImageReader.single_camera 1 --ImageReader.camera_model SIMPLE_PINHOLE"
     ),
-    f"colmap_headless colmap exhaustive_matcher --database_path {_quote(database_path)}",
+    f"colmap_headless colmap sequential_matcher --database_path {_quote(database_path)}",
     (
       f"colmap_headless colmap mapper "
       f"--database_path {_quote(database_path)} "

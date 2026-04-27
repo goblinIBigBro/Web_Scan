@@ -10,7 +10,7 @@ import {
   fetchJobLogDelta,
   fetchJobLogs,
   fetchJobs,
-  loadPlyFile,
+  loadResultPath,
   materializeSession,
   prepareColmapWorkspace,
   previewRemoteAlgorithm,
@@ -30,8 +30,8 @@ const MODEL_EXTENSIONS = new Set([".ply"]);
 
 const NAV_ITEMS = [
   { id: "overview", label: "Overview" },
-  { id: "data", label: "Data" },
-  { id: "realtime", label: "Realtime" },
+  { id: "data", label: "Off Line" },
+  { id: "realtime", label: "On Line" },
   { id: "algorithm", label: "Algorithms" },
   { id: "browser", label: "Browser" },
   { id: "analysis", label: "Analysis" },
@@ -42,6 +42,8 @@ const PAGE_ALIASES = {
   monitor: "algorithm",
   debug: "data",
   viewer: "browser",
+  "Remote Data": "data",
+  "Local Upload": "realtime",
 };
 
 const DEFAULT_REMOTE = {
@@ -214,10 +216,14 @@ function classifyAssetUrl(url) {
 }
 
 function getRenderablePlyAsset(asset = {}) {
-  const sourceUrl = asset.point_cloud_url || asset.ply_url || asset.ply_path || "";
-  if (classifyAssetUrl(sourceUrl) !== "ply") return null;
+  const sourceUrl = asset.point_cloud_url || asset.ply_url || asset.ply_path || asset.manifest_url || "";
+  const isModelAsset = classifyAssetUrl(sourceUrl) === "ply"
+    || (asset.manifest_url && asset.viewer_url)
+    || asset.type === "ply"
+    || asset.type === "manifest";
+  if (!isModelAsset) return null;
   return {
-    type: "ply",
+    type: asset.type === "manifest" ? "manifest" : "ply",
     sourceUrl,
     viewerUrl: asset.viewer_url || "",
   };
@@ -241,7 +247,9 @@ function classifyResultAsset(asset = {}) {
 }
 
 function resultTypeLabel(asset = {}) {
-  if (getRenderablePlyAsset(asset)) return "PLY 3D Model";
+  const plyAsset = getRenderablePlyAsset(asset);
+  if (plyAsset?.type === "manifest") return "Scene Manifest";
+  if (plyAsset) return "PLY 3D Model";
   if (getRenderableImageAsset(asset)) return "Image";
   return "Unknown";
 }
@@ -424,9 +432,9 @@ function renderTopbar() {
   return `
     <header class="topbar">
       <div class="brand-mark">
-        <div class="brand-cube">WG</div>
+        <div class="brand-cube">GSC</div>
         <div>
-          <h1 class="brand-title">WebGSC</h1>
+          <h1 class="brand-title">Web-GSC</h1>
           <p class="brand-subtitle">Remote training and 3D results workbench</p>
         </div>
       </div>
@@ -444,44 +452,14 @@ function renderTopbar() {
 }
 
 function renderLeftRail() {
-  const adapter = selectedAlgorithm();
-  const showAlgorithmPicker = state.activePage === "algorithm";
   const activeJobs = jobs.filter((job) => ["queued", "running"].includes(String(job.status || "").toLowerCase()));
   return `
-    <section class="panel pad">
-      <p class="eyebrow">Project</p>
-      <h2>Campus Reconstruction Demo</h2>
-      <p class="panel-copy">Remote training first. Local mode is reserved for PLY viewing and data handoff.</p>
-      <div class="metric-grid" style="grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 14px;">
-        <div class="metric"><span class="muted">Algorithms</span><strong>${algorithms.length || "-"}</strong></div>
-        <div class="metric"><span class="muted">Jobs</span><strong>${jobs.length || "-"}</strong></div>
-      </div>
-    </section>
-    <section class="panel">
-      <div class="panel-head">
-        <h3>Algorithm Family</h3>
-        <span class="badge">${escapeHtml(adapter?.label || "Not selected")}</span>
-      </div>
-      ${showAlgorithmPicker ? `<div class="algorithm-list card">
-        ${algorithms.length ? algorithms.slice(0, 10).map((item) => `
-          <article class="selectable-card ${item.family === state.algorithmFamily ? "active" : ""}">
-            <strong>${escapeHtml(item.label || item.family)}</strong>
-            <p class="panel-copy">${escapeHtml(item.category || "-")} · ${escapeHtml(item.representation || "-")}</p>
-            <button data-action="select-algorithm" data-family="${escapeHtml(item.family)}" type="button">Select</button>
-          </article>
-        `).join("") : `<p class="panel-copy">Waiting for /api/algorithms.</p>`}
-      </div>` : `<div class="card grid">
-        <p class="panel-copy">Current: ${escapeHtml(adapter?.label || adapter?.family || "Not selected")}</p>
-        <p class="panel-copy">Open the Algorithms page when you want to expand the full selector.</p>
-        <button data-page="algorithm" type="button">Choose Algorithm</button>
-      </div>`}
-    </section>
     <section class="panel">
       <div class="panel-head">
         <h3>Current Data</h3>
         <span class="badge ${state.useExistingRemoteDataset ? "ok" : "warn"}">${state.useExistingRemoteDataset ? "Remote reuse" : "New upload"}</span>
       </div>
-      <div class="card grid">
+      <div class="card rail-facts">
         <p class="panel-copy">Session: ${escapeHtml(state.sessionId || "-")}</p>
         <p class="panel-copy">Capture: ${escapeHtml(state.captureId || "-")}</p>
         <p class="panel-copy">Dataset: ${escapeHtml(datasetNameForPayload())}</p>
@@ -601,7 +579,6 @@ function renderOverviewPage() {
     <section class="panel hero">
       <p class="eyebrow">Remote-first Gaussian Workflow</p>
       <h1>The web training page is now a progressive 3D training workbench</h1>
-      <p>Move from capture, remote precheck, command confirmation, job monitoring, and PLY/image results through a clear dependency-driven flow without exposing every field at once.</p>
       <div class="action-row">
         <button class="primary" data-page="data" type="button">Prepare Data</button>
         <button data-page="algorithm" type="button">Open Training</button>
@@ -851,7 +828,7 @@ function renderAlgorithmPage() {
         <div class="split">
           <div class="grid">
             <div class="form-grid">
-              <label>Algorithm Family
+              <label>Algorithm
                 <select data-bind="algorithmFamily">
                   ${algorithms.map((item) => `<option value="${escapeHtml(item.family)}" ${state.algorithmFamily === item.family ? "selected" : ""}>${escapeHtml(item.label || item.family)}</option>`).join("")}
                 </select>
@@ -1060,18 +1037,18 @@ function renderBrowserPage() {
       <div class="panel-head">
         <div>
           <h2>PLY / Image Result Browser</h2>
-          <p class="panel-copy">Local training is removed. Local mode only keeps PLY viewing and result fallback browsing.</p>
+          <p class="panel-copy">Open a project result folder or a single PLY/image file. PLY is used first, then image fallback.</p>
         </div>
         <button data-action="discover-results" type="button">Discover Results</button>
       </div>
       <div class="card grid">
         <div class="form-grid">
-          <label class="wide">PLY Path
-            <input data-bind="quickPlyPath" value="${escapeHtml(state.quickPlyPath)}" placeholder="/abs/path/to/model.ply" />
+          <label class="wide">Result Folder / File Path
+            <input data-bind="quickPlyPath" value="${escapeHtml(state.quickPlyPath)}" placeholder="/abs/path/to/project-output-or-model.ply" />
           </label>
         </div>
         <div class="button-row">
-          <button class="primary" data-action="load-ply" type="button">Load PLY</button>
+          <button class="primary" data-action="load-result" type="button">Open Result</button>
           <button data-action="open-selected-result" type="button" ${state.selectedJobId ? "" : "disabled"}>Open Current Job Result</button>
         </div>
         ${renderResultSurface(state.loadedPly, { tall: true })}
@@ -1088,11 +1065,11 @@ function renderBrowserPage() {
                 <strong>${escapeHtml(summarize(item.output_dir, 84))}</strong>
                 <span class="badge ${asset.type ? "ok" : "warn"}">${escapeHtml(resultTypeLabel(item))}</span>
               </div>
-              <p class="panel-copy">${escapeHtml(asset.sourceUrl || "-")}</p>
+              <p class="panel-copy">${escapeHtml(item.family ? `${item.family} · ${asset.sourceUrl || item.resolved_path || "-"}` : asset.sourceUrl || item.resolved_path || "-")}</p>
               <button data-action="open-discovered-result" data-output-dir="${escapeHtml(item.output_dir)}" type="button">Open</button>
             </article>
           `;
-        }).join("") : `<p class="panel-copy">Click Discover Results to scan generated/runs, streams, and datasets.</p>`}
+        }).join("") : `<p class="panel-copy">Click Discover Results to scan generated outputs and local project result folders.</p>`}
       </div>
     </section>
   `;
@@ -1101,7 +1078,7 @@ function renderBrowserPage() {
 function renderResultSurface(asset, options = {}) {
   const classified = classifyResultAsset(asset || {});
   const frameClass = `viewer-frame${options.tall === false ? "" : " tall"}`;
-  if (classified.type === "ply") {
+  if (classified.type === "ply" || classified.type === "manifest") {
     if (!classified.viewerUrl) {
       return `
         <div class="${frameClass} result-placeholder">
@@ -1116,7 +1093,7 @@ function renderResultSurface(asset, options = {}) {
     return `
       <section class="result-surface">
         <div class="result-toolbar">
-          <span class="badge ok">PLY 3D Model</span>
+          <span class="badge ok">${classified.type === "manifest" ? "Scene Manifest" : "PLY 3D Model"}</span>
           <span class="panel-copy">Use the 3D viewer controls to rotate and zoom.</span>
         </div>
         <iframe class="${frameClass}" src="${escapeHtml(classified.viewerUrl)}" title="PLY 3D model viewer"></iframe>
@@ -1227,7 +1204,7 @@ function renderResultPage() {
         </div>
       </div>
       <div class="card grid">
-        ${job ? renderResultSurface(surfaceAsset, { tall: true }) : `<p class="panel-copy">No renderable job yet. Finish training first or load a PLY from the Browser page.</p>`}
+        ${job ? renderResultSurface(surfaceAsset, { tall: true }) : `<p class="panel-copy">No renderable job yet. Finish training first or open a result from the Browser page.</p>`}
         ${job && !plyAsset && !imageAsset ? `<div class="error-box"><p>No supported result file was found. Supported model files use .ply, while image results use .png, .jpg, .jpeg, .bmp, .gif, .webp, .tif, or .tiff.</p></div>` : ""}
       </div>
     </section>
@@ -1284,7 +1261,8 @@ async function handleClick(event) {
   if (action === "open-result") openResult(jobId);
   if (action === "open-selected-result") openResult(state.selectedJobId);
   if (action === "rerun-job") rerunJob(jobId);
-  if (action === "load-ply") await guarded(loadQuickPly, "Failed to load PLY");
+  if (action === "load-result") await guarded(loadQuickResult, "Failed to open result");
+  if (action === "load-ply") await guarded(loadQuickResult, "Failed to open result");
   if (action === "discover-results") await guarded(discoverResults, "Failed to discover results");
   if (action === "open-discovered-result") openDiscovered(actionNode.dataset.outputDir);
   if (action === "load-analysis") await guarded(loadAnalysisRows, "Failed to load metrics");
@@ -1778,28 +1756,20 @@ function rerunJob(jobId) {
   setPage("algorithm");
 }
 
-async function loadQuickPly() {
-  if (!state.quickPlyPath) throw new Error("Enter a PLY file path.");
-  const data = await loadPlyFile(state.apiBaseUrl, {
-    ply_path: state.quickPlyPath,
-    representation: selectedAlgorithm()?.representation || "sh",
+async function loadQuickResult() {
+  if (!state.quickPlyPath) throw new Error("Enter a result folder or file path.");
+  const data = await loadResultPath(state.apiBaseUrl, {
+    path: state.quickPlyPath,
   });
   state.loadedPly = data;
-  if (!data.ok) throw new Error(data.error || "PLY load failed");
-  showToast("PLY loaded.");
+  if (!data.ok) throw new Error(data.reason || data.error || "Result open failed");
+  showToast("Result opened.");
 }
 
 function openDiscovered(outputDir) {
   const item = discoveredResults.find((result) => result.output_dir === outputDir);
   if (!item) return;
-  const plyAsset = getRenderablePlyAsset(item);
-  const imageAsset = getRenderableImageAsset(item);
-  state.loadedPly = {
-    ok: true,
-    viewer_url: plyAsset?.viewerUrl || "",
-    point_cloud_url: plyAsset?.sourceUrl || "",
-    result_url: plyAsset ? "" : imageAsset?.imageUrl || "",
-  };
+  state.loadedPly = { ok: true, ...item };
   state.activePage = "browser";
   persistState();
   render();

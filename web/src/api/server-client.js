@@ -252,3 +252,14 @@ export async function loadPlyFile(apiBaseUrl, payload) {
   });
   return parseJson(response);
 }
+
+export async function loadResultPath(apiBaseUrl, payload) {
+  const response = await fetch(withApiBase(apiBaseUrl, "api/load-result"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  return parseJson(response);
+}

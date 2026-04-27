@@ -57,6 +57,61 @@ MAX_PROCESS_FRAME_COMPLETED_HISTORY = 80
 MAX_METRICS_HISTORY = 5000
 
 MANUAL_ZH_URL = "/web/WEB_TRAINING_MANUAL_ZH.md"
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"}
+PLY_EXTENSIONS = {".ply"}
+RESULT_SCAN_EXCLUDED_DIRS = {
+  ".git",
+  "__pycache__",
+  "assets",
+  "docs",
+  "node_modules",
+  "submodules",
+  "SIBR_viewers",
+}
+LOCAL_RESULT_PROJECTS = [
+  {
+    "family": "compgs",
+    "label": "CompGS",
+    "root": ROOT_DIR / "CompGS-main",
+    "representation": "sh",
+  },
+  {
+    "family": "contextgs",
+    "label": "ContextGS",
+    "root": ROOT_DIR / "ContextGS-main",
+    "representation": "sh",
+  },
+  {
+    "family": "fcgs",
+    "label": "FCGS",
+    "root": ROOT_DIR / "FCGS-main",
+    "representation": "sh",
+  },
+  {
+    "family": "hac-plus-plus",
+    "label": "HAC++",
+    "root": ROOT_DIR / "HAC-plus-main",
+    "representation": "sh",
+  },
+  {
+    "family": "megs2",
+    "label": "MEGS2",
+    "root": ROOT_DIR / "MEGS-2-main",
+    "representation": "sg",
+  },
+  {
+    "family": "scaffold-gs",
+    "label": "Scaffold-GS",
+    "root": ROOT_DIR / "Scaffold-GS-main",
+    "representation": "sh",
+  },
+  {
+    "family": "reduced-3dgs",
+    "label": "Reduced 3DGS",
+    "root": ROOT_DIR / "reduced-3dgs-main",
+    "representation": "sh",
+  },
+]
 
 
 def extract_job_metrics(text: str) -> Dict[str, Any]:
@@ -472,7 +527,7 @@ def prepare_colmap_workspace(
       f" && mkdir -p {shlex.quote(str(distorted_sparse_path))} {shlex.quote(str(sparse_root))}"
       f" && colmap_headless colmap feature_extractor --database_path {shlex.quote(str(database_path))} --image_path {shlex.quote(str(input_dir))} "
       "--ImageReader.single_camera 1 --ImageReader.camera_model SIMPLE_PINHOLE"
-      f" && colmap_headless colmap exhaustive_matcher --database_path {shlex.quote(str(database_path))}"
+      f" && colmap_headless colmap sequential_matcher --database_path {shlex.quote(str(database_path))}"
       f" && colmap_headless colmap mapper --database_path {shlex.quote(str(database_path))} --image_path {shlex.quote(str(input_dir))} --output_path {shlex.quote(str(distorted_sparse_path))}"
       f" && rm -rf {shlex.quote(str(images_dir))} {shlex.quote(str(sparse_root))}"
       f" && mkdir -p {shlex.quote(str(images_dir))} {shlex.quote(str(sparse_root))} {shlex.quote(str(sparse_0))}"
@@ -942,6 +997,308 @@ def build_viewer_url(relative_url: str, representation: str | None = None) -> st
   return f"/web/viewers/{renderer}.html?url={relative_url}"
 
 
+def path_is_inside(path: Path, parent: Path) -> bool:
+  try:
+    path.resolve().relative_to(parent.resolve())
+    return True
+  except ValueError:
+    return False
+
+
+def file_url_for_path(path: Path, cache_group: str = "files") -> str:
+  resolved = path.resolve()
+  if path_is_inside(resolved, ROOT_DIR):
+    return "/" + str(resolved.relative_to(ROOT_DIR)).replace("\\", "/")
+
+  cache_dir = WEB_DIR / "generated" / "result_cache" / cache_group
+  cache_dir.mkdir(parents=True, exist_ok=True)
+  stat = resolved.stat()
+  suffix = resolved.suffix.lower()
+  digest = uuid.uuid5(
+    uuid.NAMESPACE_URL,
+    f"{resolved}:{stat.st_mtime_ns}:{stat.st_size}",
+  ).hex[:12]
+  cache_path = cache_dir / f"{resolved.stem}_{digest}{suffix}"
+  if not cache_path.exists():
+    shutil.copy2(resolved, cache_path)
+  return "/" + str(cache_path.relative_to(ROOT_DIR)).replace("\\", "/")
+
+
+def project_for_family(family: str | None) -> Dict[str, Any] | None:
+  normalized = str(family or "").strip().lower()
+  if not normalized:
+    return None
+  for project in LOCAL_RESULT_PROJECTS:
+    if project["family"] == normalized:
+      return project
+  return None
+
+
+def infer_family_for_path(path: Path, explicit_family: str | None = None) -> str:
+  if explicit_family:
+    return str(explicit_family).strip()
+  resolved = path.resolve()
+  for project in LOCAL_RESULT_PROJECTS:
+    root = Path(project["root"]).resolve()
+    if root.exists() and path_is_inside(resolved, root):
+      return str(project["family"])
+  path_parts = {part.lower() for part in resolved.parts}
+  for project in LOCAL_RESULT_PROJECTS:
+    if str(project["family"]).lower() in path_parts:
+      return str(project["family"])
+  return ""
+
+
+def representation_for_family(family: str | None, fallback: str | None = None) -> str:
+  if fallback:
+    return fallback
+  project = project_for_family(family)
+  if project:
+    return str(project.get("representation") or "sh")
+  adapter = get_adapter(str(family or ""))
+  return str((adapter or {}).get("representation") or "sh")
+
+
+def is_image_file(path: Path) -> bool:
+  return path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+
+
+def is_ply_file(path: Path) -> bool:
+  return path.is_file() and path.suffix.lower() in PLY_EXTENSIONS
+
+
+def newest_file(paths: list[Path]) -> Path | None:
+  existing = [path for path in paths if path.exists() and path.is_file()]
+  if not existing:
+    return None
+  return max(existing, key=lambda item: (item.stat().st_mtime, str(item)))
+
+
+def newest_image_from_globs(directory: Path, patterns: list[str]) -> Path | None:
+  candidates: list[Path] = []
+  for pattern in patterns:
+    for image_path in directory.glob(pattern):
+      if is_image_file(image_path):
+        candidates.append(image_path)
+  return newest_file(candidates)
+
+
+def latest_iteration_dir(point_cloud_dir: Path) -> Path | None:
+  if not point_cloud_dir.exists() or not point_cloud_dir.is_dir():
+    return None
+  candidates: list[tuple[int, Path]] = []
+  for child in point_cloud_dir.iterdir():
+    if not child.is_dir() or not child.name.startswith("iteration_"):
+      continue
+    try:
+      iteration = int(child.name.split("_")[-1])
+    except ValueError:
+      continue
+    candidates.append((iteration, child))
+  if not candidates:
+    return None
+  candidates.sort(key=lambda item: item[0], reverse=True)
+  return candidates[0][1]
+
+
+def direct_ply_candidates(directory: Path, names: list[str] | None = None) -> list[Path]:
+  target_names = names or ["point_cloud.ply", "latest.ply", "scene.ply"]
+  return [directory / name for name in target_names]
+
+
+def find_result_ply(directory: Path, family: str | None = None) -> Path | None:
+  family = str(family or "").strip()
+  if is_ply_file(directory):
+    return directory
+
+  names = ["point_cloud.ply", "latest.ply", "scene.ply"]
+  if family == "reduced-3dgs":
+    names = ["point_cloud_quantised_half.ply", "point_cloud_quantised.ply", "point_cloud.ply", "latest.ply", "scene.ply"]
+
+  if directory.is_dir():
+    direct = newest_file([path for path in direct_ply_candidates(directory, names) if is_ply_file(path)])
+    if direct:
+      return direct
+
+    iteration_dir = latest_iteration_dir(directory / "point_cloud")
+    if iteration_dir:
+      for candidate in direct_ply_candidates(iteration_dir, names):
+        if is_ply_file(candidate):
+          return candidate
+
+    if directory.name.startswith("iteration_"):
+      for candidate in direct_ply_candidates(directory, names):
+        if is_ply_file(candidate):
+          return candidate
+
+  return None
+
+
+def find_result_manifest(directory: Path) -> Path | None:
+  if directory.is_file() and directory.name == "scene_manifest.json":
+    return directory
+  if not directory.is_dir():
+    return None
+  candidate = directory / "scene_manifest.json"
+  return candidate if candidate.exists() and candidate.is_file() else None
+
+
+def find_result_image(directory: Path, family: str | None = None) -> Path | None:
+  if is_image_file(directory):
+    return directory
+  if not directory.is_dir():
+    return None
+
+  direct_latest = newest_file([directory / f"latest{suffix}" for suffix in IMAGE_EXTENSIONS])
+  if direct_latest:
+    return direct_latest
+
+  family = str(family or "").strip()
+  if family == "compgs":
+    patterns = [
+      "eval/rendered/*",
+      "eval_training/rendered/*",
+    ]
+  elif family == "reduced-3dgs":
+    patterns = [
+      "test/*/renders/*",
+      "train/*/renders/*",
+    ]
+  else:
+    patterns = [
+      "test/ours_*/renders/*",
+      "train/ours_*/renders/*",
+    ]
+  return newest_image_from_globs(directory, patterns)
+
+
+def result_payload_for_ply(path: Path, *, family: str | None = None, representation: str | None = None) -> Dict[str, Any]:
+  resolved = path.resolve()
+  resolved_family = infer_family_for_path(resolved, family)
+  resolved_representation = representation_for_family(resolved_family, representation)
+  point_cloud_url = file_url_for_path(resolved, "ply")
+  return {
+    "ok": True,
+    "type": "ply",
+    "family": resolved_family,
+    "representation": resolved_representation,
+    "point_cloud_url": point_cloud_url,
+    "viewer_url": build_viewer_url(point_cloud_url, resolved_representation),
+    "resolved_path": str(resolved),
+    "path": str(resolved),
+    "file_size": resolved.stat().st_size,
+  }
+
+
+def result_payload_for_image(path: Path, *, family: str | None = None) -> Dict[str, Any]:
+  resolved = path.resolve()
+  resolved_family = infer_family_for_path(resolved, family)
+  image_url = file_url_for_path(resolved, "images")
+  return {
+    "ok": True,
+    "type": "image",
+    "family": resolved_family,
+    "result_url": image_url,
+    "resolved_path": str(resolved),
+    "path": str(resolved),
+    "file_size": resolved.stat().st_size,
+  }
+
+
+def result_payload_for_manifest(path: Path, *, family: str | None = None, representation: str | None = None) -> Dict[str, Any]:
+  resolved = path.resolve()
+  resolved_family = infer_family_for_path(resolved, family)
+  resolved_representation = representation_for_family(resolved_family, representation)
+  manifest_url = file_url_for_path(resolved, "manifests")
+  return {
+    "ok": True,
+    "type": "manifest",
+    "family": resolved_family,
+    "representation": resolved_representation,
+    "manifest_url": manifest_url,
+    "viewer_url": f"/web/?manifest={manifest_url}",
+    "resolved_path": str(resolved),
+    "path": str(resolved),
+    "file_size": resolved.stat().st_size,
+  }
+
+
+def looks_like_fcgs_bitstream_dir(directory: Path) -> bool:
+  if not directory.is_dir():
+    return False
+  for child in directory.iterdir():
+    if not child.is_dir():
+      continue
+    try:
+      float(child.name)
+    except ValueError:
+      continue
+    return True
+  return False
+
+
+def load_result_path(path_value: str, family: str | None = None, representation: str | None = None) -> Dict[str, Any]:
+  resolved_text = resolve_project_path(path_value)
+  resolved = Path(resolved_text).resolve() if resolved_text else Path(str(path_value or "")).expanduser().resolve()
+  resolved_family = infer_family_for_path(resolved, family)
+  resolved_representation = representation_for_family(resolved_family, representation)
+
+  if not resolved.exists():
+    reason = f"Result path does not exist: {path_value}"
+    return {
+      "ok": False,
+      "type": "",
+      "family": resolved_family,
+      "reason": reason,
+      "error": reason,
+      "path": str(path_value or ""),
+      "resolved_path": str(resolved),
+    }
+
+  if is_ply_file(resolved):
+    return result_payload_for_ply(resolved, family=resolved_family, representation=resolved_representation)
+  if is_image_file(resolved):
+    return result_payload_for_image(resolved, family=resolved_family)
+  if resolved.is_file() and resolved.name == "scene_manifest.json":
+    return result_payload_for_manifest(resolved, family=resolved_family, representation=resolved_representation)
+  if resolved.is_file():
+    reason = f"Unsupported result file type: {resolved.suffix or resolved.name}"
+    return {
+      "ok": False,
+      "type": "",
+      "family": resolved_family,
+      "reason": reason,
+      "error": reason,
+      "path": str(path_value or ""),
+      "resolved_path": str(resolved),
+    }
+
+  ply_path = find_result_ply(resolved, resolved_family)
+  if ply_path:
+    return result_payload_for_ply(ply_path, family=resolved_family, representation=resolved_representation)
+
+  manifest_path = find_result_manifest(resolved)
+  if manifest_path:
+    return result_payload_for_manifest(manifest_path, family=resolved_family, representation=resolved_representation)
+
+  image_path = find_result_image(resolved, resolved_family)
+  if image_path:
+    return result_payload_for_image(image_path, family=resolved_family)
+
+  reason = "No supported PLY, scene manifest, or rendered image was found in this result directory."
+  if resolved_family == "fcgs" and looks_like_fcgs_bitstream_dir(resolved):
+    reason = "FCGS bitstreams were found, but no decoded PLY exists yet. Decode to point_cloud.ply, latest.ply, or scene.ply first."
+  return {
+    "ok": False,
+    "type": "",
+    "family": resolved_family,
+    "reason": reason,
+    "error": reason,
+    "path": str(path_value or ""),
+    "resolved_path": str(resolved),
+  }
+
+
 def load_ply_file(ply_path: str, representation: str | None = None) -> Dict[str, Any]:
   """
   Load a PLY file independently from the training flow.
@@ -965,36 +1322,7 @@ def load_ply_file(ply_path: str, representation: str | None = None) -> Dict[str,
         "path": str(ply_file),
       }
 
-    # Files inside ROOT_DIR can be served directly; external files are copied
-    # into a generated cache that is reachable by the static viewer.
-    try:
-      if ROOT_DIR in ply_file.parents or ply_file == ROOT_DIR:
-        point_cloud_url = "/" + str(ply_file.relative_to(ROOT_DIR)).replace("\\", "/")
-      else:
-        cache_dir = WEB_DIR / "generated" / "ply_cache"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-
-        cache_filename = f"{ply_file.stem}_{int(time.time())}.ply"
-        cache_path = cache_dir / cache_filename
-
-        shutil.copy2(ply_file, cache_path)
-        point_cloud_url = "/" + str(cache_path.relative_to(ROOT_DIR)).replace("\\", "/")
-    except Exception as e:
-      return {
-        "ok": False,
-        "error": f"Could not process file path: {str(e)}",
-        "path": str(ply_file),
-      }
-
-    viewer_url = build_viewer_url(point_cloud_url, representation)
-
-    return {
-      "ok": True,
-      "point_cloud_url": point_cloud_url,
-      "viewer_url": viewer_url,
-      "path": str(ply_file),
-      "file_size": ply_file.stat().st_size,
-    }
+    return result_payload_for_ply(ply_file, representation=representation)
   except Exception as e:
     return {
       "ok": False,
@@ -1075,37 +1403,17 @@ def read_runtime_artifacts(output_dir: str | None, representation: str | None = 
     return {}
   directory = Path(output_dir).resolve()
   metrics_path = directory / "metrics.json"
-  latest_image = directory / "latest.png"
-  scene_manifest = directory / "scene_manifest.json"
-  point_cloud_candidates = [
-    directory / "point_cloud.ply",
-    directory / "latest.ply",
-    directory / "scene.ply",
-  ]
-  latest_model_ply = newest_iteration_ply(directory)
-  if latest_model_ply is not None:
-    point_cloud_candidates.append(latest_model_ply)
-  latest_render = newest_render_image(directory)
   payload: Dict[str, Any] = {}
   if metrics_path.exists():
     try:
       payload["metrics"] = json.loads(metrics_path.read_text(encoding="utf-8"))
     except Exception:
       pass
-  if scene_manifest.exists() and ROOT_DIR in scene_manifest.parents:
-    manifest_url = "/" + str(scene_manifest.relative_to(ROOT_DIR)).replace("\\", "/")
-    payload["manifest_url"] = manifest_url
-    payload["viewer_url"] = f"/web/?manifest={manifest_url}"
-  for candidate in point_cloud_candidates:
-    if candidate.exists() and ROOT_DIR in candidate.parents:
-      point_cloud_url = "/" + str(candidate.relative_to(ROOT_DIR)).replace("\\", "/")
-      payload["point_cloud_url"] = point_cloud_url
-      payload["viewer_url"] = build_viewer_url(point_cloud_url, representation)
-      break
-  if latest_image.exists() and ROOT_DIR in latest_image.parents:
-    payload["result_url"] = "/" + str(latest_image.relative_to(ROOT_DIR)).replace("\\", "/")
-  elif latest_render is not None and ROOT_DIR in latest_render.parents:
-    payload["result_url"] = "/" + str(latest_render.relative_to(ROOT_DIR)).replace("\\", "/")
+  artifact = load_result_path(str(directory), representation=representation)
+  if artifact.get("ok"):
+    for key in ("type", "family", "representation", "manifest_url", "viewer_url", "point_cloud_url", "result_url", "resolved_path"):
+      if artifact.get(key):
+        payload[key] = artifact[key]
   return payload
 
 
@@ -1464,50 +1772,70 @@ def _artifact_score(directory: Path) -> float:
   return max(scores) if scores else 0.0
 
 
+def result_scan_roots() -> list[tuple[Path, str, str]]:
+  roots: list[tuple[Path, str, str]] = [
+    ((WEB_DIR / "generated" / "runs").resolve(), "", "generated"),
+    ((STREAM_DIR).resolve(), "", "generated"),
+    ((WEB_DIR / "generated" / "datasets").resolve(), "", "generated"),
+  ]
+  for project in LOCAL_RESULT_PROJECTS:
+    project_root = Path(project["root"]).resolve()
+    if not project_root.exists():
+      continue
+    roots.append((project_root, str(project["family"]), "project"))
+  return roots
+
+
 def discover_runtime_results(*, limit: int = 30, max_scan_dirs: int = 1800) -> list[Dict[str, Any]]:
   """Scan local server output roots and return mountable runtime artifacts."""
   safe_limit = max(1, min(limit, 100))
   safe_max_scan_dirs = max(200, min(max_scan_dirs, 8000))
 
-  scan_roots = [
-    (WEB_DIR / "generated" / "runs").resolve(),
-    (STREAM_DIR).resolve(),
-    (WEB_DIR / "generated" / "datasets").resolve(),
-  ]
-
   discovered: Dict[str, Dict[str, Any]] = {}
   scanned_dirs = 0
 
-  for root in scan_roots:
+  for root, family, source in result_scan_roots():
     if not root.exists() or not root.is_dir():
       continue
 
-    for current_root, _, _ in os.walk(root):
+    for current_root, dirnames, _ in os.walk(root):
+      dirnames[:] = [
+        dirname for dirname in dirnames
+        if dirname not in RESULT_SCAN_EXCLUDED_DIRS and not dirname.startswith(".")
+      ]
       scanned_dirs += 1
       if scanned_dirs > safe_max_scan_dirs:
         break
       directory = Path(current_root)
-      artifacts = read_runtime_artifacts(str(directory))
-      if not any(artifacts.get(key) for key in ("manifest_url", "viewer_url", "point_cloud_url", "result_url")):
+      artifact = load_result_path(str(directory), family=family)
+      if not artifact.get("ok"):
         continue
 
       output_dir = str(directory.resolve())
+      asset_path = str(artifact.get("resolved_path") or output_dir)
+      try:
+        score = Path(asset_path).stat().st_mtime
+      except OSError:
+        score = _artifact_score(directory)
       item = {
         "id": f"discovered::{uuid.uuid5(uuid.NAMESPACE_URL, output_dir).hex[:12]}",
-        "source": "discovered",
+        "source": source,
         "output_dir": output_dir,
-        "representation": "sg" if str(artifacts.get("viewer_url", "")).find("/viewers/sg.html") >= 0 else "sh",
-        "score": _artifact_score(directory),
+        "resolved_path": asset_path,
+        "type": artifact.get("type", ""),
+        "family": artifact.get("family", family),
+        "representation": artifact.get("representation") or ("sg" if str(artifact.get("viewer_url", "")).find("/viewers/sg.html") >= 0 else "sh"),
+        "score": score,
       }
-      for key in ("manifest_url", "viewer_url", "point_cloud_url", "result_url"):
-        if artifacts.get(key):
-          item[key] = artifacts[key]
+      for key in ("manifest_url", "viewer_url", "point_cloud_url", "result_url", "reason"):
+        if artifact.get(key):
+          item[key] = artifact[key]
 
-      metrics = artifacts.get("metrics")
+      metrics = read_runtime_artifacts(str(directory)).get("metrics")
       if isinstance(metrics, dict):
         item["metrics"] = metrics
 
-      discovered[output_dir] = item
+      discovered.setdefault(asset_path, item)
 
     if scanned_dirs > safe_max_scan_dirs:
       break
@@ -2841,6 +3169,25 @@ class ApiHandler(SimpleHTTPRequestHandler):
           status=400,
           manual_anchor="#6-%E5%88%86%E6%AD%A5%E6%B5%81%E7%A8%8B%E8%B0%83%E8%AF%95%E5%85%9C%E5%BA%95",
         )
+      return
+
+    if parsed.path == "/api/load-result":
+      result_path = str(payload.get("path", "") or payload.get("result_path", "") or "").strip()
+      family = str(payload.get("family", "")).strip() or None
+      representation = str(payload.get("representation", "")).strip() or None
+
+      if not result_path:
+        json_response(self, {
+          "ok": False,
+          "type": "",
+          "error": "Missing path parameter",
+          "reason": "Missing path parameter",
+        }, status=400)
+        return
+
+      result = load_result_path(result_path, family=family, representation=representation)
+      status = 200 if result.get("ok") else 400
+      json_response(self, result, status=status)
       return
 
     if parsed.path == "/api/load-ply":

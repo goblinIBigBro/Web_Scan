@@ -20,6 +20,7 @@
   --radius: 16px;
   --radius-sm: 10px;
   font-family: "Avenir Next", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 17px;
 }
 
 * {
@@ -38,6 +39,7 @@ body {
     radial-gradient(circle at 80% 12%, rgba(29, 211, 255, 0.18), transparent 30%),
     linear-gradient(135deg, #040b17 0%, #07152a 48%, #05101e 100%);
   color: var(--text);
+  line-height: 1.55;
 }
 
 #app-root {
@@ -63,10 +65,12 @@ button,
   border-radius: 12px;
   background: rgba(19, 41, 76, 0.92);
   color: var(--text);
-  padding: 10px 14px;
+  padding: 11px 16px;
   cursor: pointer;
   text-decoration: none;
   transition: transform 0.16s ease, border-color 0.16s ease, background 0.16s ease;
+  font-size: 15px;
+  font-weight: 650;
 }
 
 button:hover,
@@ -102,8 +106,9 @@ textarea {
   border-radius: 12px;
   background: rgba(4, 12, 27, 0.72);
   color: var(--text);
-  padding: 10px 12px;
+  padding: 12px 13px;
   outline: none;
+  font-size: 15px;
 }
 
 input[type="checkbox"] {
@@ -119,7 +124,7 @@ label {
   display: grid;
   gap: 7px;
   color: var(--muted);
-  font-size: 13px;
+  font-size: 14px;
 }
 
 pre {
@@ -172,18 +177,20 @@ pre {
 .brand-cube {
   display: grid;
   place-items: center;
-  width: 42px;
+  width: 50px;
   height: 42px;
   border: 1px solid rgba(42, 206, 255, 0.5);
   border-radius: 13px;
   background: linear-gradient(145deg, rgba(49, 123, 255, 0.2), rgba(137, 88, 255, 0.22));
   color: var(--cyan);
   font-weight: 800;
+  font-size: 14px;
 }
 
 .brand-title {
   margin: 0;
-  font-size: 24px;
+  font-size: 27px;
+  line-height: 1.05;
 }
 
 .brand-subtitle,
@@ -197,7 +204,7 @@ pre {
 .eyebrow,
 .panel-copy {
   margin: 0;
-  font-size: 13px;
+  font-size: 14px;
 }
 
 .eyebrow {
@@ -233,7 +240,7 @@ pre {
 
 .layout {
   display: grid;
-  grid-template-columns: minmax(360px, 420px) minmax(0, 1fr);
+  grid-template-columns: minmax(340px, 390px) minmax(0, 1fr);
   gap: 16px;
   align-items: start;
   min-height: 0;
@@ -268,25 +275,25 @@ pre {
 }
 
 .rail h2 {
-  font-size: 28px;
+  font-size: 25px;
   line-height: 1.22;
 }
 
 .rail h3,
 .rail .selectable-card strong {
-  font-size: 20px;
+  font-size: 19px;
   line-height: 1.25;
 }
 
 .rail .panel-copy,
 .rail .muted,
 .rail .eyebrow {
-  font-size: 15px;
+  font-size: 16px;
   line-height: 1.5;
 }
 
 .rail .badge {
-  font-size: 14px;
+  font-size: 15px;
 }
 
 .rail {
@@ -387,6 +394,17 @@ pre {
 
 .grid.three {
   grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.rail-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 14px;
+}
+
+.rail-facts .panel-copy {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .metric-grid {
@@ -744,7 +762,8 @@ th {
   .form-grid,
   .grid.two,
   .grid.three,
-  .metric-grid {
+  .metric-grid,
+  .rail-facts {
     grid-template-columns: 1fr;
   }
 

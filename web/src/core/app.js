@@ -2,7 +2,9 @@ import {
   buildJobLogDownloadUrl,
   buildJobMetricsCsvUrl,
   cancelJob,
+  clearJobs,
   deleteFlowData,
+  deleteJob,
   fetchAlgorithms,
   fetchDiscoveredResults,
   fetchFlowData,
@@ -372,7 +374,7 @@ function buttonActionKey(node) {
   if (node.dataset.page) return `page:${node.dataset.page}`;
   if (!node.dataset.action) return "";
   const parts = [node.dataset.action];
-  for (const key of ["jobId", "datasetId", "outputDir", "mode", "stage"]) {
+  for (const key of ["jobId", "datasetId", "outputDir", "mode", "stage", "statuses"]) {
     if (node.dataset[key]) parts.push(node.dataset[key]);
   }
   return parts.join(":");
@@ -489,9 +491,11 @@ function render() {
   root.innerHTML = `
     <div class="workbench">
       ${renderTopbar()}
-      <div class="layout">
-        <aside class="rail">${renderLeftRail()}</aside>
-        <main class="main-column">${renderMain()}</main>
+      <div class="workspace-frame">
+        <div class="layout">
+          <aside class="rail">${renderLeftRail()}</aside>
+          <main class="main-column">${renderMain()}</main>
+        </div>
       </div>
     </div>
     <div id="modal-layer" class="modal-layer" hidden></div>
@@ -534,7 +538,7 @@ function renderLeftRail() {
         <p class="panel-copy">Session: ${escapeHtml(state.sessionId || "-")}</p>
         <p class="panel-copy">Capture: ${escapeHtml(state.captureId || "-")}</p>
         <p class="panel-copy">Dataset: ${escapeHtml(datasetNameForPayload())}</p>
-        <p class="panel-copy">Uploaded: ${state.uploadedCount || 0} image(s)</p>
+        <p class="panel-copy">Uploaded: ${stagedUploadFrameCount()} image(s)</p>
       </div>
     </section>
     <section class="panel">
@@ -571,24 +575,6 @@ function renderStatusRail() {
         <p class="panel-copy">API: ${escapeHtml(state.apiBaseUrl)}</p>
         <p class="panel-copy">SSH: ${state.sshChecked ? "Precheck passed" : "Not checked or expired"}</p>
         <p class="panel-copy">COLMAP: ${state.autoColmap ? "Automatic" : "Manual confirmation"}</p>
-      </div>
-    </section>
-    <section class="panel">
-      <div class="panel-head">
-        <h3>Environment Check</h3>
-        <button data-action="check-runtime" type="button">Check</button>
-      </div>
-      <div class="card grid">
-        ${renderEnvironmentChecks()}
-      </div>
-    </section>
-    <section class="panel">
-      <div class="panel-head">
-        <h3>Current Job</h3>
-        <button data-action="refresh-jobs" type="button">Refresh</button>
-      </div>
-      <div class="card">
-        ${renderCurrentJobSummary()}
       </div>
     </section>
     ${state.lastError ? `
@@ -663,23 +649,18 @@ function renderOverviewPage() {
     </section>
     <section class="panel">
       <div class="panel-head">
-        <h2>Training Pipeline</h2>
-        <span class="badge">Capture -> Upload -> Session Prep -> COLMAP -> Train -> Render -> View</span>
-      </div>
-      <div class="card step-flow">
-        ${["Capture", "Upload", "Session Prep", "COLMAP", "Train", "Render", "View"].map((label, index) => `
-          <div class="step ${index < pipelineProgressIndex() ? "done" : index === pipelineProgressIndex() ? "active" : ""}">
-            <span class="badge">${index + 1}</span>
-            <h3>${label}</h3>
-            <p class="panel-copy">${pipelineHint(label)}</p>
-          </div>
-        `).join("")}
+        <h2>Workflow</h2>
+        ${renderProgressChips()}
       </div>
     </section>
     <section class="panel">
       <div class="panel-head">
         <h2>Recent Jobs</h2>
-        <button data-page="algorithm" type="button">Open Job Monitor</button>
+        <div class="button-row">
+          <button data-action="clear-jobs" data-statuses="canceled" type="button">Clear Canceled</button>
+          <button data-action="clear-jobs" data-statuses="finished" type="button">Clear Finished</button>
+          <button data-page="algorithm" type="button">Open Job Monitor</button>
+        </div>
       </div>
       <div class="card">${renderJobsTable(jobs.slice(0, 6))}</div>
     </section>
@@ -713,6 +694,34 @@ function pipelineHint(label) {
     "Result Page": "Open PLY or image result",
   };
   return hints[label] || "";
+}
+
+function compactProgressIndex() {
+  const job = getJob();
+  const status = String(job?.status || "").toLowerCase();
+  if (status === "completed") return 4;
+  if (["queued", "running", "detached"].includes(status)) return 3;
+  if (state.lastPreview) return 2;
+  if (state.sshChecked) return 1;
+  return 0;
+}
+
+function renderProgressChips() {
+  const activeIndex = compactProgressIndex();
+  const stages = [
+    ["Data", stagedUploadFrameCount() > 0 || state.useExistingRemoteDataset],
+    ["SSH", state.sshChecked],
+    ["Command", Boolean(state.lastPreview)],
+    ["Train", ["queued", "running", "detached"].includes(String(getJob()?.status || "").toLowerCase())],
+    ["Results", getJob()?.status === "completed"],
+  ];
+  return `
+    <div class="mini-flow" aria-label="Workflow progress">
+      ${stages.map(([label, done], index) => `
+        <span class="mini-step ${done ? "done" : index === activeIndex ? "active" : ""}">${escapeHtml(label)}</span>
+      `).join("")}
+    </div>
+  `;
 }
 
 function renderDataPage() {
@@ -785,16 +794,8 @@ function renderDataPage() {
     </details>
     <section class="panel">
       <div class="panel-head">
-        <h2>Processing Flow</h2>
-        <span class="badge">${escapeHtml(state.sessionId)}</span>
-      </div>
-      <div class="card step-flow">
-        ${["Capture", "Upload", "Session Prep", "COLMAP", "Train", "Render", "View"].map((label, index) => `
-          <div class="step ${index < pipelineProgressIndex() ? "done" : index === pipelineProgressIndex() ? "active" : ""}">
-            <h3>${label}</h3>
-            <p class="panel-copy">${pipelineHint(label)}</p>
-          </div>
-        `).join("")}
+        <h2>Workflow</h2>
+        ${renderProgressChips()}
       </div>
     </section>
   `;
@@ -874,27 +875,36 @@ function renderCurrentFlowData() {
       </div>
       <div class="flow-stage-grid">
         ${renderFlowStageCard({
+          index: 1,
           stage: "capture",
-          title: "1 Capture",
+          title: "Capture",
           badge: `${Number(capture.frame_count || 0)} frame(s)`,
           detail: capturePath ? summarize(capturePath, 72) : "No capture input yet.",
+          fullDetail: capturePath,
           enabled: Number(capture.frame_count || 0) > 0,
+          deletable: Number(capture.frame_count || 0) > 0,
           preview: latestCapture?.url || "",
         })}
         ${renderFlowStageCard({
+          index: 2,
           stage: "upload",
-          title: "2 Upload",
+          title: "Upload",
           badge: `${Number(upload.uploaded_frame_count || 0)} uploaded`,
           detail: streamPath ? summarize(streamPath, 72) : "No stream session yet.",
-          enabled: Boolean(upload.exists),
+          fullDetail: streamPath,
+          enabled: Number(upload.uploaded_frame_count || 0) > 0,
+          deletable: Number(upload.uploaded_frame_count || 0) > 0 || Boolean(upload.latest_output),
           preview: upload.latest_output?.url || "",
         })}
         ${renderFlowStageCard({
+          index: 3,
           stage: "session_prep",
-          title: "3 Session Prep",
+          title: "Session Prep",
           badge: `${Number(prep.dataset_count || 0)} dataset / ${Number(prep.workspace_count || 0)} workspace`,
           detail: summarize(workspace?.workspace_root || dataset?.dataset_root || "No materialized dataset or workspace yet.", 72),
+          fullDetail: workspace?.workspace_root || dataset?.dataset_root || "",
           enabled: Boolean(prep.exists),
+          deletable: Boolean(prep.exists),
           preview: "",
         })}
       </div>
@@ -902,16 +912,17 @@ function renderCurrentFlowData() {
   `;
 }
 
-function renderFlowStageCard({ stage, title, badge, detail, enabled, preview }) {
+function renderFlowStageCard({ index, stage, title, badge, detail, fullDetail, enabled, deletable, preview }) {
   return `
-    <article class="selectable-card flow-stage-card">
-      <div class="button-row" style="justify-content: space-between;">
+    <article class="flow-stage-row">
+      <span class="flow-stage-index">${escapeHtml(index)}</span>
+      <div class="flow-stage-main">
         <strong>${escapeHtml(title)}</strong>
-        <span class="badge ${enabled ? "ok" : "warn"}">${escapeHtml(badge)}</span>
+        <p class="panel-copy" title="${escapeHtml(fullDetail || detail)}">${escapeHtml(detail)}</p>
       </div>
-      <p class="panel-copy">${escapeHtml(detail)}</p>
       ${preview ? `<img class="flow-preview" src="${escapeHtml(preview)}" alt="${escapeHtml(title)} preview" />` : ""}
-      <button class="danger" data-action="delete-flow-data" data-stage="${escapeHtml(stage)}" type="button" ${enabled ? "" : "disabled"}>Delete</button>
+      <span class="badge ${enabled ? "ok" : "warn"}">${enabled ? escapeHtml(badge) : "Empty"}</span>
+      ${deletable ? `<button class="danger compact-button" data-action="delete-flow-data" data-stage="${escapeHtml(stage)}" type="button">Delete</button>` : `<span class="stage-empty">No data</span>`}
     </article>
   `;
 }
@@ -1003,18 +1014,11 @@ function renderAlgorithmPage() {
         <div>
           <h2>Algorithm Management and Remote Job Scheduling</h2>
           <p class="panel-copy">Remote training is the only training entry. Local APIs stay available for debug compatibility only.</p>
+          ${renderProgressChips()}
         </div>
         <span class="badge ${operationSupportsRemote() ? "ok" : "bad"}">${operationSupportsRemote() ? "Remote Template OK" : "No Remote Template"}</span>
       </div>
       <div class="card grid">
-        <div class="step-flow">
-          ${["Data Input", "Data Prep", "SSH Precheck", "Command Review", "Remote Submit", "Logs and Metrics", "Result Page"].map((label, index) => `
-            <div class="step ${index < pipelineProgressIndex() ? "done" : index === pipelineProgressIndex() ? "active" : ""}">
-              <h3>${label}</h3>
-              <p class="panel-copy">${pipelineHint(label) || "Move by dependency"}</p>
-            </div>
-          `).join("")}
-        </div>
         <div class="split">
           <div class="grid">
             <div class="form-grid">
@@ -1060,6 +1064,8 @@ function renderAlgorithmPage() {
       <div class="panel-head">
         <h2>Job Monitor</h2>
         <div class="button-row">
+          <button data-action="clear-jobs" data-statuses="canceled" type="button">Clear Canceled</button>
+          <button data-action="clear-jobs" data-statuses="finished" type="button">Clear Finished</button>
           <button data-action="refresh-jobs" type="button">Refresh Jobs</button>
           ${state.selectedJobId ? `<button data-action="load-log-reset" type="button">Reload Logs</button>` : ""}
         </div>
@@ -1167,7 +1173,7 @@ function renderJobsTable(items) {
   if (!items.length) return `<p class="panel-copy">No jobs yet.</p>`;
   return `
     <div class="table-wrap">
-      <table>
+      <table class="job-table">
         <thead>
           <tr>
             <th>Job</th><th>Status</th><th>Metrics</th><th>Dataset</th><th>Actions</th>
@@ -1189,11 +1195,13 @@ function renderJobsTable(items) {
               <td>FPS ${escapeHtml(job.metrics?.fps || "-")}<br />PSNR ${escapeHtml(job.metrics?.psnr || "-")}<br />Loss ${escapeHtml(job.metrics?.loss || "-")}</td>
               <td>${escapeHtml(summarize(job.remote_result?.remote_dataset_id || job.remote_dataset_id || job.dataset_name || "-", 32))}</td>
               <td>
-                <div class="button-row">
-                  <button data-action="select-job" data-job-id="${escapeHtml(job.id)}" type="button">Logs</button>
-                  <button data-action="open-result" data-job-id="${escapeHtml(job.id)}" type="button">Results</button>
-                  <button data-action="rerun-job" data-job-id="${escapeHtml(job.id)}" type="button">Rerun</button>
-                  <button class="danger" data-action="cancel-job" data-job-id="${escapeHtml(job.id)}" type="button" ${isTerminal(job.status) ? "disabled" : ""}>Cancel</button>
+                <div class="table-actions">
+                  <button class="compact-button" data-action="select-job" data-job-id="${escapeHtml(job.id)}" type="button">Logs</button>
+                  <button class="compact-button" data-action="open-result" data-job-id="${escapeHtml(job.id)}" type="button">Results</button>
+                  <button class="compact-button" data-action="rerun-job" data-job-id="${escapeHtml(job.id)}" type="button">Rerun</button>
+                  ${isTerminal(job.status)
+                    ? `<button class="danger compact-button" data-action="delete-job" data-job-id="${escapeHtml(job.id)}" type="button">Remove</button>`
+                    : `<button class="danger compact-button" data-action="cancel-job" data-job-id="${escapeHtml(job.id)}" type="button">Cancel</button>`}
                 </div>
               </td>
             </tr>
@@ -1463,6 +1471,8 @@ async function handleClick(event) {
   if (action === "preview-command") await guarded(previewCommand, "Command preview failed", actionKey);
   if (action === "submit-remote") await guarded(submitRemote, "Remote job submission failed", actionKey);
   if (action === "select-job") selectJob(jobId);
+  if (action === "clear-jobs") await guarded(() => clearJobRecords(actionNode.dataset.statuses), "Failed to clear jobs", actionKey);
+  if (action === "delete-job") await guarded(() => deleteJobRecord(jobId), "Failed to remove job", actionKey);
   if (action === "load-log-reset") await guarded(() => loadLog(true), "Failed to load logs", actionKey);
   if (action === "cancel-job") await guarded(() => cancelSelectedJob(jobId), "Failed to cancel job", actionKey);
   if (action === "open-result") openResult(jobId);
@@ -1825,6 +1835,58 @@ async function deleteCurrentFlowData(stage) {
   render();
   afterRender();
   showToast("Selected staged data cleared.");
+  return result;
+}
+
+function parseStatuses(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return ["completed", "failed", "canceled"];
+  if (raw === "finished") return ["completed", "failed", "canceled"];
+  return raw.split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+async function clearJobRecords(statusesValue) {
+  const statuses = parseStatuses(statusesValue);
+  const confirmed = await openJobCleanupConfirmModal({
+    mode: "clear",
+    statuses,
+  });
+  if (!confirmed) return null;
+  const result = await clearJobs(state.apiBaseUrl, { statuses });
+  const removedIds = new Set((result.removed || []).map((item) => item.id));
+  if (removedIds.has(state.selectedJobId)) {
+    state.selectedJobId = "";
+    state.logText = "";
+    state.logCursor = 0;
+  }
+  await refreshJobs();
+  render();
+  afterRender();
+  showToast(`Cleared ${result.removed_count || 0} job record(s). Logs were kept.`);
+  return result;
+}
+
+async function deleteJobRecord(jobId) {
+  const job = getJob(jobId);
+  if (!job) throw new Error(`Unknown job: ${jobId}`);
+  if (!isTerminal(job.status)) {
+    throw new Error("Cancel running jobs before removing the record.");
+  }
+  const confirmed = await openJobCleanupConfirmModal({
+    mode: "delete",
+    job,
+  });
+  if (!confirmed) return null;
+  const result = await deleteJob(state.apiBaseUrl, jobId);
+  if (state.selectedJobId === jobId) {
+    state.selectedJobId = "";
+    state.logText = "";
+    state.logCursor = 0;
+  }
+  await refreshJobs();
+  render();
+  afterRender();
+  showToast("Job record removed. Logs were kept.");
   return result;
 }
 
@@ -2358,6 +2420,42 @@ function openDeleteFlowDataConfirmModal(stage) {
       <div class="modal-footer">
         <button data-modal-cancel type="button">Cancel</button>
         <button class="danger" data-modal-ok type="button">Delete ${escapeHtml(label)}</button>
+      </div>
+    </div>
+  `;
+  return new Promise((resolve) => {
+    layer.querySelector("[data-modal-cancel]").addEventListener("click", () => {
+      layer.hidden = true;
+      resolve(false);
+    });
+    layer.querySelector("[data-modal-ok]").addEventListener("click", () => {
+      layer.hidden = true;
+      resolve(true);
+    });
+  });
+}
+
+function openJobCleanupConfirmModal({ mode, statuses = [], job = null }) {
+  const layer = document.getElementById("modal-layer");
+  const isDelete = mode === "delete";
+  const title = isDelete ? "Remove Job Record" : "Clear Job Records";
+  const statusText = isDelete
+    ? `${job?.id || "-"} · ${job?.status || "-"}`
+    : statuses.join(", ");
+  layer.hidden = false;
+  layer.innerHTML = `
+    <div class="modal">
+      <div class="panel-head"><h2>${escapeHtml(title)}</h2><span class="badge warn">Records only</span></div>
+      <div class="modal-body grid">
+        <p>This removes job records from the page and prevents them from reappearing after API restart. Runtime logs, metrics files, and training outputs are kept.</p>
+        <div class="command-box grid">
+          <p class="panel-copy">${isDelete ? "Job" : "Statuses"}: ${escapeHtml(statusText || "-")}</p>
+          <p class="panel-copy">Running jobs are not removed. Cancel them first if needed.</p>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button data-modal-cancel type="button">Cancel</button>
+        <button class="danger" data-modal-ok type="button">${isDelete ? "Remove" : "Clear"}</button>
       </div>
     </div>
   `;

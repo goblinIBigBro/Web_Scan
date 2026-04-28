@@ -2277,6 +2277,96 @@ def is_job_terminal(job: Dict[str, Any]) -> bool:
   return str(job.get("status", "")).strip().lower() in TERMINAL_STATUSES
 
 
+def job_log_dir_for_id(job_id: str) -> Path:
+  raw = str(job_id or "").strip()
+  if not raw:
+    raise ValueError("job_id is required")
+  candidate = (JOB_LOG_DIR / raw).resolve()
+  root = JOB_LOG_DIR.resolve()
+  if root == candidate or root not in candidate.parents:
+    raise ValueError(f"Unsafe job log path: {candidate}")
+  return candidate
+
+
+def remove_job_record(job_id: str, *, require_terminal: bool = True) -> Dict[str, Any]:
+  raw = str(job_id or "").strip()
+  if not raw:
+    raise ValueError("job_id is required")
+  job = JOBS.get(raw)
+  if not job:
+    raise KeyError(f"Unknown job: {raw}")
+  if require_terminal and not is_job_terminal(job):
+    raise ValueError("Only completed, failed, or canceled job records can be removed. Cancel running jobs first.")
+
+  log_dir_value = str(job.get("log_dir", "")).strip()
+  try:
+    log_dir = Path(log_dir_value).resolve() if log_dir_value else job_log_dir_for_id(raw)
+  except Exception:
+    log_dir = job_log_dir_for_id(raw)
+  job_log_root = JOB_LOG_DIR.resolve()
+  if log_dir == job_log_root or not path_is_inside(log_dir, job_log_root):
+    raise ValueError(f"Unsafe job log path: {log_dir}")
+
+  state_file = log_dir / JOB_STATE_FILE
+  removed_state_file = False
+  if state_file.exists() and state_file.is_file():
+    state_file.unlink()
+    removed_state_file = True
+
+  removed = JOBS.pop(raw, None)
+  JOB_LOG_LOCKS.pop(raw, None)
+  return {
+    "id": raw,
+    "status": removed.get("status", "") if isinstance(removed, dict) else "",
+    "removed_state_file": removed_state_file,
+    "logs_retained": str(log_dir),
+  }
+
+
+def normalize_clear_statuses(value: Any) -> set[str]:
+  if value in (None, "", []):
+    return set(TERMINAL_STATUSES)
+  if isinstance(value, str):
+    raw_items = [value]
+  elif isinstance(value, list):
+    raw_items = value
+  else:
+    raw_items = []
+
+  statuses: set[str] = set()
+  for item in raw_items:
+    text = str(item or "").strip().lower()
+    if not text:
+      continue
+    if text in {"finished", "terminal", "done"}:
+      statuses.update(TERMINAL_STATUSES)
+    else:
+      statuses.add(text)
+  return {status for status in statuses if status in TERMINAL_STATUSES}
+
+
+def clear_job_records(statuses_value: Any = None) -> Dict[str, Any]:
+  statuses = normalize_clear_statuses(statuses_value)
+  removed: list[Dict[str, Any]] = []
+  skipped: list[Dict[str, str]] = []
+  for job_id, job in list(JOBS.items()):
+    status = str(job.get("status", "")).strip().lower()
+    if status not in statuses:
+      continue
+    if not is_job_terminal(job):
+      skipped.append({"id": job_id, "status": status})
+      continue
+    removed.append(remove_job_record(job_id, require_terminal=True))
+  return {
+    "ok": True,
+    "statuses": sorted(statuses),
+    "removed": removed,
+    "removed_count": len(removed),
+    "skipped": skipped,
+    "remaining": len(JOBS),
+  }
+
+
 def update_job_artifacts(job: Dict[str, Any]) -> None:
   artifacts = read_runtime_artifacts(job.get("output_dir"), job.get("representation"))
   if artifacts.get("metrics"):
@@ -2904,6 +2994,43 @@ class ApiHandler(SimpleHTTPRequestHandler):
       )
       return
 
+    if parsed.path.startswith("/api/jobs/") and parsed.path.endswith("/delete"):
+      parts = parsed.path.strip("/").split("/")
+      job_id = parts[2] if len(parts) >= 3 else ""
+      job = JOBS.get(job_id)
+      if not job:
+        json_response(self, {"ok": False, "error": f"Unknown job: {job_id}"}, status=404)
+        return
+      if not is_job_terminal(job):
+        error_response(
+          self,
+          code="WGSC-JOB-DELETE-RUNNING",
+          step="job",
+          message="Only completed, failed, or canceled job records can be removed. Cancel running jobs first.",
+          status=400,
+          details={"job_id": job_id, "status": job.get("status", "")},
+        )
+        return
+      try:
+        removed = remove_job_record(job_id, require_terminal=True)
+      except Exception as exc:
+        error_response(
+          self,
+          code="WGSC-JOB-DELETE-001",
+          step="job",
+          message=str(exc),
+          status=400,
+          details={"job_id": job_id},
+        )
+        return
+      json_response(self, {
+        "ok": True,
+        "code": "WGSC-JOB-RECORD-REMOVED",
+        "removed": removed,
+        "remaining": len(JOBS),
+      })
+      return
+
     if parsed.path.startswith("/api/jobs/") and parsed.path.endswith("/cancel"):
       parts = parsed.path.strip("/").split("/")
       job_id = parts[2] if len(parts) >= 3 else ""
@@ -3065,17 +3192,17 @@ class ApiHandler(SimpleHTTPRequestHandler):
       return
 
     if parsed.path == "/api/jobs/clear":
-      before = len(JOBS)
-      operation_filter = payload.get("operation", "")
-      if operation_filter:
-        remove_ids = [job_id for job_id, job in JOBS.items() if job.get("operation") == operation_filter]
-        for job_id in remove_ids:
-          JOBS.pop(job_id, None)
-          JOB_LOG_LOCKS.pop(job_id, None)
-      else:
-        JOBS.clear()
-        JOB_LOG_LOCKS.clear()
-      json_response(self, {"ok": True, "cleared": before - len(JOBS), "remaining": len(JOBS)})
+      try:
+        result = clear_job_records(payload.get("statuses"))
+        json_response(self, result)
+      except Exception as exc:
+        error_response(
+          self,
+          code="WGSC-JOBS-CLEAR-001",
+          step="job",
+          message=str(exc),
+          status=400,
+        )
       return
 
     if parsed.path == "/api/export-scene":

@@ -191,6 +191,28 @@ export async function deleteFlowData(apiBaseUrl, payload) {
   return parseJson(response);
 }
 
+export async function clearJobs(apiBaseUrl, payload = {}) {
+  const response = await fetch(withApiBase(apiBaseUrl, "api/jobs/clear"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  return parseJson(response);
+}
+
+export async function deleteJob(apiBaseUrl, jobId) {
+  const response = await fetch(withApiBase(apiBaseUrl, `api/jobs/${jobId}/delete`), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({}),
+  });
+  return parseJson(response);
+}
+
 export async function fetchJobs(apiBaseUrl) {
   const response = await fetch(withApiBase(apiBaseUrl, "api/jobs"));
   return parseJson(response);

@@ -538,6 +538,79 @@ def _download_directory(sftp, remote_dir: str, local_dir: Path) -> Dict[str, Any
   }
 
 
+def _remote_job_paths(remote_output_dir: str) -> Dict[str, str]:
+  job_dir = str(PurePosixPath(remote_output_dir) / ".wgsc_job")
+  return {
+    "job_dir": job_dir,
+    "run_script": str(PurePosixPath(job_dir) / "run.sh"),
+    "runtime_log": str(PurePosixPath(job_dir) / "runtime.log"),
+    "status_file": str(PurePosixPath(job_dir) / "status.json"),
+    "pid_file": str(PurePosixPath(job_dir) / "pid"),
+    "launcher_pid_file": str(PurePosixPath(job_dir) / "launcher_pid"),
+    "exit_code_file": str(PurePosixPath(job_dir) / "exit_code"),
+  }
+
+
+def _write_remote_text(sftp, remote_path: str, content: str) -> None:
+  parent = str(PurePosixPath(remote_path).parent)
+  _sftp_mkdir_p(sftp, parent)
+  with sftp.open(remote_path, "w") as handle:
+    handle.write(content)
+
+
+def _read_remote_text_file(sftp, remote_path: str) -> str:
+  try:
+    with sftp.open(remote_path, "r") as handle:
+      raw = handle.read()
+    if isinstance(raw, bytes):
+      return raw.decode("utf-8", errors="replace")
+    return str(raw or "")
+  except Exception:
+    return ""
+
+
+def _read_remote_log_delta(sftp, remote_path: str, cursor: int) -> Dict[str, Any]:
+  try:
+    stat_result = sftp.stat(remote_path)
+    size = int(getattr(stat_result, "st_size", 0) or 0)
+  except Exception:
+    return {"cursor": cursor, "text": "", "available": False}
+
+  start = max(0, int(cursor or 0))
+  if start > size:
+    start = 0
+
+  try:
+    with sftp.open(remote_path, "rb") as handle:
+      handle.seek(start)
+      raw = handle.read()
+  except Exception:
+    return {"cursor": start, "text": "", "available": False}
+
+  if isinstance(raw, str):
+    raw_bytes = raw.encode("utf-8", errors="replace")
+    text = raw
+  else:
+    raw_bytes = raw or b""
+    text = raw_bytes.decode("utf-8", errors="replace")
+
+  return {
+    "cursor": start + len(raw_bytes),
+    "text": text,
+    "available": True,
+  }
+
+
+def _remote_sparse_test_script(workspace_dir: str) -> str:
+  sparse_dir = str(PurePosixPath(workspace_dir) / "sparse" / "0")
+  marker_path = str(PurePosixPath(workspace_dir) / ".wgsc_colmap_undistorted.ok")
+  return (
+    f"test -f {_quote(marker_path)}"
+    f" && test -d {_quote(sparse_dir)}"
+    f" && [ \"$(find {_quote(sparse_dir)} -maxdepth 1 -type f | wc -l)\" -gt 0 ]"
+  )
+
+
 def _read_stream(stream, channel: str, log_callback: Callable[[str, str], None] | None) -> None:
   for raw_line in iter(stream.readline, ""):
     if raw_line is None:
@@ -720,6 +793,531 @@ def _build_remote_colmap_script(workspace_dir: str) -> str:
     f"touch {_quote(marker_path)}",
   ]
   return _wrap_remote_colmap_headless_script(" && ".join(steps))
+
+
+def _build_remote_detached_run_script(
+  *,
+  validated: Dict[str, Any],
+  job_id: str,
+  family: str,
+  remote_paths: Dict[str, str],
+  remote_job_paths: Dict[str, str],
+  remote_workspace_for_command: str,
+  remote_command: str,
+  auto_colmap: bool,
+  resolved_dataset_id: str,
+  resolved_dataset_name: str,
+  use_existing_remote_dataset: bool,
+) -> str:
+  colmap_script = _build_remote_colmap_script(remote_workspace_for_command)
+  sparse_test = _remote_sparse_test_script(remote_workspace_for_command)
+
+  activate_cmd = str(validated.get("activate_cmd", "")).strip()
+  training_lines = [
+    f"cd {_quote(validated['repo_path'])}",
+  ]
+  if activate_cmd:
+    training_lines.append(activate_cmd)
+  training_lines.append(remote_command)
+  training_body = "\n".join(training_lines)
+
+  return f"""#!/usr/bin/env bash
+set +e
+
+PYTHON_BIN={_quote(validated["python"])}
+JOB_ID={_quote(job_id)}
+FAMILY={_quote(family)}
+JOB_DIR={_quote(remote_job_paths["job_dir"])}
+STATUS_FILE={_quote(remote_job_paths["status_file"])}
+EXIT_CODE_FILE={_quote(remote_job_paths["exit_code_file"])}
+LOG_FILE={_quote(remote_job_paths["runtime_log"])}
+PID_FILE={_quote(remote_job_paths["pid_file"])}
+OUTPUT_DIR={_quote(remote_paths["output_dir"])}
+REMOTE_DATASET_ID={_quote(resolved_dataset_id)}
+REMOTE_DATASET_NAME={_quote(resolved_dataset_name)}
+REMOTE_DATASET_WORKSPACE={_quote(remote_workspace_for_command)}
+REMOTE_COMMAND_TEXT={_quote(remote_command)}
+AUTO_COLMAP={_quote("1" if auto_colmap else "0")}
+USE_EXISTING_REMOTE_DATASET={_quote("1" if use_existing_remote_dataset else "0")}
+
+mkdir -p "$JOB_DIR" "$OUTPUT_DIR"
+echo "$$" > "$PID_FILE"
+
+write_status() {{
+  local status="$1"
+  local stage="$2"
+  local return_code="${{3:-}}"
+  local message="${{4:-}}"
+  WGSC_STATUS="$status" \\
+  WGSC_STAGE="$stage" \\
+  WGSC_RETURN_CODE="$return_code" \\
+  WGSC_MESSAGE="$message" \\
+  WGSC_JOB_ID="$JOB_ID" \\
+  WGSC_FAMILY="$FAMILY" \\
+  WGSC_PID="$$" \\
+  WGSC_LOG_PATH="$LOG_FILE" \\
+  WGSC_OUTPUT_DIR="$OUTPUT_DIR" \\
+  WGSC_DATASET_ID="$REMOTE_DATASET_ID" \\
+  WGSC_DATASET_NAME="$REMOTE_DATASET_NAME" \\
+  WGSC_DATASET_WORKSPACE="$REMOTE_DATASET_WORKSPACE" \\
+  WGSC_REMOTE_COMMAND="$REMOTE_COMMAND_TEXT" \\
+  "$PYTHON_BIN" - "$STATUS_FILE" <<'PY'
+import json
+import os
+import sys
+import time
+
+status_path = sys.argv[1]
+payload = {{
+  "job_id": os.environ.get("WGSC_JOB_ID", ""),
+  "family": os.environ.get("WGSC_FAMILY", ""),
+  "status": os.environ.get("WGSC_STATUS", ""),
+  "stage": os.environ.get("WGSC_STAGE", ""),
+  "pid": os.environ.get("WGSC_PID", ""),
+  "message": os.environ.get("WGSC_MESSAGE", ""),
+  "remote_log_path": os.environ.get("WGSC_LOG_PATH", ""),
+  "remote_output_dir": os.environ.get("WGSC_OUTPUT_DIR", ""),
+  "remote_dataset_id": os.environ.get("WGSC_DATASET_ID", ""),
+  "remote_dataset_name": os.environ.get("WGSC_DATASET_NAME", ""),
+  "remote_dataset_workspace": os.environ.get("WGSC_DATASET_WORKSPACE", ""),
+  "remote_command": os.environ.get("WGSC_REMOTE_COMMAND", ""),
+  "updated_at": time.time(),
+}}
+return_code = os.environ.get("WGSC_RETURN_CODE", "")
+if return_code not in ("", None):
+  try:
+    payload["return_code"] = int(return_code)
+  except Exception:
+    payload["return_code"] = return_code
+os.makedirs(os.path.dirname(status_path), exist_ok=True)
+with open(status_path, "w", encoding="utf-8") as handle:
+  json.dump(payload, handle, ensure_ascii=False, indent=2)
+PY
+}}
+
+finish_with() {{
+  local status="$1"
+  local stage="$2"
+  local return_code="$3"
+  local message="${{4:-}}"
+  echo "$return_code" > "$EXIT_CODE_FILE"
+  write_status "$status" "$stage" "$return_code" "$message"
+  exit "$return_code"
+}}
+
+echo "[Web-GSC] Detached remote job started at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+write_status "running" "remote_detached_running" "" "Remote job is detached. It is safe to close the web page."
+
+if [ "$AUTO_COLMAP" = "1" ]; then
+  if {sparse_test}; then
+    echo "[AutoCOLMAP] Skip: sparse workspace already exists at $REMOTE_DATASET_WORKSPACE"
+  else
+    echo "[AutoCOLMAP] Running remote COLMAP preprocessing"
+    write_status "running" "executing_remote_colmap" "" "Running remote COLMAP preprocessing."
+    {colmap_script}
+    colmap_rc=$?
+    if [ "$colmap_rc" -ne 0 ]; then
+      finish_with "failed" "colmap" "$colmap_rc" "Remote COLMAP preprocessing failed."
+    fi
+    write_status "running" "remote_colmap_completed" "" "Remote COLMAP preprocessing completed."
+  fi
+elif [ "$USE_EXISTING_REMOTE_DATASET" = "1" ]; then
+  echo "[Dataset] Reusing existing remote dataset: $REMOTE_DATASET_ID"
+fi
+
+write_status "running" "executing_remote_command" "" "Running remote training command."
+(
+{training_body}
+)
+train_rc=$?
+if [ "$train_rc" -eq 0 ]; then
+  finish_with "completed" "completed" "$train_rc" "Remote training completed."
+fi
+finish_with "failed" "failed" "$train_rc" "Remote training failed."
+"""
+
+
+def _build_remote_detached_start_command(remote_job_paths: Dict[str, str]) -> str:
+  return (
+    f"mkdir -p {_quote(remote_job_paths['job_dir'])}"
+    f" && rm -f {_quote(remote_job_paths['pid_file'])} {_quote(remote_job_paths['launcher_pid_file'])} "
+    f"{_quote(remote_job_paths['exit_code_file'])} {_quote(remote_job_paths['status_file'])}"
+    f" && chmod +x {_quote(remote_job_paths['run_script'])}"
+    f" && (cd {_quote(remote_job_paths['job_dir'])}"
+    f" && (setsid nohup bash {_quote(remote_job_paths['run_script'])} >> {_quote(remote_job_paths['runtime_log'])} 2>&1 < /dev/null & echo $! > {_quote(remote_job_paths['launcher_pid_file'])}))"
+    " && sleep 0.5"
+  )
+
+
+def start_remote_algorithm_detached(
+  *,
+  remote_config: Dict[str, Any],
+  local_workspace_dir: str,
+  local_output_dir: str,
+  session_id: str,
+  family: str,
+  job_id: str,
+  command_template: str,
+  checkpoint_path: str,
+  input_path: str,
+  source_path: str,
+  auto_colmap: bool = True,
+  dataset_name: str = "",
+  remote_dataset_id: str = "",
+  remote_dataset_path: str = "",
+  use_existing_remote_dataset: bool = False,
+  training_args: Dict[str, Any] | None = None,
+  log_callback: Callable[[str, str], None] | None = None,
+  stage_callback: Callable[[str], None] | None = None,
+  cancel_checker: Callable[[], bool] | None = None,
+) -> Dict[str, Any]:
+  validated = validate_remote_config(remote_config)
+
+  workspace_dir: Path | None = None
+  if not use_existing_remote_dataset:
+    workspace_dir = Path(local_workspace_dir).expanduser().resolve()
+    if not workspace_dir.exists() or not workspace_dir.is_dir():
+      raise RemoteExecutionError(f"Local workspace directory not found: {workspace_dir}")
+
+  output_dir = Path(local_output_dir).expanduser().resolve()
+  output_dir.mkdir(parents=True, exist_ok=True)
+
+  remote_paths = build_remote_paths(
+    workspace_root=validated["workspace_root"],
+    output_root=validated["output_root"],
+    session_id=session_id,
+    family=family,
+    job_id=job_id,
+  )
+  remote_job_paths = _remote_job_paths(remote_paths["output_dir"])
+
+  resolved_dataset_id = str(remote_dataset_id or "").strip()
+  resolved_dataset_name = str(dataset_name or "").strip() or resolved_dataset_id
+
+  if use_existing_remote_dataset:
+    selected_path = str(remote_dataset_path or "").strip()
+    if selected_path:
+      remote_workspace_for_command = str(PurePosixPath(selected_path))
+      if not resolved_dataset_id:
+        resolved_dataset_id = PurePosixPath(remote_workspace_for_command).parent.name
+    elif resolved_dataset_id:
+      remote_workspace_for_command = str(
+        PurePosixPath(validated["workspace_root"]) / "datasets" / family / resolved_dataset_id / "workspace"
+      )
+    else:
+      raise RemoteExecutionError(
+        "No remote dataset was selected. Choose an existing dataset before running this operation.",
+        code_hint="WGSC-STEP5-DATASET-SELECT-001",
+        stage="dataset",
+      )
+  else:
+    resolved_dataset_id = resolved_dataset_id or _normalize_dataset_id(resolved_dataset_name, job_id)
+    resolved_dataset_name = resolved_dataset_name or resolved_dataset_id
+    remote_workspace_for_command = str(
+      PurePosixPath(validated["workspace_root"]) / "datasets" / family / resolved_dataset_id / "workspace"
+    )
+
+  remote_command = command_template.format(
+    input_path=input_path,
+    output_dir=remote_paths["output_dir"],
+    workspace=remote_workspace_for_command,
+    checkpoint_path=checkpoint_path,
+    repo_path=validated["repo_path"],
+    source=source_path or remote_workspace_for_command,
+    **(training_args or {}),
+  )
+
+  format_args = {
+    "input_path": input_path,
+    "output_dir": remote_paths["output_dir"],
+    "workspace": remote_workspace_for_command,
+    "checkpoint_path": checkpoint_path,
+    "repo_path": validated["repo_path"],
+    "source": source_path or remote_workspace_for_command,
+    **(training_args or {}),
+  }
+  try:
+    remote_command = sanitize_formatted_command(command_template, remote_command, format_args)
+  except Exception:
+    pass
+
+  if remote_command.lstrip().startswith("python "):
+    remote_command = f"{validated['python']}{remote_command.lstrip()[len('python') :]}"
+
+  paramiko = _load_paramiko()
+  client = paramiko.SSHClient()
+  client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+  sftp = None
+
+  try:
+    def assert_not_cancelled() -> None:
+      if cancel_checker and cancel_checker():
+        raise RemoteExecutionError(
+          "Remote job was canceled by user.",
+          code_hint="WGSC-JOB-CANCELED",
+          stage="canceled",
+        )
+
+    if stage_callback:
+      stage_callback("connecting")
+    client.connect(
+      hostname=validated["host"],
+      port=validated["port"],
+      username=validated["username"],
+      password=validated["password"],
+      timeout=20,
+      look_for_keys=False,
+      allow_agent=False,
+    )
+
+    sftp = client.open_sftp()
+    assert_not_cancelled()
+
+    if use_existing_remote_dataset:
+      if stage_callback:
+        stage_callback("using_existing_dataset")
+      if not _remote_directory_exists(client, remote_workspace_for_command):
+        raise RemoteExecutionError(
+          f"Selected remote dataset workspace not found: {remote_workspace_for_command}",
+          code_hint="WGSC-STEP5-DATASET-SELECT-001",
+          stage="dataset",
+        )
+      upload_info = {
+        "files": 0,
+        "bytes": 0,
+        "skipped": True,
+      }
+    else:
+      if stage_callback:
+        stage_callback("uploading_workspace")
+      upload_info = _upload_directory(sftp, workspace_dir, remote_paths["workspace_dir"])
+      assert_not_cancelled()
+
+      if stage_callback:
+        stage_callback("saving_named_dataset")
+      remote_dataset_dir = str(PurePosixPath(remote_workspace_for_command).parent)
+      persist_script = (
+        f"mkdir -p {_quote(remote_dataset_dir)}"
+        f" && rm -rf {_quote(remote_workspace_for_command)}"
+        f" && cp -a {_quote(remote_paths['workspace_dir'])} {_quote(remote_workspace_for_command)}"
+      )
+      persist_rc = _run_remote_command_cancellable(
+        client,
+        f"bash -lc {_quote(persist_script)}",
+        log_callback,
+        cancel_checker,
+      )
+      if persist_rc != 0:
+        raise RemoteExecutionError(
+          "Failed to persist named remote dataset workspace.",
+          code_hint="WGSC-STEP5-DATASET-NAME-001",
+          stage="dataset",
+        )
+
+    if stage_callback:
+      stage_callback("starting_detached_remote_job")
+    run_script = _build_remote_detached_run_script(
+      validated=validated,
+      job_id=job_id,
+      family=family,
+      remote_paths=remote_paths,
+      remote_job_paths=remote_job_paths,
+      remote_workspace_for_command=remote_workspace_for_command,
+      remote_command=remote_command,
+      auto_colmap=auto_colmap,
+      resolved_dataset_id=resolved_dataset_id,
+      resolved_dataset_name=resolved_dataset_name,
+      use_existing_remote_dataset=use_existing_remote_dataset,
+    )
+    _write_remote_text(sftp, remote_job_paths["run_script"], run_script)
+    start_command = _build_remote_detached_start_command(remote_job_paths)
+    start_rc = _run_remote_command(
+      client,
+      f"bash -lc {_quote(start_command)}",
+      log_callback,
+    )
+    if start_rc != 0:
+      raise RemoteExecutionError(
+        "Failed to start detached remote job.",
+        code_hint="WGSC-STEP5-REMOTE-DETACH-001",
+        stage="detach",
+      )
+
+    remote_pid = _read_remote_text_file(sftp, remote_job_paths["pid_file"]).strip()
+    launcher_pid = _read_remote_text_file(sftp, remote_job_paths["launcher_pid_file"]).strip()
+    remote_pid = remote_pid or launcher_pid
+    if log_callback:
+      log_callback(
+        "stdout",
+        (
+          f"[Detached] Remote job started in background. PID: {remote_pid or '-'}; "
+          f"log: {remote_job_paths['runtime_log']}\n"
+        ),
+      )
+    if stage_callback:
+      stage_callback("remote_detached_running")
+
+    return {
+      "return_code": None,
+      "remote_detached": True,
+      "safe_to_close_web": True,
+      "monitor_state": "monitoring",
+      "remote_pid": remote_pid,
+      "remote_workspace_dir": remote_workspace_for_command,
+      "remote_output_dir": remote_paths["output_dir"],
+      "remote_job_dir": remote_job_paths["job_dir"],
+      "remote_run_script": remote_job_paths["run_script"],
+      "remote_log_path": remote_job_paths["runtime_log"],
+      "remote_status_path": remote_job_paths["status_file"],
+      "remote_exit_code_path": remote_job_paths["exit_code_file"],
+      "remote_dataset_id": resolved_dataset_id,
+      "remote_dataset_name": resolved_dataset_name,
+      "remote_dataset_workspace": remote_workspace_for_command,
+      "remote_command": remote_command,
+      "upload": upload_info,
+      "download": {"files": 0, "bytes": 0, "pending": True},
+    }
+  finally:
+    try:
+      if sftp is not None:
+        sftp.close()
+    except Exception:
+      pass
+    try:
+      client.close()
+    except Exception:
+      pass
+
+
+def poll_remote_detached_job(
+  *,
+  remote_config: Dict[str, Any],
+  remote_status_path: str,
+  remote_log_path: str,
+  remote_output_dir: str,
+  local_output_dir: str,
+  log_cursor: int = 0,
+  download_output: bool = False,
+) -> Dict[str, Any]:
+  validated = validate_remote_config(remote_config)
+  paramiko = _load_paramiko()
+  client = paramiko.SSHClient()
+  client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+  sftp = None
+  try:
+    client.connect(
+      hostname=validated["host"],
+      port=validated["port"],
+      username=validated["username"],
+      password=validated["password"],
+      timeout=20,
+      look_for_keys=False,
+      allow_agent=False,
+    )
+    sftp = client.open_sftp()
+    status_payload = _read_remote_json_file(sftp, remote_status_path)
+    log_delta = _read_remote_log_delta(sftp, remote_log_path, log_cursor)
+
+    status = str(status_payload.get("status") or "running")
+    stage = str(status_payload.get("stage") or "remote_detached_running")
+    return_code = status_payload.get("return_code")
+    download_info = {"files": 0, "bytes": 0, "pending": True}
+    if download_output and status in {"completed", "failed", "canceled"}:
+      download_info = _download_directory(sftp, remote_output_dir, Path(local_output_dir).expanduser().resolve())
+
+    return {
+      "ok": True,
+      "status": status,
+      "stage": stage,
+      "return_code": return_code,
+      "remote_pid": str(status_payload.get("pid", "")),
+      "message": str(status_payload.get("message", "")),
+      "remote_log_path": str(status_payload.get("remote_log_path") or remote_log_path),
+      "remote_output_dir": str(status_payload.get("remote_output_dir") or remote_output_dir),
+      "remote_dataset_id": str(status_payload.get("remote_dataset_id", "")),
+      "remote_dataset_name": str(status_payload.get("remote_dataset_name", "")),
+      "remote_dataset_workspace": str(status_payload.get("remote_dataset_workspace", "")),
+      "remote_command": str(status_payload.get("remote_command", "")),
+      "log_text": log_delta["text"],
+      "log_cursor": log_delta["cursor"],
+      "log_available": log_delta["available"],
+      "download": download_info,
+    }
+  finally:
+    try:
+      if sftp is not None:
+        sftp.close()
+    except Exception:
+      pass
+    try:
+      client.close()
+    except Exception:
+      pass
+
+
+def cancel_remote_detached_job(
+  *,
+  remote_config: Dict[str, Any],
+  remote_job_dir: str,
+  remote_pid: str = "",
+) -> Dict[str, Any]:
+  validated = validate_remote_config(remote_config)
+  remote_job_paths = {
+    "job_dir": str(remote_job_dir),
+    "pid_file": str(PurePosixPath(remote_job_dir) / "pid"),
+    "exit_code_file": str(PurePosixPath(remote_job_dir) / "exit_code"),
+    "status_file": str(PurePosixPath(remote_job_dir) / "status.json"),
+    "runtime_log": str(PurePosixPath(remote_job_dir) / "runtime.log"),
+  }
+  paramiko = _load_paramiko()
+  client = paramiko.SSHClient()
+  client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+  sftp = None
+  try:
+    client.connect(
+      hostname=validated["host"],
+      port=validated["port"],
+      username=validated["username"],
+      password=validated["password"],
+      timeout=20,
+      look_for_keys=False,
+      allow_agent=False,
+    )
+    sftp = client.open_sftp()
+    resolved_pid = str(remote_pid or "").strip() or _read_remote_text_file(sftp, remote_job_paths["pid_file"]).strip()
+    cancel_script = (
+      f"pid={_quote(resolved_pid)}"
+      f" && if [ -z \"$pid\" ] && [ -f {_quote(remote_job_paths['pid_file'])} ]; then pid=$(cat {_quote(remote_job_paths['pid_file'])}); fi"
+      " && if [ -n \"$pid\" ]; then "
+      "kill -TERM -- -$pid >/dev/null 2>&1 || kill -TERM $pid >/dev/null 2>&1 || true; "
+      "sleep 1; "
+      "kill -KILL -- -$pid >/dev/null 2>&1 || true; "
+      "fi"
+      f" && echo 130 > {_quote(remote_job_paths['exit_code_file'])}"
+      f" && printf '%s\\n' '[Cancel] Detached remote job cancellation requested.' >> {_quote(remote_job_paths['runtime_log'])}"
+    )
+    _run_remote_command(client, f"bash -lc {_quote(cancel_script)}", None)
+    status_payload = {
+      "status": "canceled",
+      "stage": "canceled",
+      "return_code": 130,
+      "pid": resolved_pid,
+      "message": "Detached remote job cancellation requested.",
+      "remote_log_path": remote_job_paths["runtime_log"],
+      "updated_at": time.time(),
+    }
+    _write_remote_text(sftp, remote_job_paths["status_file"], json.dumps(status_payload, ensure_ascii=False, indent=2))
+    return {"ok": True, "remote_pid": resolved_pid, "status": "canceled"}
+  finally:
+    try:
+      if sftp is not None:
+        sftp.close()
+    except Exception:
+      pass
+    try:
+      client.close()
+    except Exception:
+      pass
 
 
 def run_remote_algorithm(

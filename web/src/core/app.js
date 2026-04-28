@@ -14,11 +14,12 @@ import {
   materializeSession,
   prepareColmapWorkspace,
   previewRemoteAlgorithm,
+  reattachRemoteJob,
   remoteCheck,
   runRemoteAlgorithm,
   streamFrame,
   validateAdapter,
-} from "../api/server-client.js";
+} from "../api/server-client.js?v=20260428-detached";
 
 const root = document.getElementById("app-root");
 
@@ -90,6 +91,11 @@ let cameraStream = null;
 let streamTimer = null;
 let busy = false;
 let toastTimer = null;
+let pendingActionKey = "";
+let pressedActionKey = "";
+let pressTimer = null;
+const reattachInFlight = new Set();
+const reattachAttempted = new Set();
 
 const state = loadState();
 
@@ -266,7 +272,7 @@ function formatBytes(bytes) {
 function statusClass(status) {
   const normalized = String(status || "").toLowerCase();
   if (["completed", "ok", "ready", "canceled"].includes(normalized)) return "ok";
-  if (["running", "queued"].includes(normalized)) return "warn";
+  if (["running", "queued", "detached"].includes(normalized)) return "warn";
   if (["failed", "error"].includes(normalized)) return "bad";
   return "";
 }
@@ -344,6 +350,50 @@ function setBusy(next) {
   busy = Boolean(next);
 }
 
+function buttonActionKey(node) {
+  if (!node) return "";
+  if (node.dataset.page) return `page:${node.dataset.page}`;
+  if (!node.dataset.action) return "";
+  const parts = [node.dataset.action];
+  for (const key of ["jobId", "datasetId", "outputDir", "mode"]) {
+    if (node.dataset[key]) parts.push(node.dataset[key]);
+  }
+  return parts.join(":");
+}
+
+function setPressedAction(key) {
+  if (!key) return;
+  pressedActionKey = key;
+  window.clearTimeout(pressTimer);
+  pressTimer = window.setTimeout(() => {
+    pressedActionKey = "";
+    decorateButtonFeedback();
+  }, 1800);
+  decorateButtonFeedback();
+}
+
+function setPendingAction(key) {
+  pendingActionKey = key || "";
+  render();
+  afterRender();
+}
+
+function decorateButtonFeedback() {
+  root.querySelectorAll("button[data-action], button[data-page]").forEach((button) => {
+    const key = buttonActionKey(button);
+    const isPending = key && key === pendingActionKey;
+    const isPressed = key && key === pressedActionKey;
+    button.classList.toggle("is-loading", Boolean(isPending));
+    button.classList.toggle("is-pressed", Boolean(isPressed));
+    if (isPending) {
+      button.setAttribute("aria-busy", "true");
+      button.disabled = true;
+    } else {
+      button.removeAttribute("aria-busy");
+    }
+  });
+}
+
 function showToast(message) {
   const node = document.getElementById("toast");
   if (!node) return;
@@ -369,9 +419,10 @@ function setError(error, fallback = "Action failed") {
   afterRender();
 }
 
-async function guarded(action, fallback) {
+async function guarded(action, fallback, actionKey = "") {
   try {
     setBusy(true);
+    setPendingAction(actionKey);
     state.lastError = null;
     const result = await action();
     persistState();
@@ -383,6 +434,9 @@ async function guarded(action, fallback) {
     return null;
   } finally {
     setBusy(false);
+    pendingActionKey = "";
+    render();
+    afterRender();
   }
 }
 
@@ -989,7 +1043,12 @@ function renderJobsTable(items) {
                 <strong>${escapeHtml(job.algorithm_family || "-")}</strong>
                 <p class="panel-copy">${escapeHtml(summarize(job.id, 18))}</p>
               </td>
-              <td><span class="badge ${statusClass(job.status)}">${escapeHtml(job.status || "-")}</span><p class="panel-copy">${escapeHtml(job.remote_stage || job.operation || "-")}</p></td>
+              <td>
+                <span class="badge ${statusClass(job.status)}">${escapeHtml(job.status || "-")}</span>
+                ${job.safe_to_close_web && !isTerminal(job.status) ? `<span class="badge ok">Safe to close page</span>` : ""}
+                <p class="panel-copy">${escapeHtml(job.remote_stage || job.operation || "-")}</p>
+                ${job.monitor_state === "needs_remote_config" ? `<p class="panel-copy">Waiting for remote reattach.</p>` : ""}
+              </td>
               <td>FPS ${escapeHtml(job.metrics?.fps || "-")}<br />PSNR ${escapeHtml(job.metrics?.psnr || "-")}<br />Loss ${escapeHtml(job.metrics?.loss || "-")}</td>
               <td>${escapeHtml(summarize(job.remote_result?.remote_dataset_id || job.remote_dataset_id || job.dataset_name || "-", 32))}</td>
               <td>
@@ -1020,6 +1079,8 @@ function renderLogPanel() {
         <div>
           <h3>Logs and Metrics</h3>
           <p class="panel-copy">${escapeHtml(job.id)} · ${escapeHtml(job.status || "-")}</p>
+          ${job.safe_to_close_web && !isTerminal(job.status) ? `<p class="status-dot ok">Safe to close page · remote training keeps running.</p>` : ""}
+          ${job.monitor_state === "needs_remote_config" ? `<p class="status-dot warn">Detached remote job needs reattach with the saved remote config.</p>` : ""}
         </div>
         <div class="button-row">
           <a class="button-link ${downloadsEnabled ? "" : "disabled"}" href="${downloadsEnabled ? escapeHtml(logUrl) : "#"}" download>Download Logs</a>
@@ -1227,6 +1288,7 @@ function bindStaticEvents() {
 async function handleClick(event) {
   const pageButton = event.target.closest("[data-page]");
   if (pageButton) {
+    setPressedAction(buttonActionKey(pageButton));
     setPage(pageButton.dataset.page);
     return;
   }
@@ -1236,36 +1298,38 @@ async function handleClick(event) {
   const action = actionNode.dataset.action;
   const jobId = actionNode.dataset.jobId || "";
   if (busy) return;
+  const actionKey = buttonActionKey(actionNode);
+  setPressedAction(actionKey);
 
-  if (action === "refresh-all") await refreshAll();
-  if (action === "refresh-jobs") await guarded(refreshJobs, "Failed to refresh jobs");
-  if (action === "check-runtime") await guarded(checkRuntime, "Environment check failed");
+  if (action === "refresh-all") await refreshAll(actionKey);
+  if (action === "refresh-jobs") await guarded(refreshJobs, "Failed to refresh jobs", actionKey);
+  if (action === "check-runtime") await guarded(checkRuntime, "Environment check failed", actionKey);
   if (action === "select-algorithm") selectAlgorithm(actionNode.dataset.family);
   if (action === "open-dataset-modal") await askDatasetName();
   if (action === "new-capture") newCapture();
-  if (action === "upload-images") await guarded(uploadImages, "Image upload failed");
-  if (action === "materialize-session") await guarded(materializeCurrentSession, "Session materialize failed");
-  if (action === "prepare-colmap") await guarded(prepareCurrentColmap, "COLMAP workspace prep failed");
+  if (action === "upload-images") await guarded(uploadImages, "Image upload failed", actionKey);
+  if (action === "materialize-session") await guarded(materializeCurrentSession, "Session materialize failed", actionKey);
+  if (action === "prepare-colmap") await guarded(prepareCurrentColmap, "COLMAP workspace prep failed", actionKey);
   if (action === "use-dataset") useDataset(actionNode.dataset.datasetId);
-  if (action === "start-camera") await guarded(startCamera, "Failed to start camera");
+  if (action === "start-camera") await guarded(startCamera, "Failed to start camera", actionKey);
   if (action === "stop-camera") stopCamera();
-  if (action === "toggle-stream") await guarded(toggleStream, "Auto upload failed");
+  if (action === "toggle-stream") await guarded(toggleStream, "Auto upload failed", actionKey);
   if (action === "save-remote-config") saveRemoteConfig();
   if (action === "restore-remote-config") restoreRemoteConfig();
-  if (action === "check-remote") await guarded(checkRemote, "Remote precheck failed");
-  if (action === "preview-command") await guarded(previewCommand, "Command preview failed");
-  if (action === "submit-remote") await guarded(submitRemote, "Remote job submission failed");
+  if (action === "check-remote") await guarded(checkRemote, "Remote precheck failed", actionKey);
+  if (action === "preview-command") await guarded(previewCommand, "Command preview failed", actionKey);
+  if (action === "submit-remote") await guarded(submitRemote, "Remote job submission failed", actionKey);
   if (action === "select-job") selectJob(jobId);
-  if (action === "load-log-reset") await guarded(() => loadLog(true), "Failed to load logs");
-  if (action === "cancel-job") await guarded(() => cancelSelectedJob(jobId), "Failed to cancel job");
+  if (action === "load-log-reset") await guarded(() => loadLog(true), "Failed to load logs", actionKey);
+  if (action === "cancel-job") await guarded(() => cancelSelectedJob(jobId), "Failed to cancel job", actionKey);
   if (action === "open-result") openResult(jobId);
   if (action === "open-selected-result") openResult(state.selectedJobId);
   if (action === "rerun-job") rerunJob(jobId);
-  if (action === "load-result") await guarded(loadQuickResult, "Failed to open result");
-  if (action === "load-ply") await guarded(loadQuickResult, "Failed to open result");
-  if (action === "discover-results") await guarded(discoverResults, "Failed to discover results");
+  if (action === "load-result") await guarded(loadQuickResult, "Failed to open result", actionKey);
+  if (action === "load-ply") await guarded(loadQuickResult, "Failed to open result", actionKey);
+  if (action === "discover-results") await guarded(discoverResults, "Failed to discover results", actionKey);
   if (action === "open-discovered-result") openDiscovered(actionNode.dataset.outputDir);
-  if (action === "load-analysis") await guarded(loadAnalysisRows, "Failed to load metrics");
+  if (action === "load-analysis") await guarded(loadAnalysisRows, "Failed to load metrics", actionKey);
   if (action === "set-render-mode") {
     state.renderMode = actionNode.dataset.mode || "ply";
     persistState();
@@ -1340,6 +1404,7 @@ function updateBoundValue(node) {
 }
 
 function afterRender() {
+  decorateButtonFeedback();
   const video = document.getElementById("local-stream");
   if (video && cameraStream) {
     video.srcObject = cameraStream;
@@ -1373,15 +1438,16 @@ function invalidateRemoteState() {
   state.sshChecked = false;
   state.lastPreview = null;
   state.lastError = null;
+  reattachAttempted.clear();
 }
 
-async function refreshAll() {
+async function refreshAll(actionKey = "") {
   await guarded(async () => {
     await Promise.allSettled([refreshHealth(), refreshAlgorithms(), refreshJobs(), discoverResults(false)]);
     if (state.algorithmFamily) {
       await checkRuntime(false);
     }
-  }, "Failed to refresh workbench");
+  }, "Failed to refresh workbench", actionKey);
 }
 
 async function refreshHealth() {
@@ -1427,7 +1493,49 @@ async function refreshJobs() {
   if (!state.selectedJobId && jobs[0]) {
     state.selectedJobId = jobs[0].id;
   }
+  await autoReattachDetachedJobs();
   persistState();
+}
+
+function remoteConfigReadyForReattach() {
+  const remote = state.remoteConfig || {};
+  return Boolean(
+    String(remote.host || "").trim()
+    && String(remote.username || "").trim()
+    && String(remote.password || "").trim()
+    && String(remote.repo_path || "").trim()
+    && String(remote.workspace_root || "").trim()
+    && String(remote.output_root || "").trim(),
+  );
+}
+
+function needsRemoteReattach(job) {
+  if (!job?.remote_detached || isTerminal(job.status)) return false;
+  const monitorState = String(job.monitor_state || "").toLowerCase();
+  const status = String(job.status || "").toLowerCase();
+  return ["needs_remote_config", "disconnected"].includes(monitorState) || ["detached"].includes(status);
+}
+
+async function autoReattachDetachedJobs() {
+  if (!remoteConfigReadyForReattach()) return;
+  const candidates = jobs.filter(needsRemoteReattach);
+  await Promise.all(candidates.map(async (job) => {
+    const key = `${job.id}:${state.remoteConfig.host}:${state.remoteConfig.username}`;
+    if (reattachInFlight.has(key) || reattachAttempted.has(key)) return;
+    reattachInFlight.add(key);
+    try {
+      const data = await reattachRemoteJob(state.apiBaseUrl, job.id, state.remoteConfig);
+      const updated = data.job;
+      if (updated?.id) {
+        jobs = jobs.map((item) => item.id === updated.id ? updated : item);
+        showToast(`Reattached remote monitor: ${updated.id}`);
+      }
+    } catch {
+      reattachAttempted.add(key);
+    } finally {
+      reattachInFlight.delete(key);
+    }
+  }));
 }
 
 async function discoverResults(shouldRender = true) {
@@ -1721,7 +1829,7 @@ async function loadLog(reset = false) {
 async function cancelSelectedJob(jobId) {
   const id = jobId || state.selectedJobId;
   if (!id) return;
-  await cancelJob(state.apiBaseUrl, id);
+  await cancelJob(state.apiBaseUrl, id, state.remoteConfig);
   await refreshJobs();
   await loadLog(false);
   showToast("Cancel requested. Logs and generated outputs will be retained.");

@@ -42,10 +42,12 @@ from web.server.adapter_registry import (
 from web.server.remote_executor import (
   RemoteExecutionError,
   build_remote_paths,
+  cancel_remote_detached_job,
+  poll_remote_detached_job,
   remote_preflight_check,
-  run_remote_algorithm,
   sanitize_remote_config,
   sanitize_formatted_command,
+  start_remote_algorithm_detached,
   validate_remote_config,
 )
 from web.tools.export_scene_package import build_scene_package
@@ -55,6 +57,8 @@ JOB_LOG_LOCKS: Dict[str, threading.Lock] = {}
 MAX_JOB_HISTORY = 300
 MAX_PROCESS_FRAME_COMPLETED_HISTORY = 80
 MAX_METRICS_HISTORY = 5000
+JOB_STATE_FILE = "job.json"
+TERMINAL_STATUSES = {"completed", "failed", "canceled"}
 
 MANUAL_ZH_URL = "/web/WEB_TRAINING_MANUAL_ZH.md"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"}
@@ -193,6 +197,72 @@ def ensure_job_logging(job: Dict[str, Any]) -> None:
 
   if job_id not in JOB_LOG_LOCKS:
     JOB_LOG_LOCKS[job_id] = threading.Lock()
+
+
+def sanitize_job_for_persistence(job: Dict[str, Any]) -> Dict[str, Any]:
+  persisted: Dict[str, Any] = {}
+  for key, value in job.items():
+    if key.startswith("_"):
+      continue
+    if key in {"log_dir", "log_file", "metrics_csv_file"}:
+      continue
+    if key == "remote":
+      if isinstance(value, dict):
+        remote_value = dict(value)
+        if "password" in remote_value:
+          remote_value = sanitize_remote_config(remote_value)
+        else:
+          remote_value.pop("password", None)
+        persisted[key] = remote_value
+      else:
+        persisted[key] = value
+      continue
+    try:
+      json.dumps(value)
+    except TypeError:
+      continue
+    persisted[key] = value
+  if isinstance(persisted.get("remote"), dict):
+    persisted["remote"].pop("password", None)
+  return persisted
+
+
+def persist_job_state(job: Dict[str, Any]) -> None:
+  job_id = str(job.get("id", "")).strip()
+  if not job_id:
+    return
+  ensure_job_logging(job)
+  job_dir = Path(str(job.get("log_dir", "")))
+  if not job_dir:
+    return
+  payload = sanitize_job_for_persistence(job)
+  target = job_dir / JOB_STATE_FILE
+  tmp = job_dir / f".{JOB_STATE_FILE}.tmp"
+  tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+  tmp.replace(target)
+
+
+def load_persisted_jobs() -> None:
+  if not JOB_LOG_DIR.exists():
+    return
+  for state_path in sorted(JOB_LOG_DIR.glob(f"*/{JOB_STATE_FILE}")):
+    try:
+      payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:
+      continue
+    if not isinstance(payload, dict):
+      continue
+    job_id = str(payload.get("id", "")).strip()
+    if not job_id or job_id in JOBS:
+      continue
+    status = str(payload.get("status", "")).strip().lower()
+    if payload.get("remote_detached") and status not in TERMINAL_STATUSES:
+      payload["status"] = "detached"
+      payload["remote_stage"] = "needs_monitor"
+      payload["monitor_state"] = "needs_remote_config"
+      payload["safe_to_close_web"] = True
+    ensure_job_logging(payload)
+    JOBS[job_id] = payload
 
 
 def append_job_log_line(job: Dict[str, Any], channel: str, line: str) -> None:
@@ -1992,6 +2062,103 @@ def prune_job_history() -> None:
       JOB_LOG_LOCKS.pop(job_id, None)
 
 
+def is_job_terminal(job: Dict[str, Any]) -> bool:
+  return str(job.get("status", "")).strip().lower() in TERMINAL_STATUSES
+
+
+def update_job_artifacts(job: Dict[str, Any]) -> None:
+  artifacts = read_runtime_artifacts(job.get("output_dir"), job.get("representation"))
+  if artifacts.get("metrics"):
+    job["metrics"] = {
+      **job.get("metrics", {}),
+      **artifacts["metrics"],
+    }
+  for key in ("manifest_url", "viewer_url", "point_cloud_url", "result_url"):
+    if artifacts.get(key):
+      job[key] = artifacts[key]
+
+
+def apply_remote_poll_result(job: Dict[str, Any], poll_result: Dict[str, Any]) -> None:
+  log_text = str(poll_result.get("log_text", ""))
+  if log_text:
+    append_job_log_line(job, "stdout", log_text)
+  job["remote_log_cursor"] = int(poll_result.get("log_cursor", job.get("remote_log_cursor", 0)) or 0)
+  job["status"] = str(poll_result.get("status") or job.get("status") or "running")
+  job["remote_stage"] = str(poll_result.get("stage") or job.get("remote_stage") or "remote_detached_running")
+  job["monitor_state"] = "monitoring" if not is_job_terminal(job) else "completed"
+  job["safe_to_close_web"] = True
+  if poll_result.get("return_code") not in (None, ""):
+    job["return_code"] = poll_result.get("return_code")
+  if poll_result.get("remote_pid"):
+    job["remote_pid"] = poll_result.get("remote_pid")
+  remote_result = job.setdefault("remote_result", {})
+  for target_key, source_key in (
+    ("remote_output_dir", "remote_output_dir"),
+    ("remote_dataset_id", "remote_dataset_id"),
+    ("remote_dataset_name", "remote_dataset_name"),
+    ("remote_dataset_workspace", "remote_dataset_workspace"),
+  ):
+    if poll_result.get(source_key):
+      remote_result[target_key] = poll_result[source_key]
+  if poll_result.get("download"):
+    remote_result["download"] = poll_result["download"]
+  update_job_artifacts(job)
+  if is_job_terminal(job) and not job.get("finished_at"):
+    job["finished_at"] = time.time()
+
+
+def start_remote_monitor_thread(job: Dict[str, Any], remote_config: Dict[str, Any]) -> None:
+  if job.get("_monitoring"):
+    return
+  job["_monitoring"] = True
+  job["_remote_config"] = dict(remote_config)
+
+  def monitor() -> None:
+    try:
+      while True:
+        if job.get("cancel_requested"):
+          break
+        try:
+          terminal = is_job_terminal(job)
+          poll_result = poll_remote_detached_job(
+            remote_config=remote_config,
+            remote_status_path=str(job.get("remote_status_path", "")),
+            remote_log_path=str(job.get("remote_log_path", "")),
+            remote_output_dir=str(job.get("remote_output_dir", "")),
+            local_output_dir=str(job.get("output_dir", "")),
+            log_cursor=int(job.get("remote_log_cursor", 0) or 0),
+            download_output=terminal,
+          )
+          apply_remote_poll_result(job, poll_result)
+          persist_job_state(job)
+          if is_job_terminal(job):
+            final_poll = poll_remote_detached_job(
+              remote_config=remote_config,
+              remote_status_path=str(job.get("remote_status_path", "")),
+              remote_log_path=str(job.get("remote_log_path", "")),
+              remote_output_dir=str(job.get("remote_output_dir", "")),
+              local_output_dir=str(job.get("output_dir", "")),
+              log_cursor=int(job.get("remote_log_cursor", 0) or 0),
+              download_output=True,
+            )
+            apply_remote_poll_result(job, final_poll)
+            if str(job.get("monitor_state", "")) != "completed":
+              job["monitor_state"] = "completed"
+            persist_job_state(job)
+            break
+        except Exception as exc:  # pragma: no cover - network dependent
+          job["monitor_state"] = "needs_remote_config"
+          job["remote_stage"] = "detached_monitor_disconnected"
+          append_job_log_line(job, "stderr", f"[Monitor] Detached remote monitor disconnected: {exc}\n")
+          persist_job_state(job)
+          break
+        time.sleep(3)
+    finally:
+      job["_monitoring"] = False
+
+  threading.Thread(target=monitor, daemon=True).start()
+
+
 def start_job_thread(job: Dict[str, Any], command: str, cwd: str | None = None) -> None:
   def runner() -> None:
     ensure_job_logging(job)
@@ -2132,6 +2299,8 @@ def start_remote_job_thread(
     job["stdout"] = ""
     job["stderr"] = ""
     job["remote_stage"] = "queued"
+    job["monitor_state"] = "starting"
+    persist_job_state(job)
     combined_log: list[str] = []
 
     def update_artifacts() -> None:
@@ -2155,7 +2324,7 @@ def start_remote_job_thread(
       job["remote_stage"] = stage
 
     try:
-      result = run_remote_algorithm(
+      result = start_remote_algorithm_detached(
         remote_config=remote_config,
         local_workspace_dir=local_workspace_dir or "",
         local_output_dir=local_output_dir,
@@ -2176,7 +2345,17 @@ def start_remote_job_thread(
         stage_callback=on_stage,
         cancel_checker=lambda: bool(job.get("cancel_requested")),
       )
-      job["return_code"] = result.get("return_code", 1)
+      job["remote_detached"] = True
+      job["safe_to_close_web"] = True
+      job["monitor_state"] = result.get("monitor_state", "monitoring")
+      job["remote_pid"] = result.get("remote_pid", "")
+      job["remote_job_dir"] = result.get("remote_job_dir", "")
+      job["remote_run_script"] = result.get("remote_run_script", "")
+      job["remote_log_path"] = result.get("remote_log_path", "")
+      job["remote_status_path"] = result.get("remote_status_path", "")
+      job["remote_exit_code_path"] = result.get("remote_exit_code_path", "")
+      job["remote_output_dir"] = result.get("remote_output_dir", "")
+      job["remote_log_cursor"] = 0
       job["remote_result"] = {
         "remote_workspace_dir": result.get("remote_workspace_dir", ""),
         "remote_output_dir": result.get("remote_output_dir", ""),
@@ -2191,7 +2370,11 @@ def start_remote_job_thread(
         job["status"] = "canceled"
         job["remote_stage"] = "canceled"
       else:
-        job["status"] = "completed" if job["return_code"] == 0 else "failed"
+        job["status"] = "running"
+        job["remote_stage"] = "remote_detached_running"
+        append_job_log_line(job, "stdout", "[Detached] Safe to close page. Remote training will continue on the server.\n")
+        persist_job_state(job)
+        start_remote_monitor_thread(job, remote_config)
     except Exception as exc:  # pragma: no cover - network/runtime dependent
       if job.get("cancel_requested") or getattr(exc, "code_hint", "") == "WGSC-JOB-CANCELED":
         job["status"] = "canceled"
@@ -2202,7 +2385,9 @@ def start_remote_job_thread(
       merged_stderr = f"{job.get('stderr', '').rstrip()}\n{exc}".strip()
       job["stderr"] = merged_stderr[-12000:]
     finally:
-      job["finished_at"] = time.time()
+      if not job.get("remote_detached") or is_job_terminal(job):
+        job["finished_at"] = time.time()
+      persist_job_state(job)
 
   threading.Thread(target=runner, daemon=True).start()
 
@@ -2371,9 +2556,55 @@ class ApiHandler(SimpleHTTPRequestHandler):
         return
 
       job["cancel_requested"] = True
+      append_job_log_line(job, "stderr", "[Cancel] User requested job cancellation.\n")
+      if job.get("remote_detached"):
+        remote_config = payload.get("remote") if isinstance(payload.get("remote"), dict) else job.get("_remote_config")
+        if not isinstance(remote_config, dict) or not str(remote_config.get("password", "")).strip():
+          job["monitor_state"] = "needs_remote_config"
+          persist_job_state(job)
+          error_response(
+            self,
+            code="WGSC-JOB-CANCEL-REMOTE-CONFIG",
+            step="job",
+            message="Remote credentials are required to cancel this detached remote job.",
+            status=400,
+            details={"job_id": job_id},
+          )
+          return
+        try:
+          cancel_remote_detached_job(
+            remote_config=remote_config,
+            remote_job_dir=str(job.get("remote_job_dir", "")),
+            remote_pid=str(job.get("remote_pid", "")),
+          )
+        except Exception as exc:
+          job["cancel_requested"] = False
+          append_job_log_line(job, "stderr", f"[Cancel] Failed to cancel detached remote job: {exc}\n")
+          persist_job_state(job)
+          error_response(
+            self,
+            code=getattr(exc, "code_hint", "") or "WGSC-JOB-CANCEL-REMOTE-001",
+            step="job",
+            message=str(exc),
+            status=500,
+            details={"job_id": job_id},
+          )
+          return
+        job["status"] = "canceled"
+        job["remote_stage"] = "canceled"
+        job["monitor_state"] = "completed"
+        job["return_code"] = 130
+        job["finished_at"] = time.time()
+        persist_job_state(job)
+        json_response(self, {
+          "ok": True,
+          "code": "WGSC-JOB-CANCELED",
+          "job": enrich_job(job),
+        })
+        return
+
       job["status"] = "canceled"
       job["remote_stage"] = "canceled"
-      append_job_log_line(job, "stderr", "[Cancel] User requested job cancellation.\n")
       process = job.get("_process")
       if process is not None:
         try:
@@ -2384,6 +2615,52 @@ class ApiHandler(SimpleHTTPRequestHandler):
       json_response(self, {
         "ok": True,
         "code": "WGSC-JOB-CANCELED",
+        "job": enrich_job(job),
+      })
+      persist_job_state(job)
+      return
+
+    if parsed.path.startswith("/api/jobs/") and parsed.path.endswith("/reattach"):
+      parts = parsed.path.strip("/").split("/")
+      job_id = parts[2] if len(parts) >= 3 else ""
+      job = JOBS.get(job_id)
+      if not job:
+        json_response(self, {"ok": False, "error": f"Unknown job: {job_id}"}, status=404)
+        return
+      if not job.get("remote_detached"):
+        json_response(self, {"ok": True, "job": enrich_job(job), "message": "Job is not detached."})
+        return
+      remote_config = payload.get("remote") if isinstance(payload.get("remote"), dict) else {}
+      if not str(remote_config.get("password", "")).strip():
+        error_response(
+          self,
+          code="WGSC-JOB-REATTACH-REMOTE-CONFIG",
+          step="job",
+          message="Remote credentials are required to reattach detached job monitoring.",
+          status=400,
+          details={"job_id": job_id},
+        )
+        return
+      try:
+        validate_remote_config(remote_config)
+      except RemoteExecutionError as exc:
+        error_response(
+          self,
+          code=exc.code_hint or "WGSC-JOB-REATTACH-CONFIG",
+          step="job",
+          message=str(exc),
+          status=400,
+          details={"stage": exc.stage},
+        )
+        return
+      job["monitor_state"] = "monitoring"
+      job["remote_stage"] = "reattaching_monitor"
+      job["_remote_config"] = dict(remote_config)
+      persist_job_state(job)
+      start_remote_monitor_thread(job, remote_config)
+      json_response(self, {
+        "ok": True,
+        "code": "WGSC-JOB-REATTACHED",
         "job": enrich_job(job),
       })
       return
@@ -2804,6 +3081,9 @@ class ApiHandler(SimpleHTTPRequestHandler):
         "cwd": definition.get("default_cwd", ""),
         "remote": sanitize_remote_config(validated_remote),
         "remote_stage": "queued",
+        "remote_detached": False,
+        "safe_to_close_web": False,
+        "monitor_state": "queued",
         "metrics": {},
         "step_result": {
           "step": "step5",
@@ -2813,6 +3093,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
       }
       ensure_job_logging(job)
       JOBS[job_id] = job
+      persist_job_state(job)
       prune_job_history()
 
       start_remote_job_thread(
@@ -2841,6 +3122,12 @@ class ApiHandler(SimpleHTTPRequestHandler):
           "job": enrich_job(job),
           "materialized": materialized_result,
           "remote_check": preflight_report,
+          "remote_detached": bool(job.get("remote_detached")),
+          "remote_pid": job.get("remote_pid", ""),
+          "remote_log_path": job.get("remote_log_path", ""),
+          "remote_status_path": job.get("remote_status_path", ""),
+          "safe_to_close_web": bool(job.get("safe_to_close_web")),
+          "monitor_state": job.get("monitor_state", "queued"),
         },
         status=202,
       )
@@ -3215,6 +3502,7 @@ def main() -> None:
   parser.add_argument("--port", type=int, default=8080)
   args = parser.parse_args()
 
+  load_persisted_jobs()
   server = ThreadingHTTPServer((args.host, args.port), ApiHandler)
   print(f"Serving web app at http://{args.host}:{args.port}/web/")
   server.serve_forever()

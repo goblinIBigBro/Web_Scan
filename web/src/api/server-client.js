@@ -137,13 +137,24 @@ export async function remoteCheck(apiBaseUrl, payload) {
   return parseJson(response);
 }
 
-export async function cancelJob(apiBaseUrl, jobId) {
+export async function cancelJob(apiBaseUrl, jobId, remote = {}) {
   const response = await fetch(withApiBase(apiBaseUrl, `api/jobs/${jobId}/cancel`), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({}),
+    body: JSON.stringify({ remote }),
+  });
+  return parseJson(response);
+}
+
+export async function reattachRemoteJob(apiBaseUrl, jobId, remote = {}) {
+  const response = await fetch(withApiBase(apiBaseUrl, `api/jobs/${jobId}/reattach`), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ remote }),
   });
   return parseJson(response);
 }

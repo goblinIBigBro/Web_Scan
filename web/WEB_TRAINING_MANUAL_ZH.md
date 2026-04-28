@@ -1,5 +1,14 @@
 # Web 端远程训练操作手册（中文）
 
+## 🆕 重要更新：文件上传问题已修复
+
+**问题**：上传图片后总是提示"选中一张或多张照片"  
+**根因**：页面重新渲染时，文件选择状态丢失  
+**解决**：已升级为在内存中保存文件选择状态，刷新页面不再丢失文件  
+**操作**：清除浏览器缓存（Ctrl+Shift+Delete）后重新访问，或在浏览器地址栏按 Ctrl+R 强制刷新
+
+---
+
 ## 1. 目标与当前能力
 
 本手册对应当前代码实现的流程：
@@ -440,9 +449,9 @@ Remote Connecting -> Remote Uploading -> Remote Training -> Remote Downloading -
 
 ---
 
-## 10. 远程 COLMAP 工作流详解
+## 9. 远程 COLMAP 工作流详解
 
-### 10.1 何时触发 COLMAP
+### 9.1 何时触发 COLMAP
 
 **在以下场景自动触发 COLMAP 预处理**：
 
@@ -455,7 +464,7 @@ Remote Connecting -> Remote Uploading -> Remote Training -> Remote Downloading -
 1. 已上传完整的稀疏重建（camera、images、points 文件都存在）
 2. 使用 FCGS 等不需要 COLMAP 的纯压缩流程（直接输入点云 PLY）
 
-### 10.2 Step 4 验证阶段（远端预检查）
+### 9.2 Step 4 验证阶段（远端预检查）
 
 **点击 `Check SSH` 按钮时执行**：
 
@@ -486,7 +495,7 @@ Remote Connecting -> Remote Uploading -> Remote Training -> Remote Downloading -
 | vglrun | `command -v vglrun` | 可选 | 警告，自动降级到 Xvfb-only |
 | COLMAP 可执行 | `xvfb-run -a colmap feature_extractor -h` | 需要 COLMAP 时必需 | `WGSC-STEP5-COLMAP-TOOL-001` → 检查 COLMAP 安装 |
 
-### 10.3 Step 5 执行阶段（远端运行）
+### 9.3 Step 5 执行阶段（远端运行）
 
 **点击 `One-click Upload and Remote Train` 后的流程**：
 
@@ -653,7 +662,13 @@ dpkg -l | grep virtualgl
 
 ---
 
-## 10. 结果回传与渲染规则
+## 10. 错误代码参考
+
+见上表。
+
+---
+
+## 11. 结果回传与渲染规则
 
 服务端会在本地 output_dir 中识别并返回：
 
@@ -669,7 +684,7 @@ dpkg -l | grep virtualgl
 
 ---
 
-## 11. 安全建议
+## 12. 安全建议
 
 - 当前版本使用账号密码，仅用于受控内网环境。
 - 不要将密码写入版本库。
@@ -677,10 +692,270 @@ dpkg -l | grep virtualgl
 
 ---
 
-## 12. 版本说明
+## 13. 版本说明
 
 本文档对应功能：
 
 - 后端新增 `/api/remote-check` 与结构化错误码响应。
 - `/api/run-remote-algorithm` 从固定 hac-plus-plus 放开为适配器能力驱动。
 - 前端 Step1-5 增加可视化结果卡（成功/失败/错误码）。
+
+---
+
+## 14. 文件上传常见问题与解决方案
+
+### 问题1：上传图片后总是显示"选中一张或多张照片"
+
+**症状**：
+- 选择了图片文件，看到了预览
+- 点击"Upload Selected Photos"后报错"上传前请选中一张或多张照片"
+
+**原因**：
+- 旧版本代码中，页面重新渲染时会重置 input 元素，导致文件选择丢失
+
+**解决方案**（✅ 已在最新版本修复）：
+1. **清除浏览器缓存**：
+   - Windows/Linux：Ctrl + Shift + Delete
+   - Mac：Cmd + Shift + Delete
+   - 选择"全部"并清除
+   
+2. **强制刷新页面**：在浏览器地址栏按 Ctrl+R（或 Cmd+R 在 Mac 上）
+   
+3. **重新访问页面**：关闭所有标签页，重新打开 http://127.0.0.1:8080/web/
+
+4. **如果问题仍然存在**：
+   - 检查浏览器控制台（F12）是否有 JavaScript 错误
+   - 尝试使用无痕窗口（Ctrl+Shift+N）测试
+   - 确认 api_server.py 已启动且显示"Online"
+
+### 问题2：选择文件后页面崩溃或卡住
+
+**症状**：
+- 点击"Select images"选择文件后页面无响应
+- 浏览器标签页变灰或显示加载中
+
+**原因**：
+- 选择大量文件时，预览生成消耗资源过多
+- 浏览器内存不足
+
+**解决方案**：
+1. **分批上传**：一次选择不超过 50 张图片
+2. **优化图片**：确保每张图片不超过 5MB
+3. **清理浏览器**：关闭其他标签页，释放内存
+4. **检查浏览器**：升级到最新版本（Chrome、Firefox、Safari、Edge）
+
+### 问题3：上传后收不到"Uploaded X image(s)"提示
+
+**症状**：
+- 点击上传按钮没有任何反应
+- 页面无错误提示，但也没有成功提示
+
+**原因**：
+- SSH 配置未完成（需先通过 Check SSH）
+- 后端 api_server.py 未启动或崩溃
+- Session ID 为空或不合法
+
+**解决方案**：
+1. **检查 SSH 配置**：
+   ```
+   数据页 -> 在右侧"Remote Training Config"填写所有必需字段 -> 点击"Check SSH"
+   ```
+   
+2. **确认 API 在线**：
+   - 查看页面右上角"Online/Offline"状态
+   - 如显示 Offline，刷新页面
+   - 检查终端是否运行：`python3 web/server/api_server.py`
+
+3. **检查 Session ID**：
+   - 不能为空
+   - 不能包含特殊字符（建议用小写字母+数字+下划线，如 session_demo_001）
+
+4. **查看浏览器控制台**：
+   - 按 F12 打开开发者工具
+   - 切换到"Console"标签
+   - 查看红色错误信息，记录完整错误文本用于排查
+
+### 问题4：预览网格中看不到上传的图片
+
+**症状**：
+- 选择文件后，下面的网格显示"No images selected"
+- 或网格中的图片显示为破损
+
+**原因**：
+- 文件格式不被支持
+- 文件太大导致生成预览失败
+- 浏览器权限问题
+
+**解决方案**：
+1. **检查文件格式**：仅支持 PNG、JPG、JPEG、BMP、GIF、WebP、TIF、TIFF
+   - 其他格式如 RAW、HEIC 需转换为 JPG/PNG
+
+2. **压缩文件大小**：
+   ```bash
+   # Mac/Linux：用 ImageMagick 批量压缩
+   mogrify -resize 50% -quality 80 *.jpg
+   
+   # 或用在线工具：https://tinypng.com/
+   ```
+
+3. **尝试不同浏览器**：有些浏览器对 WebP 等格式的支持差异
+
+### 问题5：上传到远端后提示"远端目录不可写"（WGSC-STEP4-PATH-WRITE-001）
+
+**症状**：
+- Check SSH 时报错"远端目录不可写"
+- Step4 检查失败
+
+**原因**：
+- Remote Workspace Root 或 Remote Output Root 不存在
+- 账号对目录无写权限
+- 远端磁盘已满
+
+**解决方案**：
+1. **SSH 登录远端手动检查**：
+   ```bash
+   ssh user@host -p 22
+   ls -ld /tmp/web_scan/workspaces/
+   touch /tmp/web_scan/workspaces/.test && rm /tmp/web_scan/workspaces/.test
+   ```
+
+2. **如果目录不存在，创建它**：
+   ```bash
+   # 在远端执行
+   mkdir -p /tmp/web_scan/workspaces /tmp/web_scan/outputs
+   chmod 755 /tmp/web_scan/workspaces /tmp/web_scan/outputs
+   ```
+
+3. **检查磁盘空间**：
+   ```bash
+   df -h /tmp  # 至少需要 100GB 可用空间
+   du -sh /tmp/web_scan/  # 查看当前占用
+   ```
+
+4. **在页面中修改路径**：如果 `/tmp` 权限有限，改用 `$HOME/web_scan_data`
+   ```
+   Remote Workspace Root: /home/username/web_scan_data/workspaces
+   Remote Output Root: /home/username/web_scan_data/outputs
+   ```
+
+### 问题6：浏览器自动清理缓存导致文件选择再次丢失
+
+**症状**：
+- 浏览器设置为"关闭时清理数据"
+- 每次打开页面后之前选择的文件都消失
+
+**原因**：
+- 旧版本中文件列表存储在 localStorage，被浏览器清理
+- 新版本虽然改进了，但如果会话被中断仍可能丢失
+
+**解决方案**：
+1. **不要设置关闭浏览器时自动清理**：
+   - Chrome：设置 -> 隐私和安全 -> 清除浏览数据 -> 取消"退出时清除Cookie及其他网站数据"
+   - Firefox：首选项 -> 隐私 -> 关闭 Firefox 时删除Cookie和网站数据
+
+2. **改用本地上传**：
+   - 在数据页选择后立即点击"Upload Selected Photos"，不要关闭浏览器
+   - 如果需要临时中断，点击"Materialize Session"以保存进度
+
+3. **定期备份配置**：
+   ```bash
+   # 导出 localStorage
+   # 在浏览器控制台执行：
+   copy(JSON.stringify(localStorage))
+   ```
+
+---
+
+## 15. 快速诊断流程图
+
+```
+页面显示"选中一张或多张照片"错误
+  │
+  ├─ 是否选择了文件？
+  │  ├─ 否 → 请先选择图片文件
+  │  └─ 是 → 继续下一步
+  │
+  ├─ 浏览器是否显示"Online"？
+  │  ├─ 否 → 1) 检查 api_server.py 是否运行
+  │  │       2) 检查网络（防火墙/VPN）
+  │  └─ 是 → 继续下一步
+  │
+  ├─ 是否完成了"Check SSH"？
+  │  ├─ 否 → 填写 Remote Training Config，点击"Check SSH"
+  │  └─ 是 → 继续下一步
+  │
+  ├─ Check SSH 是否返回"passed"？
+  │  ├─ 否 → 根据错误码查看第9章节的错误代码表
+  │  └─ 是 → 继续下一步
+  │
+  ├─ Session ID 是否为空或包含特殊字符？
+  │  ├─ 是 → 填写合法的 Session ID（如 session_demo_001）
+  │  └─ 否 → 继续下一步
+  │
+  └─ 清除浏览器缓存 + 强制刷新
+     （Ctrl+Shift+Delete 然后 Ctrl+R）
+     如问题仍存在，按 F12 查看控制台错误
+```
+
+---
+
+## 16. 高级调试技巧
+
+### 查看后端实时日志
+
+```bash
+# 终端中启动服务时保持输出可见
+python3 web/server/api_server.py --host 127.0.0.1 --port 8080
+
+# 或在后台运行但可以查看日志
+tail -f /tmp/web_scan_debug.log  # 如果有记录
+```
+
+### 检查浏览器网络请求
+
+1. 打开开发者工具（F12）
+2. 切换到"Network"标签
+3. 执行上传操作
+4. 查看请求列表：
+   - `stream-frame` 请求是否返回 200
+   - Response 中是否有 `error` 字段
+   - 检查 request body 是否包含完整的 image_data
+
+### 重置所有本地存储
+
+```javascript
+// 在浏览器控制台执行
+localStorage.clear();
+sessionStorage.clear();
+location.reload();
+```
+
+### 验证 API 服务健康
+
+```bash
+# 在终端执行
+curl -s http://127.0.0.1:8080/api/health | python -m json.tool
+
+# 应输出类似：
+# {
+#   "ok": true,
+#   "status": "online"
+# }
+```
+
+---
+
+## 17. 反馈与支持
+
+如遇到本文档未覆盖的问题，请提供：
+
+1. **错误代码**（如 WGSC-STEP4-SSH-AUTH-001）
+2. **完整错误信息**（从浏览器控制台或服务器日志复制）
+3. **操作步骤**（能否复现问题）
+4. **系统信息**：
+   - 操作系统及版本
+   - 浏览器类型及版本
+   - Python 版本
+   - 远端系统配置（GPU、CUDA 版本等）
+
+将此信息发送给技术支持团队，以便快速定位问题。

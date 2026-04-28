@@ -137,6 +137,7 @@ function defaultState() {
     logCursor: 0,
     logText: "",
     metricsRows: [],
+    selectedFiles: [],
   };
 }
 
@@ -177,6 +178,7 @@ function loadState() {
       logText: "",
       logCursor: 0,
       lastError: null,
+      selectedFiles: [],
     };
   } catch {
     return base;
@@ -189,6 +191,7 @@ function persistState() {
     logText: "",
     logCursor: 0,
     lastError: null,
+    selectedFiles: [],
     remoteReport: state.remoteReport,
     lastPreview: state.lastPreview,
   };
@@ -1539,7 +1542,9 @@ function handleChange(event) {
     }
   }
   if (node.id === "image-upload-input") {
-    renderSelectedFiles(node.files || []);
+    state.selectedFiles = Array.from(node.files || []);
+    renderSelectedFiles(state.selectedFiles);
+    persistState();
   }
 }
 
@@ -1958,8 +1963,7 @@ async function captureCameraFrame() {
 async function uploadImages(mode = "auto") {
   requireSshReadyForUpload();
   ensureCaptureId();
-  const input = document.getElementById("image-upload-input");
-  const files = Array.from(input?.files || []);
+  const files = mode === "camera" ? [] : state.selectedFiles || [];
   const uploadMode = String(mode || "auto");
   if (uploadMode === "files" && !files.length) {
     throw new Error("Select one or more photos before uploading.");
@@ -1989,6 +1993,7 @@ async function uploadImages(mode = "auto") {
   state.uploadedCount += frames.length;
   state.useExistingRemoteDataset = false;
   state.lastPreview = null;
+  state.selectedFiles = [];
   await refreshFlowData(false);
   showToast(`Uploaded ${frames.length} image(s) to ${state.sessionId}/${state.captureId}`);
 }
@@ -2479,8 +2484,18 @@ async function poll() {
     }
     const editing = document.activeElement?.matches?.("input, textarea, select");
     if (!editing && ["overview", "algorithm", "result", "analysis"].includes(state.activePage)) {
+      const scrollY = window.scrollY;
+      const workspaceFrame = document.querySelector('.workspace-frame');
+      const frameScrollY = workspaceFrame ? workspaceFrame.scrollTop : 0;
+      
       render();
       afterRender();
+      
+      window.scrollTo(0, scrollY);
+      const newWorkspaceFrame = document.querySelector('.workspace-frame');
+      if (newWorkspaceFrame && frameScrollY > 0) {
+        newWorkspaceFrame.scrollTop = frameScrollY;
+      }
     }
   } catch {
     // Keep the UI usable when the backend is temporarily offline.

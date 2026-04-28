@@ -1,13 +1,4 @@
-# Web Remote Training Manual (English)
-
-## 🆕 Important Update: File Upload Issue Fixed
-
-**Problem**: After uploading photos, always shows "Select one or more photos"  
-**Root Cause**: File selection state was lost when the page re-rendered  
-**Solution**: Upgraded to store file selection state in memory; clearing cache and refreshing will resolve this  
-**Operation**: Clear browser cache (Ctrl+Shift+Delete) and refresh (Ctrl+R)
-
----
+# Web Remote Training Manual (EN)
 
 ## 1. Goal and Implemented Scope
 
@@ -27,7 +18,7 @@ Current remote-mode limits:
 
 ---
 
-## 2. Remote Configuration Guide (Capability-Driven)
+## 2. Remote Configuration Guide (HAC++)
 
 ### 2.1 Local controller
 
@@ -45,6 +36,7 @@ python -m pip install paramiko
 - Reachable from the local machine via SSH.
 - The account has write access to the remote workspace and output directories.
 - HAC-plus-main, training scripts, and the runtime environment are ready.
+- For auto COLMAP on a headless Linux host, install `xvfb`/`xvfb-run` and `virtualgl`/`vglrun`; the backend will run COLMAP inside Xvfb and use VirtualGL when available.
 - The remote repo path must be able to run the HAC++ training command directly, for example:
 
 ```bash
@@ -332,7 +324,7 @@ The left workflow is collapsible and state-driven:
 4. Fill Remote Training fields and run Check SSH.
 5. Click One-click Upload and Remote Train (selected operation must have remote template).
 6. Track states:
-   Remote Connecting -> Remote Uploading -> Remote Training -> Remote Downloading -> Remote Completed
+Remote Connecting -> Remote Uploading -> Remote Training -> Remote Downloading -> Remote Completed
 7. After completion, Processed Result auto-switches to viewer or fallback image.
 8. In `System Board -> Job Monitor`, click `View Logs` to jump to `Job Logs and Metrics` and inspect paged metrics, raw log tail, downloads, and quick copy.
 
@@ -439,9 +431,9 @@ Response:
 
 ---
 
-## 9. Remote COLMAP Workflow in Detail
+## 10. Remote COLMAP Workflow in Detail
 
-### 9.1 When COLMAP is triggered
+### 10.1 When COLMAP is triggered
 
 **Auto-triggered in these scenarios**:
 
@@ -454,7 +446,7 @@ Response:
 1. Complete sparse reconstruction already uploaded (camera, images, points files all present)
 2. Using compression-only workflows like FCGS (direct point cloud PLY input)
 
-### 9.2 Step 4 Verification Phase (remote preflight)
+### 10.2 Step 4 Verification Phase (remote preflight)
 
 **Executed when you click `Check SSH` button**:
 
@@ -485,7 +477,7 @@ Local UI (show pass/fail)
 | vglrun | `command -v vglrun` | Optional | Warning, auto-fallback to Xvfb-only |
 | COLMAP executable | `xvfb-run -a colmap feature_extractor -h` | Required for COLMAP | `WGSC-STEP5-COLMAP-TOOL-001` → Check COLMAP installation |
 
-### 9.3 Step 5 Execution Phase (remote run)
+### 10.3 Step 5 Execution Phase (remote run)
 
 **Flow after clicking `One-click Upload and Remote Train`**:
 
@@ -525,7 +517,7 @@ Return results to local
 └─ Metrics log (metrics.csv)
 ```
 
-### 9.4 Environment variable explanation
+### 10.4 Environment variable explanation
 
 **OMP_NUM_THREADS**
 
@@ -542,7 +534,7 @@ Return results to local
 - **Value**: `xcb` (X11 compatible mode)
 - **Purpose**: Force Qt to use X11 backend, avoiding conflicts with Wayland or other display servers
 
-### 9.5 VirtualGL vs Xvfb comparison
+### 10.5 VirtualGL vs Xvfb comparison
 
 | Criterion | VirtualGL mode | Xvfb-only mode |
 |-----------|----------------|----------------|
@@ -552,7 +544,7 @@ Return results to local
 | Use case | Large scenes, GPU-rich | Small scenes, no GPU, demos |
 | Failure rate | Low (mature solution) | Minimal (no GPU drivers) |
 
-### 9.6 Common issues and diagnostics
+### 10.6 Common issues and diagnostics
 
 #### Issue: `qt.qpa.xcb: Could not connect to display`
 
@@ -610,7 +602,7 @@ dpkg -l | grep virtualgl
 - If VirtualGL not installed: System auto-falls back to Xvfb-only, functionality unchanged, just slower
 - To enable GPU forwarding: `sudo apt-get install -y virtualgl`
 
-### 9.7 Performance optimization tips
+### 10.7 Performance optimization tips
 
 1. **Pre-test COLMAP**: Run small dataset COLMAP on remote once to verify environment
 2. **Tune OMP_NUM_THREADS**: Adjust based on CPU cores and available memory
@@ -619,8 +611,6 @@ dpkg -l | grep virtualgl
 5. **Monitor resources**: Run `watch -n 1 'nvidia-smi && free -h'` on remote for real-time stats
 
 ---
-
-## 10. Error Code Reference
 
 | Code | Step | Meaning | Action |
 | --- | --- | --- | --- |
@@ -647,13 +637,13 @@ dpkg -l | grep virtualgl
 
 ---
 
-## 11. Result Return and Rendering Rules
+## 10. Return-and-Render Rules
 
 Server scans local output_dir and emits:
 
 - scene_manifest.json -> manifest_url + viewer_url
 - point_cloud.ply or point_cloud/iteration_x/point_cloud.ply -> point_cloud_url + viewer_url
-- latest.png -> result_url (image fallback)
+- latest.png -> result_url fallback
 - metrics.json -> job.metrics
 
 In addition, server persists job logs at `web/generated/job_logs/<job_id>/`:
@@ -663,7 +653,7 @@ In addition, server persists job logs at `web/generated/job_logs/<job_id>/`:
 
 ---
 
-## 12. Security Notes
+## 11. Security Notes
 
 - Current version uses username/password auth for controlled environments.
 - Do not commit passwords into repository files.
@@ -671,284 +661,10 @@ In addition, server persists job logs at `web/generated/job_logs/<job_id>/`:
 
 ---
 
-## 13. Version Information
+## 12. Version Mapping
 
 This manual corresponds to:
 
-- New backend API: `/api/remote-check` with structured error codes
+- New backend API: `/api/remote-check`
 - `/api/run-remote-algorithm` now supports capability-driven family/operation checks
 - Step1-5 cards now show success/failure with error codes
-- Fixed file upload state management issue in frontend
-- Enhanced troubleshooting documentation and FAQ
-
----
-
-## 14. File Upload FAQ and Solutions
-
-### Issue 1: Upload always shows "Select one or more photos"
-
-**Symptoms**:
-- Selected image files and saw preview
-- Click "Upload Selected Photos" but get error "Select one or more photos before uploading"
-
-**Root Cause**:
-- Old code: page re-render would reset the input element, causing file selection to be lost
-
-**Solution** (✅ Fixed in latest version):
-
-1. **Clear browser cache**:
-   - Windows/Linux: Ctrl + Shift + Delete
-   - Mac: Cmd + Shift + Delete
-   - Select "All" and clear
-   
-2. **Force refresh page**: Press Ctrl+R (or Cmd+R on Mac)
-   
-3. **Revisit page**: Close all tabs and reopen http://127.0.0.1:8080/web/
-
-4. **If issue persists**:
-   - Check browser console (F12) for JavaScript errors
-   - Try private/incognito window (Ctrl+Shift+N)
-   - Confirm api_server.py is running and shows "Online"
-
-### Issue 2: Page freezes or crashes after selecting files
-
-**Symptoms**:
-- Page becomes unresponsive after clicking "Select images"
-- Browser tab grays out or shows loading
-
-**Root Cause**:
-- Selecting too many files consumes excessive preview generation resources
-- Browser runs out of memory
-
-**Solution**:
-
-1. **Batch uploads**: Select no more than 50 images at a time
-2. **Optimize images**: Ensure each image is under 5MB
-3. **Clean browser**: Close other tabs to free memory
-4. **Update browser**: Use latest version (Chrome, Firefox, Safari, Edge)
-
-### Issue 3: No "Uploaded X image(s)" feedback after upload
-
-**Symptoms**:
-- Click upload button with no response
-- No error, but no success message either
-
-**Root Cause**:
-- SSH config incomplete (need to pass "Check SSH" first)
-- Backend api_server.py not running or crashed
-- Session ID empty or invalid
-
-**Solution**:
-
-1. **Check SSH config**:
-   ```
-   Data page → Fill all Remote Training Config fields → Click "Check SSH"
-   ```
-   
-2. **Confirm API online**:
-   - Check page top-right corner for "Online/Offline" status
-   - If Offline, refresh page
-   - Check terminal: `python3 web/server/api_server.py`
-
-3. **Validate Session ID**:
-   - Cannot be empty
-   - No special characters (use lowercase, numbers, underscore like `session_demo_001`)
-
-4. **Check browser console**:
-   - Press F12 to open Developer Tools
-   - Switch to "Console" tab
-   - Look for red error messages and record them for troubleshooting
-
-### Issue 4: Preview grid shows no images
-
-**Symptoms**:
-- After selecting files, grid shows "No images selected"
-- Or images show as broken
-
-**Root Cause**:
-- Unsupported file format
-- File too large to generate preview
-- Browser permission issue
-
-**Solution**:
-
-1. **Check file formats**: Only PNG, JPG, JPEG, BMP, GIF, WebP, TIF, TIFF supported
-   - Other formats (RAW, HEIC) need conversion to JPG/PNG
-
-2. **Compress files**:
-   ```bash
-   # Mac/Linux: use ImageMagick
-   mogrify -resize 50% -quality 80 *.jpg
-   
-   # Or use online tool: https://tinypng.com/
-   ```
-
-3. **Try different browser**: Some browsers have different WebP support
-
-### Issue 5: "Remote directory not writable" error (WGSC-STEP4-PATH-WRITE-001)
-
-**Symptoms**:
-- Check SSH fails with "Remote directory not writable"
-- Step4 check fails
-
-**Root Cause**:
-- Remote Workspace Root or Output Root doesn't exist
-- Account lacks write permission
-- Remote disk full
-
-**Solution**:
-
-1. **SSH into remote and check manually**:
-   ```bash
-   ssh user@host -p 22
-   ls -ld /tmp/web_scan/workspaces/
-   touch /tmp/web_scan/workspaces/.test && rm /tmp/web_scan/workspaces/.test
-   ```
-
-2. **Create directories if missing**:
-   ```bash
-   mkdir -p /tmp/web_scan/workspaces /tmp/web_scan/outputs
-   chmod 755 /tmp/web_scan/workspaces /tmp/web_scan/outputs
-   ```
-
-3. **Check disk space**:
-   ```bash
-   df -h /tmp  # Need at least 100GB free
-   du -sh /tmp/web_scan/  # Check current usage
-   ```
-
-4. **Change paths in UI** if /tmp is restricted:
-   ```
-   Remote Workspace Root: /home/username/web_scan_data/workspaces
-   Remote Output Root: /home/username/web_scan_data/outputs
-   ```
-
-### Issue 6: Browser auto-clears cache, losing file selection
-
-**Symptoms**:
-- Browser set to "Clear data on exit"
-- Previously selected files disappear when reopening page
-
-**Root Cause**:
-- Old version stored file list in localStorage, which gets cleared
-- New version improves this but session interruption can still cause loss
-
-**Solution**:
-
-1. **Disable auto-clear on exit**:
-   - Chrome: Settings → Privacy → Uncheck "Clear cookies and site data when you close Chrome"
-   - Firefox: Preferences → Privacy → Uncheck "Delete cookies and site data when Firefox is closed"
-
-2. **Upload immediately after selection**:
-   - Select files on Data page and immediately click "Upload Selected Photos"
-   - Don't close browser in between
-   - Or click "Materialize Session" to save progress
-
-3. **Backup localStorage**:
-   ```javascript
-   // In browser console, run:
-   copy(JSON.stringify(localStorage))
-   ```
-
----
-
-## 15. Quick Diagnostic Flow
-
-```
-Page shows "Select one or more photos" error
-  │
-  ├─ Did you select files?
-  │  ├─ No → Please select image files first
-  │  └─ Yes → Continue
-  │
-  ├─ Does browser show "Online"?
-  │  ├─ No → 1) Check if api_server.py is running
-  │  │       2) Check network (firewall/VPN)
-  │  └─ Yes → Continue
-  │
-  ├─ Did you pass "Check SSH"?
-  │  ├─ No → Fill Remote Training Config and click "Check SSH"
-  │  └─ Yes → Continue
-  │
-  ├─ Did Check SSH return success?
-  │  ├─ No → Check error code in Section 10
-  │  └─ Yes → Continue
-  │
-  ├─ Is Session ID empty or has special characters?
-  │  ├─ Yes → Use valid Session ID (like session_demo_001)
-  │  └─ No → Continue
-  │
-  └─ Clear browser cache + refresh
-     (Ctrl+Shift+Delete then Ctrl+R)
-     If still stuck, press F12 to check console errors
-```
-
----
-
-## 16. Advanced Debugging Techniques
-
-### View backend real-time logs
-
-```bash
-# Keep output visible when starting service in terminal
-python3 web/server/api_server.py --host 127.0.0.1 --port 8080
-
-# Or tail background logs if configured
-tail -f /tmp/web_scan_debug.log  # if available
-```
-
-### Inspect browser network requests
-
-1. Open Developer Tools (F12)
-2. Switch to "Network" tab
-3. Perform upload operation
-4. Check request list:
-   - Is `stream-frame` returning 200?
-   - Any `error` field in Response?
-   - Does request body contain complete `image_data`?
-
-### Reset all local storage
-
-```javascript
-// Run in browser console:
-localStorage.clear();
-sessionStorage.clear();
-location.reload();
-```
-
-### Verify API service health
-
-```bash
-# Run in terminal:
-curl -s http://127.0.0.1:8080/api/health | python -m json.tool
-
-# Should output something like:
-# {
-#   "ok": true,
-#   "status": "online"
-# }
-```
-
----
-
-## 17. Feedback and Support
-
-If you encounter issues not covered in this manual, please provide:
-
-1. **Error code** (e.g., WGSC-STEP4-SSH-AUTH-001)
-2. **Complete error message** (copy from browser console or server logs)
-3. **Reproduction steps** (can you reliably reproduce?)
-4. **System information**:
-   - OS and version
-   - Browser type and version
-   - Python version
-   - Remote system config (GPU, CUDA version, etc.)
-
-Send this information to the technical support team for faster resolution.
-
----
-
-## Change Log
-
-- **2026-04-28**: Added file upload FAQ, fix verification, and enhanced troubleshooting guide
-- **Previous**: Remote training and job monitoring foundation

@@ -20,7 +20,7 @@ from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from shutil import which
-from typing import Any, Dict
+from typing import Any, Callable, Dict
 from urllib.parse import parse_qs, urlparse
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -1094,6 +1094,217 @@ def file_url_for_path(path: Path, cache_group: str = "files") -> str:
   return "/" + str(cache_path.relative_to(ROOT_DIR)).replace("\\", "/")
 
 
+def safe_generated_child(root: Path, *parts: str) -> Path:
+  root_resolved = root.resolve()
+  candidate = root_resolved
+  for part in parts:
+    raw = str(part or "").strip()
+    if not raw:
+      continue
+    candidate = candidate / raw
+  candidate = candidate.resolve()
+  if root_resolved == candidate or root_resolved not in candidate.parents:
+    raise ValueError(f"Unsafe generated path: {candidate}")
+  return candidate
+
+
+def image_file_paths(directory: Path) -> list[Path]:
+  if not directory.exists() or not directory.is_dir():
+    return []
+  files = [
+    path
+    for path in directory.iterdir()
+    if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+  ]
+  return sorted(files, key=lambda path: (path.stat().st_mtime, path.name))
+
+
+def file_brief(path: Path) -> Dict[str, Any]:
+  stat = path.stat()
+  return {
+    "name": path.name,
+    "path": str(path.resolve()),
+    "url": file_url_for_path(path),
+    "size": stat.st_size,
+    "mtime": stat.st_mtime,
+  }
+
+
+def read_json_if_present(path: Path) -> Dict[str, Any]:
+  if not path.exists() or not path.is_file():
+    return {}
+  try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return data if isinstance(data, dict) else {}
+  except Exception:
+    return {}
+
+
+def inspect_flow_data(session_id: str, capture_id: str = "", family: str = "") -> Dict[str, Any]:
+  resolved_session = str(session_id or "").strip()
+  resolved_capture = str(capture_id or "").strip()
+  resolved_family = str(family or "").strip()
+  if not resolved_session:
+    raise ValueError("session_id is required")
+
+  stream_session_dir = safe_generated_child(STREAM_DIR, resolved_session)
+  dataset_session_dir = safe_generated_child(DATASET_DIR, resolved_session)
+  workspace_session_dir = safe_generated_child(WORKSPACE_DIR, resolved_session)
+
+  captures_root = stream_session_dir / "captures"
+  captures: list[Dict[str, Any]] = []
+  if captures_root.exists() and captures_root.is_dir():
+    for child in sorted(captures_root.iterdir(), key=lambda item: item.name):
+      if not child.is_dir():
+        continue
+      input_dir = child / "input"
+      frames = image_file_paths(input_dir)
+      latest_frame = file_brief(frames[-1]) if frames else None
+      captures.append({
+        "capture_id": child.name,
+        "input_dir": str(input_dir.resolve()),
+        "frame_count": len(frames),
+        "latest_frame": latest_frame,
+        "frames": [file_brief(path) for path in frames[-12:]],
+        "mtime": max((path.stat().st_mtime for path in frames), default=child.stat().st_mtime),
+      })
+
+  selected_capture = None
+  if resolved_capture:
+    selected_capture = next((item for item in captures if item["capture_id"] == resolved_capture), None)
+  if selected_capture is None and captures:
+    selected_capture = sorted(captures, key=lambda item: item.get("mtime", 0), reverse=True)[0]
+    resolved_capture = str(selected_capture.get("capture_id", resolved_capture))
+
+  output_dir = stream_session_dir / "output"
+  output_files = image_file_paths(output_dir)
+  latest_output = file_brief(output_files[-1]) if output_files else None
+
+  dataset_root = dataset_session_dir / "datasets"
+  datasets: list[Dict[str, Any]] = []
+  if dataset_root.exists() and dataset_root.is_dir():
+    for child in sorted(dataset_root.iterdir(), key=lambda item: item.stat().st_mtime if item.exists() else 0, reverse=True):
+      if not child.is_dir():
+        continue
+      manifest_path = child / "capture_session.json"
+      manifest = read_json_if_present(manifest_path)
+      datasets.append({
+        "dataset_id": str(manifest.get("dataset_id") or child.name),
+        "dataset_name": str(manifest.get("dataset_name") or child.name),
+        "capture_id": str(manifest.get("capture_id") or ""),
+        "frame_count": int(manifest.get("frame_count") or 0),
+        "dataset_root": str(child.resolve()),
+        "images_dir": str((child / "images").resolve()),
+        "manifest_url": file_url_for_path(manifest_path) if manifest_path.exists() else "",
+        "generated_at": manifest.get("generated_at") or child.stat().st_mtime,
+      })
+
+  workspace_roots: list[Path] = []
+  if resolved_family:
+    family_root = workspace_session_dir / resolved_family
+    if family_root.exists():
+      workspace_roots.append(family_root)
+  elif workspace_session_dir.exists():
+    workspace_roots = [path for path in workspace_session_dir.iterdir() if path.is_dir()]
+
+  workspaces: list[Dict[str, Any]] = []
+  for root in workspace_roots:
+    for manifest_path in sorted(root.glob("*/workspace_manifest.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+      manifest = read_json_if_present(manifest_path)
+      workspace_root = manifest_path.parent
+      workspaces.append({
+        "dataset_id": str(manifest.get("dataset_id") or workspace_root.name),
+        "dataset_name": str(manifest.get("dataset_name") or workspace_root.name),
+        "family": str(manifest.get("family") or root.name),
+        "capture_id": str(manifest.get("capture_id") or ""),
+        "frame_count": int(manifest.get("frame_count") or 0),
+        "workspace_root": str(workspace_root.resolve()),
+        "input_dir": str((workspace_root / "input").resolve()),
+        "manifest_url": file_url_for_path(manifest_path),
+        "generated_at": manifest.get("generated_at") or manifest_path.stat().st_mtime,
+      })
+
+  return {
+    "ok": True,
+    "session_id": resolved_session,
+    "capture_id": resolved_capture,
+    "family": resolved_family,
+    "capture": {
+      "exists": bool(selected_capture),
+      "current": selected_capture,
+      "captures": captures,
+      "capture_count": len(captures),
+      "frame_count": int(selected_capture.get("frame_count", 0)) if selected_capture else 0,
+    },
+    "upload": {
+      "exists": stream_session_dir.exists(),
+      "stream_dir": str(stream_session_dir),
+      "output_dir": str(output_dir.resolve()),
+      "latest_output": latest_output,
+      "output_count": len(output_files),
+      "uploaded_frame_count": sum(int(item.get("frame_count", 0)) for item in captures),
+    },
+    "session_prep": {
+      "exists": bool(datasets or workspaces),
+      "dataset_count": len(datasets),
+      "workspace_count": len(workspaces),
+      "datasets": datasets,
+      "workspaces": workspaces,
+    },
+  }
+
+
+def delete_flow_data_stage(
+  payload: Dict[str, Any],
+  *,
+  remover: Callable[[Path], None] | None = None,
+  exists: Callable[[Path], bool] | None = None,
+) -> Dict[str, Any]:
+  session_id = str(payload.get("session_id", "")).strip()
+  capture_id = str(payload.get("capture_id", "")).strip()
+  family = str(payload.get("family", "")).strip()
+  stage = str(payload.get("stage", "")).strip().lower()
+  if not session_id:
+    raise ValueError("session_id is required")
+  if stage not in {"capture", "upload", "session_prep", "all_staging"}:
+    raise ValueError("stage must be one of: capture, upload, session_prep, all_staging")
+
+  remover = remover or (lambda path: shutil.rmtree(path))
+  exists = exists or (lambda path: path.exists())
+
+  targets: list[Path] = []
+  stream_session_dir = safe_generated_child(STREAM_DIR, session_id)
+  if stage == "capture":
+    if capture_id:
+      targets.append(safe_generated_child(STREAM_DIR, session_id, "captures", capture_id))
+    else:
+      targets.append(safe_generated_child(STREAM_DIR, session_id, "captures"))
+    targets.append(safe_generated_child(STREAM_DIR, session_id, "output"))
+  elif stage == "upload":
+    targets.append(stream_session_dir)
+  elif stage == "session_prep":
+    targets.append(safe_generated_child(DATASET_DIR, session_id))
+    targets.append(safe_generated_child(WORKSPACE_DIR, session_id))
+  elif stage == "all_staging":
+    targets.extend(flow_temporary_dirs(session_id))
+
+  deleted: list[str] = []
+  for target in targets:
+    if not exists(target):
+      continue
+    remover(target)
+    deleted.append(str(target))
+
+  return {
+    "ok": True,
+    "stage": stage,
+    "session_id": session_id,
+    "capture_id": capture_id,
+    "deleted_paths": deleted,
+    "data": inspect_flow_data(session_id, capture_id, family),
+  }
+
+
 def project_for_family(family: str | None) -> Dict[str, Any] | None:
   normalized = str(family or "").strip().lower()
   if not normalized:
@@ -2159,6 +2370,140 @@ def start_remote_monitor_thread(job: Dict[str, Any], remote_config: Dict[str, An
   threading.Thread(target=monitor, daemon=True).start()
 
 
+def job_matches_flow(job: Dict[str, Any], *, session_id: str, capture_id: str, selected_job_id: str) -> bool:
+  if selected_job_id and str(job.get("id", "")).strip() == selected_job_id:
+    return True
+  if session_id:
+    job_session = str(job.get("session_id") or job.get("stream_session_id") or "").strip()
+    if job_session == session_id:
+      return True
+  if capture_id:
+    job_capture = str(job.get("capture_id", "")).strip()
+    if job_capture == capture_id:
+      return True
+  return False
+
+
+def unfinished_flow_jobs(*, session_id: str, capture_id: str, selected_job_id: str) -> list[Dict[str, Any]]:
+  if not any((session_id, capture_id, selected_job_id)):
+    return []
+  return [
+    job
+    for job in JOBS.values()
+    if not is_job_terminal(job)
+    and job_matches_flow(job, session_id=session_id, capture_id=capture_id, selected_job_id=selected_job_id)
+  ]
+
+
+def cancel_flow_job(job: Dict[str, Any], remote_config: Dict[str, Any] | None = None) -> Dict[str, Any]:
+  if is_job_terminal(job):
+    return {"id": job.get("id", ""), "status": job.get("status", ""), "already_terminal": True}
+
+  append_job_log_line(job, "stderr", "[FlowReset] Canceling unfinished job before restarting upload training.\n")
+  job["cancel_requested"] = True
+
+  if job.get("remote_detached"):
+    if not isinstance(remote_config, dict) or not str(remote_config.get("password", "")).strip():
+      job["monitor_state"] = "needs_remote_config"
+      persist_job_state(job)
+      raise RemoteExecutionError(
+        "Remote credentials are required to cancel detached jobs before resetting the flow.",
+        code_hint="WGSC-FLOW-RESET-REMOTE-CONFIG",
+        stage="flow_reset",
+      )
+    cancel_remote_detached_job(
+      remote_config=remote_config,
+      remote_job_dir=str(job.get("remote_job_dir", "")),
+      remote_pid=str(job.get("remote_pid", "")),
+    )
+  else:
+    process = job.get("_process")
+    if process is not None:
+      try:
+        if process.poll() is None:
+          process.terminate()
+      except Exception as exc:
+        append_job_log_line(job, "stderr", f"[FlowReset] Failed to terminate local process: {exc}\n")
+
+  job["status"] = "canceled"
+  job["remote_stage"] = "flow_reset"
+  job["monitor_state"] = "completed"
+  job["return_code"] = 130
+  job["finished_at"] = time.time()
+  persist_job_state(job)
+  return {"id": job.get("id", ""), "status": "canceled", "remote_detached": bool(job.get("remote_detached"))}
+
+
+def flow_temporary_dirs(session_id: str) -> list[Path]:
+  raw = str(session_id or "").strip()
+  if not raw:
+    return []
+  roots = [STREAM_DIR, DATASET_DIR, WORKSPACE_DIR]
+  candidates: list[Path] = []
+  for root in roots:
+    root_resolved = root.resolve()
+    candidate = (root_resolved / raw).resolve()
+    if root_resolved == candidate or root_resolved not in candidate.parents:
+      raise ValueError(f"Refusing to clean unsafe flow path: {candidate}")
+    candidates.append(candidate)
+  return candidates
+
+
+def cleanup_flow_temporary_dirs(
+  session_id: str,
+  *,
+  remover: Callable[[Path], None] | None = None,
+  exists: Callable[[Path], bool] | None = None,
+) -> list[str]:
+  remover = remover or (lambda path: shutil.rmtree(path))
+  exists = exists or (lambda path: path.exists())
+  cleaned: list[str] = []
+  for path in flow_temporary_dirs(session_id):
+    if not exists(path):
+      continue
+    remover(path)
+    cleaned.append(str(path))
+  return cleaned
+
+
+def reset_flow(payload: Dict[str, Any]) -> Dict[str, Any]:
+  session_id = str(payload.get("session_id", "")).strip()
+  capture_id = str(payload.get("capture_id", "")).strip()
+  selected_job_id = str(payload.get("selected_job_id", "")).strip()
+  cancel_unfinished = bool(payload.get("cancel_unfinished", True))
+  remote_config = payload.get("remote") if isinstance(payload.get("remote"), dict) else {}
+
+  targets = unfinished_flow_jobs(
+    session_id=session_id,
+    capture_id=capture_id,
+    selected_job_id=selected_job_id,
+  )
+  if cancel_unfinished:
+    needs_remote = [job for job in targets if job.get("remote_detached")]
+    if needs_remote and not str(remote_config.get("password", "")).strip():
+      raise RemoteExecutionError(
+        "Remote credentials are required to cancel detached jobs before resetting the flow.",
+        code_hint="WGSC-FLOW-RESET-REMOTE-CONFIG",
+        stage="flow_reset",
+      )
+
+  canceled: list[Dict[str, Any]] = []
+  if cancel_unfinished:
+    for job in targets:
+      canceled.append(cancel_flow_job(job, remote_config))
+
+  cleaned_paths = cleanup_flow_temporary_dirs(session_id)
+  return {
+    "ok": True,
+    "code": "WGSC-FLOW-RESET-OK",
+    "canceled_jobs": canceled,
+    "cleaned_paths": cleaned_paths,
+    "session_id": session_id,
+    "capture_id": capture_id,
+    "reset_scope": str(payload.get("reset_scope", "all")),
+  }
+
+
 def start_job_thread(job: Dict[str, Any], command: str, cwd: str | None = None) -> None:
   def runner() -> None:
     ensure_job_logging(job)
@@ -2432,6 +2777,23 @@ class ApiHandler(SimpleHTTPRequestHandler):
     if parsed.path == "/api/jobs":
       json_response(self, {"jobs": [enrich_job(job) for job in JOBS.values()]})
       return
+    if parsed.path == "/api/flow/data":
+      try:
+        result = inspect_flow_data(
+          session_id=query.get("session_id", [""])[0],
+          capture_id=query.get("capture_id", [""])[0],
+          family=query.get("family", [""])[0],
+        )
+        json_response(self, result)
+      except Exception as exc:
+        error_response(
+          self,
+          code="WGSC-FLOW-DATA-001",
+          step="flow_data",
+          message=str(exc),
+          status=400,
+        )
+      return
     if parsed.path == "/api/results/discover":
       limit = safe_int(query.get("limit", ["30"])[0], 30, minimum=1, maximum=100)
       max_scan_dirs = safe_int(query.get("max_scan_dirs", ["1800"])[0], 1800, minimum=200, maximum=8000)
@@ -2663,6 +3025,43 @@ class ApiHandler(SimpleHTTPRequestHandler):
         "code": "WGSC-JOB-REATTACHED",
         "job": enrich_job(job),
       })
+      return
+
+    if parsed.path == "/api/flow/reset":
+      try:
+        result = reset_flow(payload)
+        json_response(self, result)
+      except RemoteExecutionError as exc:
+        error_response(
+          self,
+          code=exc.code_hint or "WGSC-FLOW-RESET-001",
+          step="flow_reset",
+          message=str(exc),
+          status=400,
+          details={"stage": exc.stage},
+        )
+      except Exception as exc:
+        error_response(
+          self,
+          code="WGSC-FLOW-RESET-001",
+          step="flow_reset",
+          message=str(exc),
+          status=500,
+        )
+      return
+
+    if parsed.path == "/api/flow/data/delete":
+      try:
+        result = delete_flow_data_stage(payload)
+        json_response(self, result)
+      except Exception as exc:
+        error_response(
+          self,
+          code="WGSC-FLOW-DATA-DELETE-001",
+          step="flow_data",
+          message=str(exc),
+          status=400,
+        )
       return
 
     if parsed.path == "/api/jobs/clear":

@@ -2,8 +2,10 @@ import {
   buildJobLogDownloadUrl,
   buildJobMetricsCsvUrl,
   cancelJob,
+  deleteFlowData,
   fetchAlgorithms,
   fetchDiscoveredResults,
+  fetchFlowData,
   fetchEnvironmentCheck,
   fetchHealth,
   fetchJob,
@@ -16,6 +18,7 @@ import {
   previewRemoteAlgorithm,
   reattachRemoteJob,
   remoteCheck,
+  resetFlow,
   runRemoteAlgorithm,
   streamFrame,
   validateAdapter,
@@ -31,8 +34,7 @@ const MODEL_EXTENSIONS = new Set([".ply"]);
 
 const NAV_ITEMS = [
   { id: "overview", label: "Overview" },
-  { id: "data", label: "Off Line" },
-  { id: "realtime", label: "On Line" },
+  { id: "data", label: "Data" },
   { id: "algorithm", label: "Algorithms" },
   { id: "browser", label: "Browser" },
   { id: "analysis", label: "Analysis" },
@@ -42,9 +44,12 @@ const PAGE_ALIASES = {
   train: "algorithm",
   monitor: "algorithm",
   debug: "data",
+  realtime: "data",
   viewer: "browser",
+  "Off Line": "data",
+  "On Line": "data",
   "Remote Data": "data",
-  "Local Upload": "realtime",
+  "Local Upload": "data",
 };
 
 const DEFAULT_REMOTE = {
@@ -120,6 +125,7 @@ function defaultState() {
     selectedJobId: "",
     quickPlyPath: "",
     loadedPly: null,
+    flowData: null,
     remoteConfig: { ...DEFAULT_REMOTE },
     training: { ...DEFAULT_TRAINING },
     sshChecked: false,
@@ -136,6 +142,16 @@ function initialPage() {
   const params = new URLSearchParams(window.location.search);
   const raw = params.get("page") || "overview";
   return PAGE_ALIASES[raw] || raw;
+}
+
+function canonicalizePageUrl() {
+  const params = new URLSearchParams(window.location.search);
+  const raw = params.get("page") || "overview";
+  const resolved = PAGE_ALIASES[raw] || raw;
+  if (raw === resolved) return;
+  const url = new URL(window.location.href);
+  url.searchParams.set("page", resolved);
+  window.history.replaceState({}, "", url);
 }
 
 function loadState() {
@@ -178,12 +194,13 @@ function persistState() {
 }
 
 function setPage(page, options = {}) {
-  state.activePage = page;
+  const resolvedPage = PAGE_ALIASES[page] || page;
+  state.activePage = resolvedPage;
   persistState();
   if (!options.silent) {
     const url = new URL(window.location.href);
-    url.searchParams.set("page", page);
-    if (page !== "result") {
+    url.searchParams.set("page", resolvedPage);
+    if (resolvedPage !== "result") {
       url.searchParams.delete("job");
     }
     window.history.pushState({}, "", url);
@@ -355,7 +372,7 @@ function buttonActionKey(node) {
   if (node.dataset.page) return `page:${node.dataset.page}`;
   if (!node.dataset.action) return "";
   const parts = [node.dataset.action];
-  for (const key of ["jobId", "datasetId", "outputDir", "mode"]) {
+  for (const key of ["jobId", "datasetId", "outputDir", "mode", "stage"]) {
     if (node.dataset[key]) parts.push(node.dataset[key]);
   }
   return parts.join(":");
@@ -618,7 +635,6 @@ function renderCurrentJobSummary() {
 function renderMain() {
   if (state.activePage === "overview") return renderOverviewPage();
   if (state.activePage === "data") return renderDataPage();
-  if (state.activePage === "realtime") return renderRealtimePage();
   if (state.activePage === "algorithm") return renderAlgorithmPage();
   if (state.activePage === "browser") return renderBrowserPage();
   if (state.activePage === "analysis") return renderAnalysisPage();
@@ -675,7 +691,7 @@ function pipelineProgressIndex() {
   if (job?.status === "completed") return 6;
   if (job?.status === "running") return 4;
   if (state.sshChecked) return 3;
-  if (state.uploadedCount > 0 || state.useExistingRemoteDataset) return 2;
+  if (stagedUploadFrameCount() > 0 || state.useExistingRemoteDataset) return 2;
   return 0;
 }
 
@@ -700,39 +716,203 @@ function pipelineHint(label) {
 }
 
 function renderDataPage() {
+  const uploadDisabled = state.sshChecked ? "" : "disabled";
+  const autoUploadDisabled = state.sshChecked || streamTimer ? "" : "disabled";
+  const uploadedFrames = stagedUploadFrameCount();
+  const prepDisabled = state.sshChecked && uploadedFrames ? "" : "disabled";
+  const continueDisabled = uploadedFrames || state.useExistingRemoteDataset ? "" : "disabled";
   return `
     <section class="panel">
       <div class="panel-head">
         <div>
-          <h2>Data Input and Dataset Management</h2>
-          <p class="panel-copy">Phase one keeps only the data selection, upload, remote reuse, and COLMAP state needed for training.</p>
+          <h2>SSH Connection</h2>
+          <p class="panel-copy">Connect to the remote machine before uploading files or camera frames.</p>
         </div>
-        <button data-action="open-dataset-modal" type="button">Name Dataset</button>
+        <span class="badge ${state.sshChecked ? "ok" : "warn"}">${state.sshChecked ? "SSH READY" : "SSH REQUIRED"}</span>
       </div>
-      <div class="card split">
-        <div class="grid">
-          ${renderSessionFields()}
-          ${renderUploadBox()}
-          <div class="button-row">
-            <button class="primary" data-action="upload-images" type="button">Upload to Session</button>
-            <button data-action="new-capture" type="button">New Capture</button>
-          </div>
+      <div class="card grid">
+        ${renderDataPrecheckFields()}
+        ${renderRemoteConfigForm()}
+        <div class="button-row">
+          <button data-action="save-remote-config" type="button">Save Remote Config</button>
+          <button data-action="restore-remote-config" type="button">Restore Last Config</button>
+          <button class="primary" data-action="check-remote" type="button" ${busy ? "disabled" : ""}>SSH / COLMAP Precheck</button>
         </div>
-        <div class="grid">
-          ${renderRemoteDatasetControls()}
-        </div>
+        ${renderRemoteChecks()}
       </div>
     </section>
     <section class="panel">
       <div class="panel-head">
-        <h2>Advanced Data Prep</h2>
-        <span class="badge warn">Debug fallback</span>
+        <div>
+          <h2>Data Upload</h2>
+          <p class="panel-copy">Choose one input method. Photo upload and camera capture write into the same session.</p>
+        </div>
+        <div class="button-row">
+          <button class="primary" data-page="algorithm" type="button" ${continueDisabled}>Continue to Training</button>
+        </div>
       </div>
-      <div class="card grid two">
-        <button data-action="materialize-session" type="button" ${state.uploadedCount ? "" : "disabled"}>Manual Session Materialize</button>
-        <button data-action="prepare-colmap" type="button" ${state.uploadedCount ? "" : "disabled"}>Manual COLMAP Workspace</button>
+      <div class="card grid">
+        ${state.sshChecked ? "" : `<p class="panel-copy">Run SSH / COLMAP Precheck first. Both upload methods unlock after the remote connection succeeds.</p>`}
+        <div class="upload-method-grid">
+          ${renderPhotoUploadCard(uploadDisabled)}
+          ${renderCameraUploadCard(uploadDisabled)}
+        </div>
+        ${renderCurrentFlowData()}
+        <details class="panel pad">
+          <summary>Session and Advanced Data Options</summary>
+          <div class="grid" style="margin-top: 14px;">
+            ${renderSessionFields()}
+            <div class="button-row">
+              <button data-action="open-dataset-modal" type="button">Name Dataset</button>
+              <button data-action="new-capture" type="button">New Capture</button>
+              <button data-action="restart-upload-training" type="button">Restart Upload Training</button>
+            </div>
+            ${renderRemoteDatasetControls()}
+          </div>
+        </details>
       </div>
     </section>
+    <details class="panel">
+      <summary class="panel-head">
+        <h2>Manual Session Prep</h2>
+        <span class="badge ${uploadedFrames ? "ok" : "warn"}">${uploadedFrames ? `${uploadedFrames} frame(s)` : "Waiting for upload"}</span>
+      </summary>
+      <div class="card grid two">
+        <button data-action="materialize-session" type="button" ${prepDisabled}>Manual Session Materialize</button>
+        <button data-action="prepare-colmap" type="button" ${prepDisabled}>Manual COLMAP Workspace</button>
+        <button data-action="toggle-stream" type="button" ${autoUploadDisabled}>${streamTimer ? "Stop Auto Upload" : "Auto Stream Upload"}</button>
+      </div>
+    </details>
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Processing Flow</h2>
+        <span class="badge">${escapeHtml(state.sessionId)}</span>
+      </div>
+      <div class="card step-flow">
+        ${["Capture", "Upload", "Session Prep", "COLMAP", "Train", "Render", "View"].map((label, index) => `
+          <div class="step ${index < pipelineProgressIndex() ? "done" : index === pipelineProgressIndex() ? "active" : ""}">
+            <h3>${label}</h3>
+            <p class="panel-copy">${pipelineHint(label)}</p>
+          </div>
+        `).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function renderPhotoUploadCard(uploadDisabled) {
+  return `
+    <section class="upload-method-card">
+      <div>
+        <p class="eyebrow">Photo Upload</p>
+        <h3>Upload Photos</h3>
+        <p class="panel-copy">Select one or more images, then upload them into this session.</p>
+      </div>
+      ${renderUploadBox()}
+      <button class="primary upload-main-button" data-action="upload-selected-photos" type="button" ${uploadDisabled}>Upload Selected Photos</button>
+    </section>
+  `;
+}
+
+function renderCameraUploadCard(uploadDisabled) {
+  return `
+    <section class="upload-method-card">
+      <div>
+        <p class="eyebrow">Camera Capture</p>
+        <h3>Use Camera</h3>
+        <p class="panel-copy">Start the camera, frame the scene, then upload the current camera frame.</p>
+      </div>
+      <video id="local-stream" class="video-frame camera-frame" autoplay playsinline muted></video>
+      <div class="button-row">
+        <button data-action="start-camera" type="button" ${uploadDisabled}>Start Camera</button>
+        <button data-action="stop-camera" type="button">Stop</button>
+      </div>
+      <button class="primary upload-main-button" data-action="upload-camera-frame" type="button" ${uploadDisabled}>Upload Camera Frame</button>
+      <div>
+        <p class="eyebrow">Result Echo</p>
+        ${renderProcessedResult()}
+      </div>
+    </section>
+  `;
+}
+
+function renderDataPrecheckFields() {
+  return `
+    <div class="form-grid">
+      <label>Algorithm
+        <select data-bind="algorithmFamily">
+          ${algorithms.map((item) => `<option value="${escapeHtml(item.family)}" ${state.algorithmFamily === item.family ? "selected" : ""}>${escapeHtml(item.label || item.family)}</option>`).join("")}
+        </select>
+      </label>
+      <label class="wide">
+        <span><input data-bind="autoColmap" type="checkbox" ${state.autoColmap ? "checked" : ""} /> Run remote COLMAP automatically when sparse/undistorted data is missing</span>
+      </label>
+    </div>
+  `;
+}
+
+function stagedUploadFrameCount() {
+  return Number(state.flowData?.upload?.uploaded_frame_count || state.uploadedCount || 0);
+}
+
+function renderCurrentFlowData() {
+  const data = state.flowData || {};
+  const capture = data.capture || {};
+  const upload = data.upload || {};
+  const prep = data.session_prep || {};
+  const currentCapture = capture.current || {};
+  const latestCapture = currentCapture.latest_frame || null;
+  const capturePath = currentCapture.input_dir || "";
+  const streamPath = upload.stream_dir || "";
+  const dataset = Array.isArray(prep.datasets) ? prep.datasets[0] : null;
+  const workspace = Array.isArray(prep.workspaces) ? prep.workspaces[0] : null;
+  return `
+    <section class="panel pad">
+      <div class="panel-head">
+        <h3>Current Staged Data</h3>
+        <button data-action="refresh-flow-data" type="button">Refresh</button>
+      </div>
+      <div class="flow-stage-grid">
+        ${renderFlowStageCard({
+          stage: "capture",
+          title: "1 Capture",
+          badge: `${Number(capture.frame_count || 0)} frame(s)`,
+          detail: capturePath ? summarize(capturePath, 72) : "No capture input yet.",
+          enabled: Number(capture.frame_count || 0) > 0,
+          preview: latestCapture?.url || "",
+        })}
+        ${renderFlowStageCard({
+          stage: "upload",
+          title: "2 Upload",
+          badge: `${Number(upload.uploaded_frame_count || 0)} uploaded`,
+          detail: streamPath ? summarize(streamPath, 72) : "No stream session yet.",
+          enabled: Boolean(upload.exists),
+          preview: upload.latest_output?.url || "",
+        })}
+        ${renderFlowStageCard({
+          stage: "session_prep",
+          title: "3 Session Prep",
+          badge: `${Number(prep.dataset_count || 0)} dataset / ${Number(prep.workspace_count || 0)} workspace`,
+          detail: summarize(workspace?.workspace_root || dataset?.dataset_root || "No materialized dataset or workspace yet.", 72),
+          enabled: Boolean(prep.exists),
+          preview: "",
+        })}
+      </div>
+    </section>
+  `;
+}
+
+function renderFlowStageCard({ stage, title, badge, detail, enabled, preview }) {
+  return `
+    <article class="selectable-card flow-stage-card">
+      <div class="button-row" style="justify-content: space-between;">
+        <strong>${escapeHtml(title)}</strong>
+        <span class="badge ${enabled ? "ok" : "warn"}">${escapeHtml(badge)}</span>
+      </div>
+      <p class="panel-copy">${escapeHtml(detail)}</p>
+      ${preview ? `<img class="flow-preview" src="${escapeHtml(preview)}" alt="${escapeHtml(title)} preview" />` : ""}
+      <button class="danger" data-action="delete-flow-data" data-stage="${escapeHtml(stage)}" type="button" ${enabled ? "" : "disabled"}>Delete</button>
+    </article>
   `;
 }
 
@@ -755,8 +935,8 @@ function renderSessionFields() {
 function renderUploadBox() {
   return `
     <div class="dropzone">
-      <strong>Select images or capture from camera</strong>
-      <p class="panel-copy">Multiple images are sent one by one through /api/stream-frame for backend compatibility.</p>
+      <strong>Select images</strong>
+      <p class="panel-copy">Multiple images are uploaded into the current session together.</p>
       <input id="image-upload-input" type="file" accept="image/*" multiple />
       <div id="upload-preview-grid" class="preview-grid"></div>
     </div>
@@ -786,7 +966,7 @@ function renderRemoteDatasetControls() {
       <span><input data-bind="autoColmap" type="checkbox" ${state.autoColmap ? "checked" : ""} /> Run remote COLMAP automatically when sparse/undistorted data is missing</span>
     </label>
     <div class="dataset-list">
-      ${datasets.length ? datasets.slice(0, 6).map((item) => renderDatasetCard(item)).join("") : `<p class="panel-copy">Remote datasets appear here after the SSH precheck on the Algorithms page.</p>`}
+      ${datasets.length ? datasets.slice(0, 6).map((item) => renderDatasetCard(item)).join("") : `<p class="panel-copy">Remote datasets appear here after the SSH precheck above.</p>`}
     </div>
   `;
 }
@@ -804,50 +984,6 @@ function renderDatasetCard(dataset) {
       </div>
       <button data-action="use-dataset" data-dataset-id="${escapeHtml(dataset.id || "")}" type="button">Use This Dataset</button>
     </article>
-  `;
-}
-
-function renderRealtimePage() {
-  return `
-    <section class="panel">
-      <div class="panel-head">
-        <div>
-          <h2>Realtime Capture and Result Echo</h2>
-          <p class="panel-copy">Keep camera capture, image upload, automatic streaming, and the processing flow.</p>
-        </div>
-        <span class="badge ok">LIVE READY</span>
-      </div>
-      <div class="card">
-        ${renderUploadBox()}
-        <div class="button-row">
-          <button data-action="start-camera" type="button">Start Camera</button>
-          <button data-action="stop-camera" type="button">Stop</button>
-          <button class="primary" data-action="upload-images" type="button">Send Current Input</button>
-          <button data-action="toggle-stream" type="button">${streamTimer ? "Stop Auto Upload" : "Auto Stream Upload"}</button>
-        </div>
-        <div class="split" style="margin-top: 14px;">
-          <div>
-            <p class="eyebrow">Live Preview</p>
-            <video id="local-stream" class="video-frame" autoplay playsinline muted></video>
-          </div>
-          <div>
-            <p class="eyebrow">Result Echo</p>
-            ${renderProcessedResult()}
-          </div>
-        </div>
-      </div>
-    </section>
-    <section class="panel">
-      <div class="panel-head"><h2>Processing Flow</h2><span class="badge">${state.sessionId}</span></div>
-      <div class="card step-flow">
-        ${["Capture", "Upload", "Session Prep", "COLMAP", "Train", "Render", "View"].map((label, index) => `
-          <div class="step ${index < pipelineProgressIndex() ? "done" : index === pipelineProgressIndex() ? "active" : ""}">
-            <h3>${label}</h3>
-            <p class="panel-copy">${pipelineHint(label)}</p>
-          </div>
-        `).join("")}
-      </div>
-    </section>
   `;
 }
 
@@ -910,6 +1046,7 @@ function renderAlgorithmPage() {
             </div>
             <p class="panel-copy">Note: the password is saved only in this browser localStorage, visible on this machine, and never written to the codebase.</p>
             <div class="button-row">
+              <button data-action="restart-upload-training" type="button">Restart Upload Training</button>
               <button data-action="check-remote" type="button" ${busy ? "disabled" : ""}>SSH / COLMAP Precheck</button>
               <button data-action="preview-command" type="button" ${state.sshChecked ? "" : "disabled"}>Generate Command Preview</button>
               <button class="primary" data-action="submit-remote" type="button" ${canSubmit ? "" : "disabled"}>Submit Remote Job</button>
@@ -1023,7 +1160,7 @@ function canSubmitRemoteJob() {
     if (dataset && !datasetHasColmap(dataset) && !state.autoColmap) return false;
     return Boolean(state.lastPreview);
   }
-  return state.uploadedCount > 0 && Boolean(state.lastPreview);
+  return stagedUploadFrameCount() > 0 && Boolean(state.lastPreview);
 }
 
 function renderJobsTable(items) {
@@ -1278,6 +1415,7 @@ function bindStaticEvents() {
   root.addEventListener("input", handleInput);
   window.addEventListener("popstate", () => {
     state.activePage = initialPage();
+    canonicalizePageUrl();
     const params = new URLSearchParams(window.location.search);
     if (params.get("job")) state.selectedJobId = params.get("job");
     render();
@@ -1307,6 +1445,11 @@ async function handleClick(event) {
   if (action === "select-algorithm") selectAlgorithm(actionNode.dataset.family);
   if (action === "open-dataset-modal") await askDatasetName();
   if (action === "new-capture") newCapture();
+  if (action === "restart-upload-training") await guarded(restartUploadTraining, "Failed to restart upload training", actionKey);
+  if (action === "refresh-flow-data") await guarded(() => refreshFlowData(true), "Failed to refresh staged data", actionKey);
+  if (action === "delete-flow-data") await guarded(() => deleteCurrentFlowData(actionNode.dataset.stage), "Failed to delete staged data", actionKey);
+  if (action === "upload-selected-photos") await guarded(() => uploadImages("files"), "Photo upload failed", actionKey);
+  if (action === "upload-camera-frame") await guarded(() => uploadImages("camera"), "Camera upload failed", actionKey);
   if (action === "upload-images") await guarded(uploadImages, "Image upload failed", actionKey);
   if (action === "materialize-session") await guarded(materializeCurrentSession, "Session materialize failed", actionKey);
   if (action === "prepare-colmap") await guarded(prepareCurrentColmap, "COLMAP workspace prep failed", actionKey);
@@ -1443,7 +1586,7 @@ function invalidateRemoteState() {
 
 async function refreshAll(actionKey = "") {
   await guarded(async () => {
-    await Promise.allSettled([refreshHealth(), refreshAlgorithms(), refreshJobs(), discoverResults(false)]);
+    await Promise.allSettled([refreshHealth(), refreshAlgorithms(), refreshJobs(), discoverResults(false), refreshFlowData(false)]);
     if (state.algorithmFamily) {
       await checkRuntime(false);
     }
@@ -1490,11 +1633,42 @@ async function checkRuntime(shouldRender = true) {
 async function refreshJobs() {
   const data = await fetchJobs(state.apiBaseUrl);
   jobs = data.jobs || [];
-  if (!state.selectedJobId && jobs[0]) {
+  if (state.selectedJobId && !jobs.some((job) => job.id === state.selectedJobId)) {
+    state.selectedJobId = "";
+    state.logText = "";
+    state.logCursor = 0;
+  }
+  if (!state.selectedJobId && jobs[0] && state.activePage !== "data") {
     state.selectedJobId = jobs[0].id;
   }
   await autoReattachDetachedJobs();
   persistState();
+}
+
+function syncFlowData(data) {
+  state.flowData = data || null;
+  const uploadedFrames = Number(data?.upload?.uploaded_frame_count || 0);
+  state.uploadedCount = uploadedFrames;
+  if (data?.capture_id && !state.captureId) {
+    state.captureId = data.capture_id;
+  }
+}
+
+async function refreshFlowData(shouldRender = false) {
+  if (!state.sessionId) return null;
+  const data = await fetchFlowData(state.apiBaseUrl, {
+    sessionId: state.sessionId,
+    captureId: state.captureId,
+    family: state.algorithmFamily,
+  });
+  syncFlowData(data);
+  if (shouldRender) {
+    persistState();
+    render();
+    afterRender();
+    showToast("Staged data refreshed.");
+  }
+  return data;
 }
 
 function remoteConfigReadyForReattach() {
@@ -1566,10 +1740,92 @@ async function askDatasetName() {
 function newCapture() {
   ensureCaptureId(true);
   state.uploadedCount = 0;
+  state.flowData = null;
   state.lastPreview = null;
   persistState();
   render();
   afterRender();
+}
+
+function resetClientStateForUploadTraining() {
+  localStorage.removeItem(STATE_KEY);
+  localStorage.removeItem(REMOTE_KEY);
+  const fresh = defaultState();
+  Object.assign(state, fresh, {
+    activePage: "data",
+    sessionId: `session-${Date.now()}`,
+    captureId: "",
+    datasetName: "",
+    algorithmFamily: "",
+    operation: "train",
+    selectedJobId: "",
+    logText: "",
+    logCursor: 0,
+    flowData: null,
+    lastError: null,
+    lastPreview: null,
+    remoteReport: null,
+  });
+  environmentReport = null;
+  discoveredResults = [];
+  reattachAttempted.clear();
+  reattachInFlight.clear();
+  persistState();
+}
+
+async function restartUploadTraining() {
+  const confirmed = await openResetFlowConfirmModal();
+  if (!confirmed) return;
+  stopCamera();
+  const resetResult = await resetFlow(state.apiBaseUrl, {
+    session_id: state.sessionId,
+    capture_id: state.captureId,
+    selected_job_id: state.selectedJobId,
+    remote: { ...state.remoteConfig },
+    reset_scope: "all",
+    cancel_unfinished: true,
+  });
+  resetClientStateForUploadTraining();
+  const url = new URL(window.location.href);
+  url.searchParams.set("page", "data");
+  url.searchParams.delete("job");
+  window.history.pushState({}, "", url);
+  await refreshAlgorithms();
+  await refreshJobs();
+  state.selectedJobId = "";
+  persistState();
+  render();
+  afterRender();
+  showToast("Current flow cleared. Ready for new upload training.");
+  return resetResult;
+}
+
+function requireSshReadyForUpload() {
+  if (!state.sshChecked) {
+    throw new Error("Run SSH / COLMAP Precheck before uploading data.");
+  }
+}
+
+async function deleteCurrentFlowData(stage) {
+  const normalizedStage = String(stage || "").trim();
+  const confirmed = await openDeleteFlowDataConfirmModal(normalizedStage);
+  if (!confirmed) return null;
+  const result = await deleteFlowData(state.apiBaseUrl, {
+    session_id: state.sessionId,
+    capture_id: state.captureId,
+    family: state.algorithmFamily,
+    stage: normalizedStage,
+  });
+  syncFlowData(result.data);
+  state.lastPreview = null;
+  if (normalizedStage === "capture" || normalizedStage === "upload") {
+    state.captureId = "";
+  }
+  persistState();
+  render();
+  afterRender();
+  showToast("Selected staged data cleared.");
+  return result;
 }
 
 async function startCamera() {
@@ -1637,14 +1893,19 @@ async function captureCameraFrame() {
   };
 }
 
-async function uploadImages() {
+async function uploadImages(mode = "auto") {
+  requireSshReadyForUpload();
   ensureCaptureId();
   const input = document.getElementById("image-upload-input");
   const files = Array.from(input?.files || []);
+  const uploadMode = String(mode || "auto");
+  if (uploadMode === "files" && !files.length) {
+    throw new Error("Select one or more photos before uploading.");
+  }
   if (!state.datasetName) {
     await askDatasetName();
   }
-  const frames = files.length
+  const frames = uploadMode !== "camera" && files.length
     ? await Promise.all(files.map(async (file) => ({
       imageData: await imageFileToDataUrl(file),
       filename: file.name || `upload_${Date.now()}.png`,
@@ -1666,6 +1927,7 @@ async function uploadImages() {
   state.uploadedCount += frames.length;
   state.useExistingRemoteDataset = false;
   state.lastPreview = null;
+  await refreshFlowData(false);
   showToast(`Uploaded ${frames.length} image(s) to ${state.sessionId}/${state.captureId}`);
 }
 
@@ -1685,6 +1947,7 @@ function renderSelectedFiles(files) {
 }
 
 async function materializeCurrentSession() {
+  requireSshReadyForUpload();
   if (!state.datasetName) await askDatasetName();
   const data = await materializeSession(state.apiBaseUrl, {
     session_id: state.sessionId,
@@ -1692,10 +1955,12 @@ async function materializeCurrentSession() {
     dataset_name: datasetNameForPayload(),
     title: datasetNameForPayload(),
   });
+  await refreshFlowData(false);
   showToast(`Materialize completed: ${data.result?.dataset_root || "-"}`);
 }
 
 async function prepareCurrentColmap() {
+  requireSshReadyForUpload();
   if (!state.datasetName) await askDatasetName();
   const data = await prepareColmapWorkspace(state.apiBaseUrl, {
     session_id: state.sessionId,
@@ -1703,6 +1968,7 @@ async function prepareCurrentColmap() {
     dataset_name: datasetNameForPayload(),
     algorithm_family: state.algorithmFamily,
   });
+  await refreshFlowData(false);
   showToast(`COLMAP workspace ready: ${data.result?.workspace_root || "-"}`);
 }
 
@@ -1741,6 +2007,7 @@ async function checkRemote() {
   state.remoteReport = data.result;
   state.sshChecked = true;
   state.lastPreview = null;
+  await refreshFlowData(false);
   showToast("SSH / remote paths / COLMAP precheck passed.");
 }
 
@@ -1757,8 +2024,8 @@ async function previewCommand() {
 }
 
 function validateDatasetReadiness() {
-  if (!state.useExistingRemoteDataset && state.uploadedCount <= 0) {
-    throw new Error("Upload images from the Data or Realtime page before submitting remote training.");
+  if (!state.useExistingRemoteDataset && stagedUploadFrameCount() <= 0) {
+    throw new Error("Upload images from the Data page before submitting remote training.");
   }
   if (state.useExistingRemoteDataset) {
     const dataset = selectedDataset();
@@ -2036,6 +2303,76 @@ function openConfirmModal(preview) {
   });
 }
 
+function openResetFlowConfirmModal() {
+  const layer = document.getElementById("modal-layer");
+  layer.hidden = false;
+  layer.innerHTML = `
+    <div class="modal">
+      <div class="panel-head"><h2>Restart Upload Training</h2><span class="badge warn">Reset current flow</span></div>
+      <div class="modal-body grid">
+        <p>This will cancel unfinished jobs for the current flow, clear current upload/training staging data, and reset all local configuration before starting a new upload training session.</p>
+        <div class="command-box grid">
+          <p class="panel-copy">Session: ${escapeHtml(state.sessionId || "-")}</p>
+          <p class="panel-copy">Capture: ${escapeHtml(state.captureId || "-")}</p>
+          <p class="panel-copy">Selected job: ${escapeHtml(state.selectedJobId || "-")}</p>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button data-modal-cancel type="button">Cancel</button>
+        <button class="danger" data-modal-ok type="button">Restart Upload Training</button>
+      </div>
+    </div>
+  `;
+  return new Promise((resolve) => {
+    layer.querySelector("[data-modal-cancel]").addEventListener("click", () => {
+      layer.hidden = true;
+      resolve(false);
+    });
+    layer.querySelector("[data-modal-ok]").addEventListener("click", () => {
+      layer.hidden = true;
+      resolve(true);
+    });
+  });
+}
+
+function openDeleteFlowDataConfirmModal(stage) {
+  const labels = {
+    capture: "Capture",
+    upload: "Upload",
+    session_prep: "Session Prep",
+  };
+  const label = labels[stage] || "Staged Data";
+  const layer = document.getElementById("modal-layer");
+  layer.hidden = false;
+  layer.innerHTML = `
+    <div class="modal">
+      <div class="panel-head"><h2>Delete ${escapeHtml(label)}</h2><span class="badge warn">Current session only</span></div>
+      <div class="modal-body grid">
+        <p>This clears the selected staged data for the current upload training flow. Job logs and completed outputs are kept.</p>
+        <div class="command-box grid">
+          <p class="panel-copy">Session: ${escapeHtml(state.sessionId || "-")}</p>
+          <p class="panel-copy">Capture: ${escapeHtml(state.captureId || "-")}</p>
+          <p class="panel-copy">Stage: ${escapeHtml(label)}</p>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button data-modal-cancel type="button">Cancel</button>
+        <button class="danger" data-modal-ok type="button">Delete ${escapeHtml(label)}</button>
+      </div>
+    </div>
+  `;
+  return new Promise((resolve) => {
+    layer.querySelector("[data-modal-cancel]").addEventListener("click", () => {
+      layer.hidden = true;
+      resolve(false);
+    });
+    layer.querySelector("[data-modal-ok]").addEventListener("click", () => {
+      layer.hidden = true;
+      resolve(true);
+    });
+  });
+}
+
 async function poll() {
   try {
     await refreshJobs();
@@ -2054,6 +2391,7 @@ async function poll() {
 
 async function bootstrap() {
   bindStaticEvents();
+  canonicalizePageUrl();
   render();
   afterRender();
   await refreshAll();

@@ -474,7 +474,7 @@ Remote Connecting -> Remote Uploading -> Remote Training -> Remote Downloading -
     │  └─ 测试运行：xvfb-run -a colmap feature_extractor -h
     │
     └─ 返回检查结果
-        ↓
+        
 本地 UI（显示通过/失败）
 ```
 

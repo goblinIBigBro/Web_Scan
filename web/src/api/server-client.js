@@ -159,6 +159,38 @@ export async function reattachRemoteJob(apiBaseUrl, jobId, remote = {}) {
   return parseJson(response);
 }
 
+export async function resetFlow(apiBaseUrl, payload) {
+  const response = await fetch(withApiBase(apiBaseUrl, "api/flow/reset"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  return parseJson(response);
+}
+
+export async function fetchFlowData(apiBaseUrl, options = {}) {
+  const params = new URLSearchParams({
+    session_id: options.sessionId || "",
+    capture_id: options.captureId || "",
+    family: options.family || "",
+  });
+  const response = await fetch(withApiBase(apiBaseUrl, `api/flow/data?${params.toString()}`));
+  return parseJson(response);
+}
+
+export async function deleteFlowData(apiBaseUrl, payload) {
+  const response = await fetch(withApiBase(apiBaseUrl, "api/flow/data/delete"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  return parseJson(response);
+}
+
 export async function fetchJobs(apiBaseUrl) {
   const response = await fetch(withApiBase(apiBaseUrl, "api/jobs"));
   return parseJson(response);

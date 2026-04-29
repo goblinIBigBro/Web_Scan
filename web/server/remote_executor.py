@@ -817,6 +817,19 @@ def _build_remote_detached_run_script(
     f"cd {_quote(validated['repo_path'])}",
   ]
   if activate_cmd:
+    training_lines.append("[ -f ~/.bash_profile ] && source ~/.bash_profile 2>/dev/null || true")
+    training_lines.append("[ -f ~/.bashrc ] && source ~/.bashrc 2>/dev/null || true")
+    training_lines.append(
+      '{ if command -v conda >/dev/null 2>&1; then '
+      'eval "$(conda shell.bash hook)" || true; '
+      'elif [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then '
+      'source "$HOME/miniconda3/etc/profile.d/conda.sh" || true; '
+      'elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then '
+      'source "$HOME/anaconda3/etc/profile.d/conda.sh" || true; '
+      'elif [ -f "/opt/conda/etc/profile.d/conda.sh" ]; then '
+      'source "/opt/conda/etc/profile.d/conda.sh" || true; '
+      'fi; }'
+    )
     training_lines.append(activate_cmd)
   training_lines.append(remote_command)
   training_body = "\n".join(training_lines)
@@ -1522,6 +1535,19 @@ def run_remote_algorithm(
       f"cd {_quote(validated['repo_path'])}",
     ]
     if validated["activate_cmd"]:
+      steps.append("[ -f ~/.bash_profile ] && source ~/.bash_profile 2>/dev/null || true")
+      steps.append("[ -f ~/.bashrc ] && source ~/.bashrc 2>/dev/null || true")
+      steps.append(
+        '{ if command -v conda >/dev/null 2>&1; then '
+        'eval "$(conda shell.bash hook)" || true; '
+        'elif [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then '
+        'source "$HOME/miniconda3/etc/profile.d/conda.sh" || true; '
+        'elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then '
+        'source "$HOME/anaconda3/etc/profile.d/conda.sh" || true; '
+        'elif [ -f "/opt/conda/etc/profile.d/conda.sh" ]; then '
+        'source "/opt/conda/etc/profile.d/conda.sh" || true; '
+        'fi; }'
+      )
       steps.append(validated["activate_cmd"])
     steps.append(remote_command)
     remote_script = " && ".join(steps)

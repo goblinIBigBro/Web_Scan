@@ -1615,6 +1615,10 @@ def load_ply_file(ply_path: str, representation: str | None = None) -> Dict[str,
 def _training_format_args(payload: Dict[str, Any]) -> Dict[str, Any]:
   return {
     "iterations": payload.get("iterations", 30_000),
+    "image_folder": payload.get("image_folder", ""),
+    "save_interval": payload.get("save_interval", 10_000),
+    "gpcc_codec_path": payload.get("gpcc_codec_path", os.environ.get("GSC_GPCC_CODEC_PATH", "tmc3")),
+    "fcgs_lmd": payload.get("fcgs_lmd", payload.get("lmd", 1e-4)),
     "voxel_size": payload.get("voxel_size", 0.001),
     "update_init_factor": payload.get("update_init_factor", 16),
     "lmbda": payload.get("lmbda", 0.001),

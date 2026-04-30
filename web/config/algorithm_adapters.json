@@ -356,6 +356,10 @@
       "repo_url": "https://github.com/YihangChen-ee/FCGS",
       "default_cwd": "../FCGS-main",
       "operations": {
+        "train": {
+          "enabled": true,
+          "template": "python ../web/tools/run_fcgs_compgs_pipeline.py --dataset-root {workspace} --output-dir {output_dir} --fcgs-repo {repo_path} --compgs-repo ../CompGS-main --max-iterations {iterations} --lambda-weight {lmbda} --save-interval {save_interval} --image-folder {image_folder} --gpcc-codec-path {gpcc_codec_path} --fcgs-lmd {fcgs_lmd}"
+        },
         "compress": {
           "enabled": true,
           "template": "python encode_single_scene.py --ply_path_from {input_path} --bit_path_to {output_dir}"
@@ -384,7 +388,7 @@
       "operations": {
         "train": {
           "enabled": true,
-          "template": "python Train.py --config {workspace}"
+          "template": "python ../web/tools/run_compgs_training.py --dataset-root {workspace} --output-dir {output_dir} --repo-path {repo_path} --max-iterations {iterations} --lambda-weight {lmbda} --save-interval {save_interval} --image-folder {image_folder} --gpcc-codec-path {gpcc_codec_path}"
         },
         "render": {
           "enabled": true,

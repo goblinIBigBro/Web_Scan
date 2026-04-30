@@ -1,5 +1,97 @@
 # Web Scan 调试与修复记录（中文）
 
+## 2026-04-30 复用远程数据集时 COLMAP 改为可选
+
+本次修改主要解决“选择已有远程数据集训练时，仍被 COLMAP 预检或自动 COLMAP 阻断”的问题。现在新上传图片与复用远程历史数据走不同逻辑：新上传数据仍可自动执行 COLMAP，已有远程数据集会直接作为训练 workspace 使用，不再强制检查或运行 COLMAP。
+
+涉及文件包括：
+
+- `web/server/api_server.py`
+- `web/server/remote_executor.py`
+- `web/src/core/app.js`
+- `web/index.html`
+- `web/styles.css`
+- `web/tools/test_detached_remote.py`
+
+### 1. 后端统一 COLMAP 生效规则
+
+新增统一判断逻辑：
+
+```python
+effective_auto_colmap(auto_colmap, use_existing_remote_dataset)
+effective_colmap_preflight_required(payload)
+```
+
+规则如下：
+
+- `use_existing_remote_dataset=true` 时，即使前端或请求体传入 `auto_colmap=true`，后端也会强制视为 `false`。
+- `/api/remote-check` 的 COLMAP 预检只在“新上传数据 + 自动 COLMAP”场景下启用。
+- `/api/run-remote-algorithm` 与远程任务线程都会复用同一套规则，避免预览、提交、实际执行之间行为不一致。
+
+### 2. 远程执行脚本调整
+
+`web/server/remote_executor.py` 中远程 detached 脚本的 COLMAP 片段改为按场景生成：
+
+- 新上传数据且启用自动 COLMAP：
+  - 若远端 workspace 已有 sparse/undistorted 数据，则跳过；
+  - 否则运行远程 COLMAP 预处理；
+  - 失败时任务进入 `colmap` 失败阶段。
+- 复用已有远程数据集：
+  - 只打印复用数据集提示；
+  - 不注入 `feature_extractor`、`sequential_matcher`、`image_undistorter` 等 COLMAP 命令；
+  - 不进入 `executing_remote_colmap` 阶段。
+
+同时非 detached 的远程执行入口也做了相同保护，确保两条执行路径一致。
+
+### 3. 前端数据来源模式更明确
+
+`web/src/core/app.js` 新增 `effectiveAutoColmap()`，前端展示与提交 payload 都使用真实生效值。
+
+界面调整：
+
+- Data 页面新增数据来源选择：
+  - `New Image Upload`：上传图片，可按需自动或手动 COLMAP；
+  - `Existing Remote Dataset`：直接复用远程 workspace，跳过 COLMAP。
+- 左侧状态栏和训练确认区中的 COLMAP 状态改为：
+  - `Auto for new upload`
+  - `Skipped for existing data`
+  - `Manual`
+- 远程预检按钮文案从 `SSH / COLMAP Precheck` 简化为 `Remote Precheck`，避免误导。
+- 复用已有远程数据集时，不再要求 dataset 必须已有 sparse/undistorted 标记。
+
+### 4. 错误提示与交互反馈增强
+
+前端新增全局错误横幅：
+
+- 操作失败后会显示错误码、错误信息、下一步建议和 details。
+- 错误横幅支持 `Dismiss` 清除。
+- 失败后会弹出 toast，并自动滚动到错误横幅位置，方便定位问题。
+
+按钮反馈也补充了 `source` 维度，数据来源切换按钮能正确显示 pressed/loading 状态。
+
+### 5. 缓存刷新
+
+`web/index.html` 更新静态资源版本号：
+
+- `styles.css?v=20260429-colmap-optional`
+- `app.js?v=20260429-colmap-optional`
+
+用于避免浏览器继续使用旧的前端资源缓存。
+
+### 6. 回归测试补充
+
+`web/tools/test_detached_remote.py` 新增覆盖：
+
+- 复用已有远程数据集时，生成脚本中 `AUTO_COLMAP=0`。
+- 复用已有远程数据集时，脚本不包含 `sequential_matcher`、`feature_extractor`、`executing_remote_colmap`。
+- `effective_auto_colmap()` 与 `effective_colmap_preflight_required()` 在新上传/复用数据两种场景下返回正确结果。
+
+建议验证命令：
+
+```bash
+python3 web/tools/test_detached_remote.py
+```
+
 ## 2026-04-27 结果浏览与项目成果加载手册补充
 
 本次项目修改主要围绕“训练结果如何快速打开、发现、回看”展开，同时补充了 COLMAP 匹配策略和界面可读性调整。涉及文件包括：

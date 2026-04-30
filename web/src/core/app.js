@@ -133,6 +133,8 @@ function defaultState() {
     sshChecked: false,
     remoteReport: null,
     lastPreview: null,
+    commandReviewEditing: false,
+    commandDraft: "",
     lastError: null,
     logCursor: 0,
     logText: "",
@@ -179,6 +181,8 @@ function loadState() {
       logCursor: 0,
       lastError: null,
       selectedFiles: [],
+      commandReviewEditing: false,
+      commandDraft: "",
     };
   } catch {
     return base;
@@ -1212,18 +1216,30 @@ function renderCommandPreview() {
       </section>
     `;
   }
+  const editableCommand = preview.command_override || preview.remote_command || preview.shell_command || "";
+  const commandDraft = state.commandDraft || editableCommand;
+  const commandMarkup = state.commandReviewEditing
+    ? `<textarea class="command-editor" data-command-draft spellcheck="false">${escapeHtml(commandDraft)}</textarea>`
+    : `<pre>${escapeHtml(editableCommand)}</pre>`;
   return `
     <section class="panel pad">
       <div class="button-row" style="justify-content: space-between;">
         <h3>Command Review</h3>
-        <span class="badge ok">Preview Ready</span>
+        <div class="button-row">
+          ${preview.command_override ? `<span class="badge warn">Edited</span>` : `<span class="badge ok">Preview Ready</span>`}
+          ${
+            state.commandReviewEditing
+              ? `<button class="primary" data-action="confirm-command-edit" type="button">确定</button>`
+              : `<button data-action="edit-command" type="button">修改</button>`
+          }
+        </div>
       </div>
       <div class="command-box grid" style="margin-top: 12px;">
         <p class="panel-copy">Remote Workspace: ${escapeHtml(preview.remote_workspace)}</p>
         <p class="panel-copy">Remote Output: ${escapeHtml(preview.remote_output_dir)}</p>
         <p class="panel-copy">Local Output: ${escapeHtml(preview.local_output_dir)}</p>
         ${preview.missing_inputs?.length ? `<p class="badge bad">Missing template inputs: ${escapeHtml(preview.missing_inputs.join(", "))}</p>` : `<p class="badge ok">Template inputs complete</p>`}
-        <pre>${escapeHtml(preview.shell_command || preview.remote_command || "")}</pre>
+        ${commandMarkup}
       </div>
     </section>
   `;
@@ -1558,6 +1574,8 @@ async function handleClick(event) {
   if (action === "restore-remote-config") restoreRemoteConfig();
   if (action === "check-remote") await guarded(checkRemote, "Remote precheck failed", actionKey);
   if (action === "preview-command") await guarded(previewCommand, "Command preview failed", actionKey);
+  if (action === "edit-command") editCommandPreview();
+  if (action === "confirm-command-edit") confirmCommandPreviewEdit();
   if (action === "submit-remote") await guarded(submitRemote, "Remote job submission failed", actionKey);
   if (action === "select-job") selectJob(jobId);
   if (action === "clear-jobs") await guarded(() => clearJobRecords(actionNode.dataset.statuses), "Failed to clear jobs", actionKey);
@@ -1594,6 +1612,10 @@ function handleInput(event) {
   if (node.matches("[data-training]")) {
     state.training[node.dataset.training] = Number(node.value);
     state.lastPreview = null;
+    persistState();
+  }
+  if (node.matches("[data-command-draft]")) {
+    state.commandDraft = node.value;
     persistState();
   }
 }
@@ -2191,8 +2213,40 @@ async function previewCommand() {
   const payload = buildRunPayload();
   const data = await previewRemoteAlgorithm(state.apiBaseUrl, payload);
   state.lastPreview = data.preview;
+  state.commandReviewEditing = false;
+  state.commandDraft = "";
   state.outputDir = data.preview?.local_output_dir || state.outputDir;
   showToast("Command preview generated.");
+}
+
+function editCommandPreview() {
+  if (!state.lastPreview) return;
+  state.commandDraft = state.lastPreview.command_override || state.lastPreview.remote_command || state.lastPreview.shell_command || "";
+  state.commandReviewEditing = true;
+  persistState();
+  render();
+  afterRender();
+}
+
+function confirmCommandPreviewEdit() {
+  if (!state.lastPreview) return;
+  const editor = document.querySelector("[data-command-draft]");
+  const command = String(editor?.value ?? state.commandDraft ?? "").trim();
+  if (!command) {
+    setError(new Error("Command cannot be empty."), "Command edit failed");
+    return;
+  }
+  state.lastPreview = {
+    ...state.lastPreview,
+    command_override: command,
+    remote_command: command,
+  };
+  state.commandDraft = command;
+  state.commandReviewEditing = false;
+  persistState();
+  showToast("Command updated.");
+  render();
+  afterRender();
 }
 
 function validateDatasetReadiness() {
@@ -2221,6 +2275,7 @@ async function submitRemote() {
   const data = await runRemoteAlgorithm(state.apiBaseUrl, buildRunPayload({
     output_dir: state.lastPreview.local_output_dir || outputDirForPayload(),
     path_confirmation: pathConfirmation,
+    command_override: state.lastPreview.command_override || "",
   }));
   if (data.job?.id) {
     state.selectedJobId = data.job.id;
@@ -2438,6 +2493,7 @@ function openInputModal({ title, description, defaultValue, placeholder }) {
 
 function openConfirmModal(preview) {
   const layer = document.getElementById("modal-layer");
+  const reviewCommand = preview.command_override || preview.remote_command || preview.shell_command || "";
   layer.hidden = false;
   layer.innerHTML = `
     <div class="modal">
@@ -2450,7 +2506,7 @@ function openConfirmModal(preview) {
           <p class="panel-copy">Local Output: ${escapeHtml(preview.local_output_dir)}</p>
           <p class="panel-copy">Remote Workspace: ${escapeHtml(preview.remote_workspace)}</p>
           <p class="panel-copy">Remote Output: ${escapeHtml(preview.remote_output_dir)}</p>
-          <pre>${escapeHtml(preview.shell_command || preview.remote_command || "")}</pre>
+          <pre>${escapeHtml(reviewCommand)}</pre>
         </div>
       </div>
       <div class="modal-footer">

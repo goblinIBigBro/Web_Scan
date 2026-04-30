@@ -898,6 +898,16 @@ th {
   padding: 14px;
 }
 
+.command-editor {
+  width: 100%;
+  min-height: 160px;
+  resize: vertical;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre;
+}
+
 .error-box {
   border-color: rgba(255, 85, 112, 0.32);
 }

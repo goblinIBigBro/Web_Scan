@@ -6,10 +6,20 @@ This folder provides a standalone web platform that serves as a unified visualiz
 
 ## User Manual
 
-If you are using this for the first time, please refer to the training manual:
+### 📖 Documentation Guide
 
-- Chinese: `web/WEB_TRAINING_MANUAL_ZH.md`
-- English: `web/WEB_TRAINING_MANUAL_EN.md`
+**Start here based on your needs:**
+
+#### 🚀 Setup and Configuration
+- **Remote SSH Environment Setup** (Recommended for remote training)
+  - Quick Navigator: [`project_md/REMOTE_SETUP_INDEX.md`](project_md/REMOTE_SETUP_INDEX.md)
+  - New Algorithms (HAC-plus, FCGS): [`project_md/REMOTE_SETUP_GUIDE_NEW.md`](project_md/REMOTE_SETUP_GUIDE_NEW.md)
+  - Legacy Algorithms (CompGS, ContextGS, etc.): [`project_md/REMOTE_SETUP_GUIDE_OLD.md`](project_md/REMOTE_SETUP_GUIDE_OLD.md)
+  - Verification Script: [`tools/remote_verify_setup.sh`](tools/remote_verify_setup.sh)
+
+#### 🎯 Web Application Training
+- Chinese: [`WEB_TRAINING_MANUAL_ZH.md`](WEB_TRAINING_MANUAL_ZH.md)
+- English: [`WEB_TRAINING_MANUAL_EN.md`](WEB_TRAINING_MANUAL_EN.md)
 
 ## Basic Functions
 
@@ -59,10 +69,24 @@ Install dependency for remote mode:
 python -m pip install paramiko
 ```
 
-For the full HAC++ remote setup checklist, see:
+### ⚠️ Before Remote Training
 
-- Chinese: `web/WEB_TRAINING_MANUAL_ZH.md`
-- English: `web/WEB_TRAINING_MANUAL_EN.md`
+**Important**: Before using remote training features, configure your remote server environment:
+
+1. **Choose your algorithm family**:
+   - HAC-plus or FCGS? → See [`project_md/REMOTE_SETUP_GUIDE_NEW.md`](project_md/REMOTE_SETUP_GUIDE_NEW.md)
+   - Other algorithms? → See [`project_md/REMOTE_SETUP_GUIDE_OLD.md`](project_md/REMOTE_SETUP_GUIDE_OLD.md)
+
+2. **Verify environment setup**:
+   ```bash
+   bash web/tools/remote_verify_setup.sh
+   ```
+
+3. **Refer to complete checklists**:
+   - Chinese (HAC++): [`WEB_TRAINING_MANUAL_ZH.md`](WEB_TRAINING_MANUAL_ZH.md)
+   - English (HAC++): [`WEB_TRAINING_MANUAL_EN.md`](WEB_TRAINING_MANUAL_EN.md)
+
+### Start the Server
 
 ```bash
 python3 web/server/api_server.py --host 127.0.0.1 --port 8080

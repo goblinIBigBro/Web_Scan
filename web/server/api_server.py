@@ -2735,6 +2735,7 @@ def start_remote_job_thread(
   remote_dataset_path: str,
   use_existing_remote_dataset: bool,
   training_args: Dict[str, Any] | None = None,
+  command_override: str = "",
 ) -> None:
   auto_colmap = effective_auto_colmap(auto_colmap, use_existing_remote_dataset)
 
@@ -2793,6 +2794,7 @@ def start_remote_job_thread(
         remote_dataset_path=remote_dataset_path,
         use_existing_remote_dataset=use_existing_remote_dataset,
         training_args=training_args or {},
+        command_override=command_override,
         log_callback=on_log,
         stage_callback=on_stage,
         cancel_checker=lambda: bool(job.get("cancel_requested")),
@@ -3603,6 +3605,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
         )
         return
 
+      command_override = str(payload.get("command_override", "")).strip()
       requested_job_id = str(payload.get("job_id", payload.get("preview_job_id", ""))).strip()
       job_id = requested_job_id if requested_job_id and requested_job_id not in JOBS else str(uuid.uuid4())
       job = {
@@ -3612,7 +3615,8 @@ class ApiHandler(SimpleHTTPRequestHandler):
         "representation": definition.get("representation", "sh"),
         "operation": "remote_train",
         "requested_operation": operation,
-        "command": command_template,
+        "command": command_override or command_template,
+        "command_override": command_override,
         "created_at": time.time(),
         "workspace": workspace_for_template,
         "output_dir": resolved_output_dir,
@@ -3657,6 +3661,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
         remote_dataset_path=remote_dataset_path,
         use_existing_remote_dataset=use_existing_remote_dataset,
         training_args=_training_format_args(payload),
+        command_override=command_override,
       )
       json_response(
         self,

@@ -1,0 +1,245 @@
+#!/bin/bash
+
+#
+# 远程环境验证脚本 - 通用版本
+# 支持新旧版本算法环境检查
+#
+# 用法：
+#   bash remote_verify_setup.sh              # 自动检测
+#   bash remote_verify_setup.sh new          # 新版（HAC-plus/FCGS）
+#   bash remote_verify_setup.sh old          # 旧版（CompGS/ContextGS/MEGS-2 等）
+#
+
+set -e
+
+# 颜色定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# 计数器
+pass_count=0
+fail_count=0
+skip_count=0
+
+# 检查函数
+check_item() {
+  local name=$1
+  local cmd=$2
+  local optional=${3:-false}
+  
+  echo -n "检查 $name ... "
+  
+  if eval "$cmd" > /dev/null 2>&1; then
+    echo -e "${GREEN}✓ PASS${NC}"
+    ((pass_count++))
+  else
+    if [ "$optional" = "true" ]; then
+      echo -e "${YELLOW}⚠ SKIP (可选)${NC}"
+      ((skip_count++))
+    else
+      echo -e "${RED}✗ FAIL${NC}"
+      ((fail_count++))
+    fi
+  fi
+}
+
+# 获取 Python 版本
+get_python_version() {
+  python3 --version 2>&1 | awk '{print $2}'
+}
+
+# 获取 PyTorch 版本
+get_pytorch_version() {
+  python3 -c "import torch; print(torch.__version__)" 2>/dev/null || echo "N/A"
+}
+
+# 检测环境版本
+detect_version() {
+  local python_ver=$(get_python_version)
+  local pytorch_ver=$(get_pytorch_version)
+  
+  if [[ "$python_ver" == 3.10* ]]; then
+    echo "new"
+  elif [[ "$python_ver" == 3.7* ]]; then
+    echo "old"
+  else
+    echo "unknown"
+  fi
+}
+
+# 新版检查（Python 3.10 + PyTorch 2.2 + CUDA 12.1/11.8）
+check_new_version() {
+  echo -e "\n${BLUE}=== 新版算法组检查 (Python 3.10 + PyTorch 2.2) ===${NC}"
+  echo ""
+  
+  # 系统检查
+  echo "--- 系统信息 ---"
+  check_item "Linux 系统" "uname -a | grep -i linux"
+  check_item "磁盘空间 (≥100GB)" "[ \$(df / 2>/dev/null | awk 'NR==2 {print \$4}') -gt 100000000 ]"
+  check_item "GPU 驱动" "nvidia-smi > /dev/null"
+  
+  # Python 检查
+  echo ""
+  echo "--- Python 环境 ---"
+  check_item "Python 3.10" "python3 --version | grep '3.10'"
+  check_item "PyTorch 2.2" "python3 -c 'import torch; assert \"2.2\" in torch.__version__'"
+  check_item "CUDA 可用" "python3 -c 'import torch; assert torch.cuda.is_available()'"
+  check_item "GPU 可见" "python3 -c 'import torch; assert torch.cuda.device_count() > 0'"
+  
+  # CUDA 版本检查
+  echo ""
+  echo "--- CUDA 版本 ---"
+  check_item "CUDA 12.1 或 11.8" "python3 -c 'import torch; v=torch.version.cuda; assert v and (\"12.1\" in v or \"11.8\" in v)'"
+  
+  # 依赖包检查
+  echo ""
+  echo "--- 依赖包 ---"
+  check_item "plyfile" "python3 -c 'import plyfile'"
+  check_item "lpips" "python3 -c 'import lpips'"
+  check_item "einops" "python3 -c 'import einops'"
+  check_item "numpy" "python3 -c 'import numpy'"
+  check_item "scipy" "python3 -c 'import scipy'"
+  check_item "tqdm" "python3 -c 'import tqdm'"
+  check_item "torch-scatter" "python3 -c 'import torch_scatter'" true
+  
+  # 子模块检查
+  echo ""
+  echo "--- 项目子模块 ---"
+  check_item "diff-gaussian-rasterization" "python3 -c 'import diff_gaussian_rasterization'"
+  check_item "simple-knn" "python3 -c 'import simple_knn'"
+  
+  # 环境激活检查
+  echo ""
+  echo "--- 环境激活 ---"
+  if command -v conda &> /dev/null; then
+    check_item "Conda 命令" "conda --version"
+    check_item "HAC_env 或 FCGS_env 存在" "conda env list | grep -E 'HAC_env|FCGS_env'" true
+  else
+    echo -e "${YELLOW}⚠ Conda 不在 PATH 中（可能使用绝对路径激活）${NC}"
+  fi
+}
+
+# 旧版检查（Python 3.7.13 + PyTorch 1.12.1 + CUDA 11.6）
+check_old_version() {
+  echo -e "\n${BLUE}=== 旧版算法组检查 (Python 3.7.13 + PyTorch 1.12.1) ===${NC}"
+  echo ""
+  
+  # 系统检查
+  echo "--- 系统信息 ---"
+  check_item "Linux 系统" "uname -a | grep -i linux"
+  check_item "磁盘空间 (≥100GB)" "[ \$(df / 2>/dev/null | awk 'NR==2 {print \$4}') -gt 100000000 ]"
+  check_item "GPU 驱动" "nvidia-smi > /dev/null"
+  
+  # Python 检查
+  echo ""
+  echo "--- Python 环境 ---"
+  check_item "Python 3.7" "python3 --version | grep '3.7'"
+  check_item "PyTorch 1.12" "python3 -c 'import torch; assert \"1.12\" in torch.__version__'"
+  check_item "CUDA 可用" "python3 -c 'import torch; assert torch.cuda.is_available()'"
+  check_item "GPU 可见" "python3 -c 'import torch; assert torch.cuda.device_count() > 0'"
+  
+  # CUDA 版本检查
+  echo ""
+  echo "--- CUDA 版本 ---"
+  check_item "CUDA 11.6" "python3 -c 'import torch; v=torch.version.cuda; assert v and \"11.6\" in v'"
+  
+  # 依赖包检查
+  echo ""
+  echo "--- 依赖包 ---"
+  check_item "plyfile" "python3 -c 'import plyfile'"
+  check_item "lpips" "python3 -c 'import lpips'"
+  check_item "einops" "python3 -c 'import einops'"
+  check_item "numpy" "python3 -c 'import numpy'"
+  check_item "scipy" "python3 -c 'import scipy'"
+  check_item "tqdm" "python3 -c 'import tqdm'"
+  check_item "torch-scatter" "python3 -c 'import torch_scatter'" true
+  
+  # 子模块检查
+  echo ""
+  echo "--- 项目子模块 ---"
+  check_item "diff-gaussian-rasterization" "python3 -c 'import diff_gaussian_rasterization'" true
+  check_item "simple-knn" "python3 -c 'import simple_knn'" true
+  
+  # 环境激活检查
+  echo ""
+  echo "--- 环境激活 ---"
+  if command -v conda &> /dev/null; then
+    check_item "Conda 命令" "conda --version"
+    check_item "contextgs/MEGS2/scaffold_gs 环境存在" "conda env list | grep -E 'contextgs|MEGS2|scaffold_gs|CompGS_env|gaussian_splatting'" true
+  else
+    echo -e "${YELLOW}⚠ Conda 不在 PATH 中（可能使用绝对路径激活）${NC}"
+  fi
+}
+
+# 显示汇总
+show_summary() {
+  echo ""
+  echo "=========================================="
+  echo "检查完成汇总"
+  echo "=========================================="
+  echo -e "  ${GREEN}✓ 通过：$pass_count 项${NC}"
+  echo -e "  ${RED}✗ 失败：$fail_count 项${NC}"
+  if [ $skip_count -gt 0 ]; then
+    echo -e "  ${YELLOW}⚠ 跳过：$skip_count 项 (可选)${NC}"
+  fi
+  echo "=========================================="
+  
+  if [ $fail_count -eq 0 ]; then
+    echo -e "${GREEN}✓ 环境配置正确，可以开始训练${NC}"
+    return 0
+  else
+    echo -e "${RED}✗ 环境存在问题，请查看上面的失败项并修复${NC}"
+    return 1
+  fi
+}
+
+# 主流程
+main() {
+  version=$1
+  
+  echo -e "${BLUE}=========================================="
+  echo "Web_Scan 远程环境验证脚本"
+  echo "=========================================${NC}"
+  echo ""
+  
+  # 如果未指定版本，自动检测
+  if [ -z "$version" ]; then
+    version=$(detect_version)
+    echo "自动检测环境版本: $version"
+    
+    if [ "$version" = "unknown" ]; then
+      echo -e "${YELLOW}无法自动检测环境版本${NC}"
+      echo "请手动指定:"
+      echo "  bash remote_verify_setup.sh new   (新版: Python 3.10 + PyTorch 2.2)"
+      echo "  bash remote_verify_setup.sh old   (旧版: Python 3.7 + PyTorch 1.12)"
+      return 1
+    fi
+  fi
+  
+  echo ""
+  
+  # 执行对应检查
+  case $version in
+    new)
+      check_new_version
+      ;;
+    old)
+      check_old_version
+      ;;
+    *)
+      echo -e "${RED}未知的版本: $version${NC}"
+      echo "请使用 'new' 或 'old'"
+      return 1
+      ;;
+  esac
+  
+  # 显示汇总
+  show_summary
+}
+
+# 运行主程序
+main "$@"
+exit $?

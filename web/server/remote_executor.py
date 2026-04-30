@@ -984,6 +984,7 @@ def start_remote_algorithm_detached(
   remote_dataset_path: str = "",
   use_existing_remote_dataset: bool = False,
   training_args: Dict[str, Any] | None = None,
+  command_override: str = "",
   log_callback: Callable[[str, str], None] | None = None,
   stage_callback: Callable[[str], None] | None = None,
   cancel_checker: Callable[[], bool] | None = None,
@@ -1035,16 +1036,6 @@ def start_remote_algorithm_detached(
       PurePosixPath(validated["workspace_root"]) / "datasets" / family / resolved_dataset_id / "workspace"
     )
 
-  remote_command = command_template.format(
-    input_path=input_path,
-    output_dir=remote_paths["output_dir"],
-    workspace=remote_workspace_for_command,
-    checkpoint_path=checkpoint_path,
-    repo_path=validated["repo_path"],
-    source=source_path or remote_workspace_for_command,
-    **(training_args or {}),
-  )
-
   format_args = {
     "input_path": input_path,
     "output_dir": remote_paths["output_dir"],
@@ -1054,10 +1045,14 @@ def start_remote_algorithm_detached(
     "source": source_path or remote_workspace_for_command,
     **(training_args or {}),
   }
-  try:
-    remote_command = sanitize_formatted_command(command_template, remote_command, format_args)
-  except Exception:
-    pass
+  if str(command_override or "").strip():
+    remote_command = str(command_override).strip()
+  else:
+    remote_command = command_template.format(**format_args)
+    try:
+      remote_command = sanitize_formatted_command(command_template, remote_command, format_args)
+    except Exception:
+      pass
 
   if remote_command.lstrip().startswith("python "):
     remote_command = f"{validated['python']}{remote_command.lstrip()[len('python') :]}"
@@ -1356,6 +1351,7 @@ def run_remote_algorithm(
   remote_dataset_path: str = "",
   use_existing_remote_dataset: bool = False,
   training_args: Dict[str, Any] | None = None,
+  command_override: str = "",
   log_callback: Callable[[str, str], None] | None = None,
   stage_callback: Callable[[str], None] | None = None,
   cancel_checker: Callable[[], bool] | None = None,
@@ -1406,16 +1402,6 @@ def run_remote_algorithm(
       PurePosixPath(validated["workspace_root"]) / "datasets" / family / resolved_dataset_id / "workspace"
     )
 
-  remote_command = command_template.format(
-    input_path=input_path,
-    output_dir=remote_paths["output_dir"],
-    workspace=remote_workspace_for_command,
-    checkpoint_path=checkpoint_path,
-    repo_path=validated["repo_path"],
-    source=source_path or remote_workspace_for_command,
-    **(training_args or {}),
-  )
-
   format_args = {
     "input_path": input_path,
     "output_dir": remote_paths["output_dir"],
@@ -1425,10 +1411,14 @@ def run_remote_algorithm(
     "source": source_path or remote_workspace_for_command,
     **(training_args or {}),
   }
-  try:
-    remote_command = sanitize_formatted_command(command_template, remote_command, format_args)
-  except Exception:
-    pass
+  if str(command_override or "").strip():
+    remote_command = str(command_override).strip()
+  else:
+    remote_command = command_template.format(**format_args)
+    try:
+      remote_command = sanitize_formatted_command(command_template, remote_command, format_args)
+    except Exception:
+      pass
 
   if remote_command.lstrip().startswith("python "):
     remote_command = f"{validated['python']}{remote_command.lstrip()[len('python') :]}"

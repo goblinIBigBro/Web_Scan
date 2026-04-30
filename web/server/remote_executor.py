@@ -809,8 +809,27 @@ def _build_remote_detached_run_script(
   resolved_dataset_name: str,
   use_existing_remote_dataset: bool,
 ) -> str:
-  colmap_script = _build_remote_colmap_script(remote_workspace_for_command)
-  sparse_test = _remote_sparse_test_script(remote_workspace_for_command)
+  auto_colmap = bool(auto_colmap) and not bool(use_existing_remote_dataset)
+  colmap_block = ""
+  if auto_colmap:
+    colmap_script = _build_remote_colmap_script(remote_workspace_for_command)
+    sparse_test = _remote_sparse_test_script(remote_workspace_for_command)
+    colmap_block = f"""if [ "$AUTO_COLMAP" = "1" ]; then
+  if {sparse_test}; then
+    echo "[AutoCOLMAP] Skip: sparse workspace already exists at $REMOTE_DATASET_WORKSPACE"
+  else
+    echo "[AutoCOLMAP] Running remote COLMAP preprocessing"
+    write_status "running" "executing_remote_colmap" "" "Running remote COLMAP preprocessing."
+    {colmap_script}
+    colmap_rc=$?
+    if [ "$colmap_rc" -ne 0 ]; then
+      finish_with "failed" "colmap" "$colmap_rc" "Remote COLMAP preprocessing failed."
+    fi
+    write_status "running" "remote_colmap_completed" "" "Remote COLMAP preprocessing completed."
+  fi
+fi"""
+  elif use_existing_remote_dataset:
+    colmap_block = 'echo "[Dataset] Reusing existing remote dataset: $REMOTE_DATASET_ID"'
 
   activate_cmd = str(validated.get("activate_cmd", "")).strip()
   training_lines = [
@@ -921,22 +940,7 @@ finish_with() {{
 echo "[Web-GSC] Detached remote job started at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 write_status "running" "remote_detached_running" "" "Remote job is detached. It is safe to close the web page."
 
-if [ "$AUTO_COLMAP" = "1" ]; then
-  if {sparse_test}; then
-    echo "[AutoCOLMAP] Skip: sparse workspace already exists at $REMOTE_DATASET_WORKSPACE"
-  else
-    echo "[AutoCOLMAP] Running remote COLMAP preprocessing"
-    write_status "running" "executing_remote_colmap" "" "Running remote COLMAP preprocessing."
-    {colmap_script}
-    colmap_rc=$?
-    if [ "$colmap_rc" -ne 0 ]; then
-      finish_with "failed" "colmap" "$colmap_rc" "Remote COLMAP preprocessing failed."
-    fi
-    write_status "running" "remote_colmap_completed" "" "Remote COLMAP preprocessing completed."
-  fi
-elif [ "$USE_EXISTING_REMOTE_DATASET" = "1" ]; then
-  echo "[Dataset] Reusing existing remote dataset: $REMOTE_DATASET_ID"
-fi
+{colmap_block}
 
 write_status "running" "executing_remote_command" "" "Running remote training command."
 (
@@ -985,6 +989,7 @@ def start_remote_algorithm_detached(
   cancel_checker: Callable[[], bool] | None = None,
 ) -> Dict[str, Any]:
   validated = validate_remote_config(remote_config)
+  auto_colmap = bool(auto_colmap) and not bool(use_existing_remote_dataset)
 
   workspace_dir: Path | None = None
   if not use_existing_remote_dataset:
@@ -1356,6 +1361,7 @@ def run_remote_algorithm(
   cancel_checker: Callable[[], bool] | None = None,
 ) -> Dict[str, Any]:
   validated = validate_remote_config(remote_config)
+  auto_colmap = bool(auto_colmap) and not bool(use_existing_remote_dataset)
 
   workspace_dir: Path | None = None
   if not use_existing_remote_dataset:

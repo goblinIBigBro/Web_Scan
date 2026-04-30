@@ -340,6 +340,10 @@ function datasetHasColmap(dataset) {
   );
 }
 
+function effectiveAutoColmap() {
+  return Boolean(state.autoColmap) && !state.useExistingRemoteDataset;
+}
+
 function datasetNameForPayload() {
   if (state.useExistingRemoteDataset) {
     const dataset = selectedDataset();
@@ -377,7 +381,7 @@ function buttonActionKey(node) {
   if (node.dataset.page) return `page:${node.dataset.page}`;
   if (!node.dataset.action) return "";
   const parts = [node.dataset.action];
-  for (const key of ["jobId", "datasetId", "outputDir", "mode", "stage", "statuses"]) {
+  for (const key of ["jobId", "datasetId", "outputDir", "mode", "stage", "statuses", "source"]) {
     if (node.dataset[key]) parts.push(node.dataset[key]);
   }
   return parts.join(":");
@@ -439,9 +443,20 @@ function setError(error, fallback = "Action failed") {
   persistState();
   render();
   afterRender();
+  const errorMessage = state.lastError.code
+    ? `${state.lastError.code}: ${state.lastError.message}`
+    : state.lastError.message;
+  showToast(errorMessage);
+  window.requestAnimationFrame(() => {
+    const node = document.getElementById("global-error-banner");
+    if (!node) return;
+    node.focus({ preventScroll: true });
+    node.scrollIntoView({ block: "start", behavior: "smooth" });
+  });
 }
 
 async function guarded(action, fallback, actionKey = "") {
+  let handledError = false;
   try {
     setBusy(true);
     setPendingAction(actionKey);
@@ -452,13 +467,18 @@ async function guarded(action, fallback, actionKey = "") {
     afterRender();
     return result;
   } catch (error) {
+    handledError = true;
+    setBusy(false);
+    pendingActionKey = "";
     setError(error, fallback);
     return null;
   } finally {
-    setBusy(false);
-    pendingActionKey = "";
-    render();
-    afterRender();
+    if (!handledError) {
+      setBusy(false);
+      pendingActionKey = "";
+      render();
+      afterRender();
+    }
   }
 }
 
@@ -474,7 +494,7 @@ function buildRunPayload(extra = {}) {
     capture_id: state.captureId,
     dataset_name: datasetNameForPayload(),
     auto_materialize: !state.useExistingRemoteDataset,
-    auto_colmap: Boolean(state.autoColmap),
+    auto_colmap: effectiveAutoColmap(),
     use_existing_remote_dataset: Boolean(state.useExistingRemoteDataset),
     remote_dataset_id: customPath ? "" : (state.selectedRemoteDatasetId || ""),
     remote_dataset_path: remoteDatasetPath,
@@ -577,19 +597,10 @@ function renderStatusRail() {
       <div class="card grid">
         <p class="panel-copy">API: ${escapeHtml(state.apiBaseUrl)}</p>
         <p class="panel-copy">SSH: ${state.sshChecked ? "Precheck passed" : "Not checked or expired"}</p>
-        <p class="panel-copy">COLMAP: ${state.autoColmap ? "Automatic" : "Manual confirmation"}</p>
+        <p class="panel-copy">COLMAP: ${effectiveAutoColmap() ? "Auto for new upload" : state.useExistingRemoteDataset ? "Skipped for existing data" : "Manual"}</p>
+        ${state.lastError ? `<p class="panel-copy">Last error: ${escapeHtml(state.lastError.code || "ERROR")}</p>` : ""}
       </div>
     </section>
-    ${state.lastError ? `
-      <section class="panel">
-        <div class="panel-head"><h3>Error Details</h3><span class="badge bad">${escapeHtml(state.lastError.code || "ERROR")}</span></div>
-        <div class="error-box">
-          <p>${escapeHtml(state.lastError.message)}</p>
-          ${state.lastError.nextAction ? `<p class="panel-copy">Next action: ${escapeHtml(state.lastError.nextAction)}</p>` : ""}
-          ${Object.keys(state.lastError.details || {}).length ? `<pre>${escapeHtml(JSON.stringify(state.lastError.details, null, 2))}</pre>` : ""}
-        </div>
-      </section>
-    ` : ""}
   `;
 }
 
@@ -622,13 +633,41 @@ function renderCurrentJobSummary() {
 }
 
 function renderMain() {
-  if (state.activePage === "overview") return renderOverviewPage();
-  if (state.activePage === "data") return renderDataPage();
-  if (state.activePage === "algorithm") return renderAlgorithmPage();
-  if (state.activePage === "browser") return renderBrowserPage();
-  if (state.activePage === "analysis") return renderAnalysisPage();
-  if (state.activePage === "result") return renderResultPage();
-  return renderOverviewPage();
+  let page = renderOverviewPage();
+  if (state.activePage === "data") page = renderDataPage();
+  if (state.activePage === "algorithm") page = renderAlgorithmPage();
+  if (state.activePage === "browser") page = renderBrowserPage();
+  if (state.activePage === "analysis") page = renderAnalysisPage();
+  if (state.activePage === "result") page = renderResultPage();
+  return `${renderGlobalErrorBanner()}${page}`;
+}
+
+function renderGlobalErrorBanner() {
+  if (!state.lastError) return "";
+  const details = state.lastError.details || {};
+  const hasDetails = Object.keys(details).length > 0;
+  return `
+    <section id="global-error-banner" class="panel error-banner" tabindex="-1">
+      <div class="panel-head">
+        <div>
+          <h2>${escapeHtml(state.lastError.code || "Action failed")}</h2>
+          <p class="panel-copy">${escapeHtml(state.lastError.message)}</p>
+        </div>
+        <button class="compact-button" data-action="clear-error" type="button">Dismiss</button>
+      </div>
+      ${state.lastError.nextAction || hasDetails ? `
+        <div class="error-banner-body">
+          ${state.lastError.nextAction ? `<p class="panel-copy"><strong>Next action:</strong> ${escapeHtml(state.lastError.nextAction)}</p>` : ""}
+          ${hasDetails ? `
+            <details>
+              <summary>Details</summary>
+              <pre>${escapeHtml(JSON.stringify(details, null, 2))}</pre>
+            </details>
+          ` : ""}
+        </div>
+      ` : ""}
+    </section>
+  `;
 }
 
 function renderOverviewPage() {
@@ -737,8 +776,20 @@ function renderDataPage() {
     <section class="panel">
       <div class="panel-head">
         <div>
-          <h2>SSH Connection</h2>
-          <p class="panel-copy">Connect to the remote machine before uploading files or camera frames.</p>
+          <h2>Data Source</h2>
+          <p class="panel-copy">Choose the data path before remote precheck.</p>
+        </div>
+        <span class="badge ${state.useExistingRemoteDataset ? "ok" : "warn"}">${state.useExistingRemoteDataset ? "Existing remote data" : "New image upload"}</span>
+      </div>
+      <div class="card">
+        ${renderDataSourceSelector()}
+      </div>
+    </section>
+    <section class="panel">
+      <div class="panel-head">
+        <div>
+          <h2>Remote Connection</h2>
+          <p class="panel-copy">Connect to the remote machine and validate the paths used by this data source.</p>
         </div>
         <span class="badge ${state.sshChecked ? "ok" : "warn"}">${state.sshChecked ? "SSH READY" : "SSH REQUIRED"}</span>
       </div>
@@ -748,7 +799,7 @@ function renderDataPage() {
         <div class="button-row">
           <button data-action="save-remote-config" type="button">Save Remote Config</button>
           <button data-action="restore-remote-config" type="button">Restore Last Config</button>
-          <button class="primary" data-action="check-remote" type="button" ${busy ? "disabled" : ""}>SSH / COLMAP Precheck</button>
+          <button class="primary" data-action="check-remote" type="button" ${busy ? "disabled" : ""}>Remote Precheck</button>
         </div>
         ${renderRemoteChecks()}
       </div>
@@ -756,51 +807,71 @@ function renderDataPage() {
     <section class="panel">
       <div class="panel-head">
         <div>
-          <h2>Data Upload</h2>
-          <p class="panel-copy">Choose one input method. Photo upload and camera capture write into the same session.</p>
+          <h2>${state.useExistingRemoteDataset ? "Existing Remote Dataset" : "New Image Upload"}</h2>
+          <p class="panel-copy">${state.useExistingRemoteDataset ? "Select a reusable remote workspace or enter its path." : "Photo upload and camera capture write into the same session."}</p>
         </div>
         <div class="button-row">
           <button class="primary" data-page="algorithm" type="button" ${continueDisabled}>Continue to Training</button>
         </div>
       </div>
       <div class="card grid">
-        ${state.sshChecked ? "" : `<p class="panel-copy">Run SSH / COLMAP Precheck first. Both upload methods unlock after the remote connection succeeds.</p>`}
-        <div class="upload-method-grid">
-          ${renderPhotoUploadCard(uploadDisabled)}
-          ${renderCameraUploadCard(uploadDisabled)}
-        </div>
-        ${renderCurrentFlowData()}
-        <details class="panel pad">
-          <summary>Session and Advanced Data Options</summary>
-          <div class="grid" style="margin-top: 14px;">
-            ${renderSessionFields()}
-            <div class="button-row">
-              <button data-action="open-dataset-modal" type="button">Name Dataset</button>
-              <button data-action="new-capture" type="button">New Capture</button>
-              <button data-action="restart-upload-training" type="button">Restart Upload Training</button>
+        ${state.useExistingRemoteDataset
+          ? renderRemoteDatasetControls()
+          : `
+            ${state.sshChecked ? "" : `<p class="panel-copy">Run Remote Precheck first. Upload methods unlock after the remote connection succeeds.</p>`}
+            <div class="upload-method-grid">
+              ${renderPhotoUploadCard(uploadDisabled)}
+              ${renderCameraUploadCard(uploadDisabled)}
             </div>
-            ${renderRemoteDatasetControls()}
-          </div>
-        </details>
+            ${renderCurrentFlowData()}
+            <details class="panel pad">
+              <summary>Session and Advanced Data Options</summary>
+              <div class="grid" style="margin-top: 14px;">
+                ${renderSessionFields()}
+                <div class="button-row">
+                  <button data-action="open-dataset-modal" type="button">Name Dataset</button>
+                  <button data-action="new-capture" type="button">New Capture</button>
+                  <button data-action="restart-upload-training" type="button">Restart Upload Training</button>
+                </div>
+              </div>
+            </details>
+          `}
       </div>
     </section>
-    <details class="panel">
-      <summary class="panel-head">
-        <h2>Manual Session Prep</h2>
-        <span class="badge ${uploadedFrames ? "ok" : "warn"}">${uploadedFrames ? `${uploadedFrames} frame(s)` : "Waiting for upload"}</span>
-      </summary>
-      <div class="card grid two">
-        <button data-action="materialize-session" type="button" ${prepDisabled}>Manual Session Materialize</button>
-        <button data-action="prepare-colmap" type="button" ${prepDisabled}>Manual COLMAP Workspace</button>
-        <button data-action="toggle-stream" type="button" ${autoUploadDisabled}>${streamTimer ? "Stop Auto Upload" : "Auto Stream Upload"}</button>
-      </div>
-    </details>
+    ${state.useExistingRemoteDataset ? "" : `
+      <details class="panel">
+        <summary class="panel-head">
+          <h2>Manual Session Prep</h2>
+          <span class="badge ${uploadedFrames ? "ok" : "warn"}">${uploadedFrames ? `${uploadedFrames} frame(s)` : "Waiting for upload"}</span>
+        </summary>
+        <div class="card grid two">
+          <button data-action="materialize-session" type="button" ${prepDisabled}>Manual Session Materialize</button>
+          <button data-action="prepare-colmap" type="button" ${prepDisabled}>Manual COLMAP Workspace</button>
+          <button data-action="toggle-stream" type="button" ${autoUploadDisabled}>${streamTimer ? "Stop Auto Upload" : "Auto Stream Upload"}</button>
+        </div>
+      </details>
+    `}
     <section class="panel">
       <div class="panel-head">
         <h2>Workflow</h2>
         ${renderProgressChips()}
       </div>
     </section>
+  `;
+}
+
+function renderDataSourceSelector() {
+  return `
+    <div class="source-choice-grid">
+      <button class="source-choice ${state.useExistingRemoteDataset ? "" : "active"}" data-action="set-data-source" data-source="upload" type="button">
+        <strong>上传新图片</strong>
+        <span>Upload images, then optionally run COLMAP preprocessing.</span>
+      </button>
+      <button class="source-choice ${state.useExistingRemoteDataset ? "active" : ""}" data-action="set-data-source" data-source="existing" type="button">
+        <strong>使用已有远端数据</strong>
+        <span>Use the selected remote workspace directly; COLMAP is skipped.</span>
+      </button>
+    </div>
   `;
 }
 
@@ -848,9 +919,11 @@ function renderDataPrecheckFields() {
           ${algorithms.map((item) => `<option value="${escapeHtml(item.family)}" ${state.algorithmFamily === item.family ? "selected" : ""}>${escapeHtml(item.label || item.family)}</option>`).join("")}
         </select>
       </label>
-      <label class="wide">
-        <span><input data-bind="autoColmap" type="checkbox" ${state.autoColmap ? "checked" : ""} /> Run remote COLMAP automatically when sparse/undistorted data is missing</span>
-      </label>
+      ${state.useExistingRemoteDataset
+        ? `<p class="panel-copy wide">Existing remote data is used directly. COLMAP precheck and auto-COLMAP are skipped.</p>`
+        : `<label class="wide">
+            <span><input data-bind="autoColmap" type="checkbox" ${state.autoColmap ? "checked" : ""} /> Run remote COLMAP automatically when sparse/undistorted data is missing</span>
+          </label>`}
     </div>
   `;
 }
@@ -960,15 +1033,13 @@ function renderUploadBox() {
 function renderRemoteDatasetControls() {
   const datasets = Array.isArray(state.remoteReport?.datasets) ? state.remoteReport.datasets : [];
   return `
-    <label class="wide">
-      <span><input data-bind="useExistingRemoteDataset" type="checkbox" ${state.useExistingRemoteDataset ? "checked" : ""} /> Use an existing remote dataset and skip local upload/materialize</span>
-    </label>
+    <p class="panel-copy">Existing remote data will be passed straight to the selected algorithm. COLMAP is not checked or run for this path.</p>
     <label>Remote Dataset
       <select data-bind="selectedRemoteDatasetId">
         <option value="">Not selected</option>
         ${datasets.map((item) => `
           <option value="${escapeHtml(item.id || "")}" ${state.selectedRemoteDatasetId === item.id ? "selected" : ""}>
-            ${escapeHtml(item.name || item.id || "unnamed")} · ${datasetHasColmap(item) ? "COLMAP OK" : "Needs COLMAP"}
+            ${escapeHtml(item.name || item.id || "unnamed")} · ${datasetHasColmap(item) ? "Sparse marker found" : "No sparse marker"}
           </option>
         `).join("")}
       </select>
@@ -976,11 +1047,8 @@ function renderRemoteDatasetControls() {
     <label>Custom Remote Data Path
       <input data-bind="remoteDatasetPath" value="${escapeHtml(state.remoteDatasetPath)}" placeholder="/tmp/web_scan/workspaces/datasets/.../workspace" />
     </label>
-    <label class="wide">
-      <span><input data-bind="autoColmap" type="checkbox" ${state.autoColmap ? "checked" : ""} /> Run remote COLMAP automatically when sparse/undistorted data is missing</span>
-    </label>
     <div class="dataset-list">
-      ${datasets.length ? datasets.slice(0, 6).map((item) => renderDatasetCard(item)).join("") : `<p class="panel-copy">Remote datasets appear here after the SSH precheck above.</p>`}
+      ${datasets.length ? datasets.slice(0, 6).map((item) => renderDatasetCard(item)).join("") : `<p class="panel-copy">Remote datasets appear here after Remote Precheck. A custom path can be entered now.</p>`}
     </div>
   `;
 }
@@ -993,7 +1061,7 @@ function renderDatasetCard(dataset) {
       <strong>${escapeHtml(dataset.name || dataset.id || "Unnamed dataset")}</strong>
       <p class="panel-copy">${escapeHtml(summarize(dataset.path, 76))}</p>
       <div class="button-row">
-        <span class="badge ${colmapOk ? "ok" : "warn"}">${colmapOk ? "COLMAP Ready" : "Will need COLMAP"}</span>
+        <span class="badge ${colmapOk ? "ok" : "warn"}">${colmapOk ? "Sparse marker found" : "No sparse marker"}</span>
         <span class="badge">${Number(dataset.frame_count || 0) || "?"} frames</span>
       </div>
       <button data-action="use-dataset" data-dataset-id="${escapeHtml(dataset.id || "")}" type="button">Use This Dataset</button>
@@ -1046,15 +1114,11 @@ function renderAlgorithmPage() {
             ${renderCommandPreview()}
           </div>
           <div class="grid">
-            ${renderRemoteConfigForm()}
+            ${renderRemoteExecutionSummary()}
             <div class="button-row">
-              <button data-action="save-remote-config" type="button">Save Remote Config</button>
-              <button data-action="restore-remote-config" type="button">Restore Last Config</button>
-            </div>
-            <p class="panel-copy">Note: the password is saved only in this browser localStorage, visible on this machine, and never written to the codebase.</p>
-            <div class="button-row">
+              <button data-page="data" type="button">Edit Data and Remote Config</button>
               <button data-action="restart-upload-training" type="button">Restart Upload Training</button>
-              <button data-action="check-remote" type="button" ${busy ? "disabled" : ""}>SSH / COLMAP Precheck</button>
+              <button data-action="check-remote" type="button" ${busy ? "disabled" : ""}>Remote Precheck</button>
               <button data-action="preview-command" type="button" ${state.sshChecked ? "" : "disabled"}>Generate Command Preview</button>
               <button class="primary" data-action="submit-remote" type="button" ${canSubmit ? "" : "disabled"}>Submit Remote Job</button>
             </div>
@@ -1076,6 +1140,28 @@ function renderAlgorithmPage() {
       <div class="card grid">
         ${renderJobsTable(jobs)}
         ${renderLogPanel()}
+      </div>
+    </section>
+  `;
+}
+
+function renderRemoteExecutionSummary() {
+  const remote = state.remoteConfig || {};
+  const dataset = selectedDataset();
+  const datasetText = state.useExistingRemoteDataset
+    ? (state.remoteDatasetPath || dataset?.path || state.selectedRemoteDatasetId || "No existing dataset selected")
+    : `${stagedUploadFrameCount()} uploaded image(s)`;
+  return `
+    <section class="panel pad">
+      <h3>Remote Execution Summary</h3>
+      <div class="grid" style="margin-top: 14px;">
+        <p class="panel-copy">Data Source: ${state.useExistingRemoteDataset ? "Existing remote dataset" : "New image upload"}</p>
+        <p class="panel-copy">Dataset: ${escapeHtml(summarize(datasetText, 96))}</p>
+        <p class="panel-copy">Host: ${escapeHtml(remote.host || "-")} · User: ${escapeHtml(remote.username || "-")}</p>
+        <p class="panel-copy">Repo: ${escapeHtml(summarize(remote.repo_path || "-", 96))}</p>
+        <p class="panel-copy">Workspace Root: ${escapeHtml(summarize(remote.workspace_root || "-", 96))}</p>
+        <p class="panel-copy">COLMAP: ${effectiveAutoColmap() ? "Auto for new upload" : state.useExistingRemoteDataset ? "Skipped for existing data" : "Manual"}</p>
+        <span class="badge ${state.sshChecked ? "ok" : "warn"}">${state.sshChecked ? "Remote precheck passed" : "Remote precheck needed"}</span>
       </div>
     </section>
   `;
@@ -1163,10 +1249,8 @@ function renderRemoteChecks() {
 function canSubmitRemoteJob() {
   if (!state.sshChecked || !operationSupportsRemote()) return false;
   if (state.useExistingRemoteDataset) {
-    const dataset = selectedDataset();
     const hasDataset = Boolean(state.remoteDatasetPath || state.selectedRemoteDatasetId);
     if (!hasDataset) return false;
-    if (dataset && !datasetHasColmap(dataset) && !state.autoColmap) return false;
     return Boolean(state.lastPreview);
   }
   return stagedUploadFrameCount() > 0 && Boolean(state.lastPreview);
@@ -1454,6 +1538,8 @@ async function handleClick(event) {
   if (action === "refresh-jobs") await guarded(refreshJobs, "Failed to refresh jobs", actionKey);
   if (action === "check-runtime") await guarded(checkRuntime, "Environment check failed", actionKey);
   if (action === "select-algorithm") selectAlgorithm(actionNode.dataset.family);
+  if (action === "clear-error") clearError();
+  if (action === "set-data-source") setDataSource(actionNode.dataset.source);
   if (action === "open-dataset-modal") await askDatasetName();
   if (action === "new-capture") newCapture();
   if (action === "restart-upload-training") await guarded(restartUploadTraining, "Failed to restart upload training", actionKey);
@@ -1555,7 +1641,7 @@ function updateBoundValue(node) {
   } else {
     state[key] = node.value;
   }
-  if (["sessionId", "captureId", "datasetName", "remoteDatasetPath", "outputDir", "checkpointPath"].includes(key)) {
+  if (["sessionId", "captureId", "datasetName", "selectedRemoteDatasetId", "remoteDatasetPath", "outputDir", "checkpointPath"].includes(key)) {
     state.lastPreview = null;
   }
   persistState();
@@ -1579,6 +1665,24 @@ function afterRender() {
 function selectAlgorithm(family) {
   state.algorithmFamily = family || state.algorithmFamily;
   normalizeOperation();
+  invalidateRemoteState();
+  persistState();
+  render();
+  afterRender();
+}
+
+function clearError() {
+  state.lastError = null;
+  persistState();
+  render();
+  afterRender();
+}
+
+function setDataSource(source) {
+  const useExisting = source === "existing";
+  if (state.useExistingRemoteDataset === useExisting) return;
+  state.useExistingRemoteDataset = useExisting;
+  state.lastPreview = null;
   invalidateRemoteState();
   persistState();
   render();
@@ -1817,7 +1921,7 @@ async function restartUploadTraining() {
 
 function requireSshReadyForUpload() {
   if (!state.sshChecked) {
-    throw new Error("Run SSH / COLMAP Precheck before uploading data.");
+    throw new Error("Run Remote Precheck before uploading data.");
   }
 }
 
@@ -2069,13 +2173,14 @@ async function checkRemote() {
     remote: state.remoteConfig,
     timeout_seconds: 20,
     algorithm_family: state.algorithmFamily,
-    check_colmap_required: Boolean(state.autoColmap),
+    use_existing_remote_dataset: Boolean(state.useExistingRemoteDataset),
+    check_colmap_required: effectiveAutoColmap(),
   });
   state.remoteReport = data.result;
   state.sshChecked = true;
   state.lastPreview = null;
   await refreshFlowData(false);
-  showToast("SSH / remote paths / COLMAP precheck passed.");
+  showToast("Remote precheck passed.");
 }
 
 async function previewCommand() {
@@ -2095,12 +2200,8 @@ function validateDatasetReadiness() {
     throw new Error("Upload images from the Data page before submitting remote training.");
   }
   if (state.useExistingRemoteDataset) {
-    const dataset = selectedDataset();
     if (!state.selectedRemoteDatasetId && !state.remoteDatasetPath) {
       throw new Error("Select an existing remote dataset or enter a custom remote data path first.");
-    }
-    if (dataset && !datasetHasColmap(dataset) && !state.autoColmap) {
-      throw new Error("This remote dataset lacks COLMAP sparse/undistorted data. Enable auto COLMAP or use a processed dataset.");
     }
   }
 }

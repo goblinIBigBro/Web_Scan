@@ -644,6 +644,33 @@ pre {
   gap: 14px;
 }
 
+.source-choice-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.source-choice {
+  min-height: 96px;
+  justify-content: flex-start;
+  align-items: flex-start;
+  flex-direction: column;
+  text-align: left;
+  white-space: normal;
+}
+
+.source-choice span {
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.source-choice.active {
+  border-color: rgba(43, 228, 143, 0.48);
+  background: rgba(25, 104, 78, 0.32);
+  box-shadow: inset 0 0 0 1px rgba(43, 228, 143, 0.18);
+}
+
 .upload-method-card {
   display: grid;
   align-content: start;
@@ -875,6 +902,28 @@ th {
   border-color: rgba(255, 85, 112, 0.32);
 }
 
+.error-banner {
+  border-color: rgba(255, 85, 112, 0.42);
+  background: rgba(50, 15, 28, 0.92);
+}
+
+.error-banner:focus {
+  outline: 3px solid rgba(255, 85, 112, 0.34);
+  outline-offset: 2px;
+}
+
+.error-banner-body {
+  display: grid;
+  gap: 10px;
+  padding: 14px 18px 18px;
+}
+
+.error-banner summary {
+  cursor: pointer;
+  color: var(--soft);
+  font-weight: 700;
+}
+
 .modal-layer {
   position: fixed;
   inset: 0;
@@ -959,6 +1008,7 @@ th {
   .topbar,
   .split,
   .upload-method-grid,
+  .source-choice-grid,
   .flow-stage-row,
   .form-grid,
   .grid.two,

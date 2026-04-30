@@ -52,6 +52,52 @@ def test_detached_script_contract() -> None:
   assert "nohup" in start_command
 
 
+def test_existing_dataset_disables_auto_colmap_contract() -> None:
+  validated = {
+    "python": "python3",
+    "repo_path": "/remote/repo",
+    "activate_cmd": "",
+  }
+  remote_paths = {
+    "workspace_dir": "/tmp/web_scan/workspaces/session/hac/job/workspace",
+    "output_dir": "/tmp/web_scan/outputs/session/hac/job/output",
+  }
+  job_paths = _remote_job_paths(remote_paths["output_dir"])
+  script = _build_remote_detached_run_script(
+    validated=validated,
+    job_id="job-existing",
+    family="hac",
+    remote_paths=remote_paths,
+    remote_job_paths=job_paths,
+    remote_workspace_for_command="/tmp/web_scan/workspaces/datasets/hac/reuse/workspace",
+    remote_command="python train.py -s /tmp/reuse -m /tmp/out",
+    auto_colmap=True,
+    resolved_dataset_id="reuse",
+    resolved_dataset_name="Reuse",
+    use_existing_remote_dataset=True,
+  )
+
+  assert "AUTO_COLMAP=0" in script
+  assert "USE_EXISTING_REMOTE_DATASET=1" in script
+  assert "[Dataset] Reusing existing remote dataset" in script
+  assert "sequential_matcher" not in script
+  assert "feature_extractor" not in script
+  assert "executing_remote_colmap" not in script
+
+
+def test_existing_dataset_colmap_preflight_is_optional() -> None:
+  assert api_server.effective_auto_colmap(True, True) is False
+  assert api_server.effective_auto_colmap(True, False) is True
+  assert api_server.effective_colmap_preflight_required({
+    "check_colmap_required": True,
+    "use_existing_remote_dataset": True,
+  }) is False
+  assert api_server.effective_colmap_preflight_required({
+    "check_colmap_required": True,
+    "use_existing_remote_dataset": False,
+  }) is True
+
+
 def test_job_persistence_sanitizes_password() -> None:
   job = {
     "id": "persist-test",
@@ -119,6 +165,8 @@ def test_apply_remote_poll_statuses() -> None:
 
 def main() -> None:
   test_detached_script_contract()
+  test_existing_dataset_disables_auto_colmap_contract()
+  test_existing_dataset_colmap_preflight_is_optional()
   test_job_persistence_sanitizes_password()
   test_apply_remote_poll_statuses()
   print("detached remote tests passed")

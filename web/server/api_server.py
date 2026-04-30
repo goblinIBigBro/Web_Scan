@@ -1870,6 +1870,17 @@ def operation_command_template(adapter: Dict[str, Any], operation: str) -> str:
   return command_template
 
 
+def effective_auto_colmap(auto_colmap: Any, use_existing_remote_dataset: Any) -> bool:
+  return bool(auto_colmap) and not bool(use_existing_remote_dataset)
+
+
+def effective_colmap_preflight_required(payload: Dict[str, Any]) -> bool:
+  return effective_auto_colmap(
+    payload.get("check_colmap_required", False),
+    payload.get("use_existing_remote_dataset", False),
+  )
+
+
 def build_remote_algorithm_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
   family = str(payload.get("algorithm_family", "")).strip()
   if not family:
@@ -2721,6 +2732,8 @@ def start_remote_job_thread(
   use_existing_remote_dataset: bool,
   training_args: Dict[str, Any] | None = None,
 ) -> None:
+  auto_colmap = effective_auto_colmap(auto_colmap, use_existing_remote_dataset)
+
   def runner() -> None:
     ensure_job_logging(job)
     if job.get("cancel_requested"):
@@ -3293,7 +3306,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
       try:
         remote_config_input = extract_remote_config_input(payload)
         family = str(payload.get("algorithm_family", "")).strip()
-        check_colmap_required = bool(payload.get("check_colmap_required", False))
+        check_colmap_required = effective_colmap_preflight_required(payload)
         result = remote_preflight_check(
           remote_config=remote_config_input,
           timeout_seconds=int(payload.get("timeout_seconds", 20) or 20),
@@ -3418,6 +3431,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
       auto_materialize = bool(payload.get("auto_materialize", True))
       auto_colmap = bool(payload.get("auto_colmap", True))
       use_existing_remote_dataset = bool(payload.get("use_existing_remote_dataset", False))
+      auto_colmap = effective_auto_colmap(auto_colmap, use_existing_remote_dataset)
       remote_dataset_id = str(payload.get("remote_dataset_id", "")).strip()
       remote_dataset_path = str(payload.get("remote_dataset_path", "")).strip()
       workspace_input = str(payload.get("workspace", "")).strip()
@@ -3436,6 +3450,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
           )
           return
         auto_materialize = False
+        auto_colmap = False
       else:
         if auto_materialize and not workspace_input:
           try:

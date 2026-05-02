@@ -908,6 +908,22 @@ th {
   white-space: pre;
 }
 
+.tmux-attach-box {
+  border: 1px solid rgba(93, 214, 180, 0.24);
+  border-radius: 14px;
+  background: rgba(6, 32, 30, 0.58);
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+}
+
+.tmux-attach-box pre {
+  margin: 0;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .error-box {
   border-color: rgba(255, 85, 112, 0.32);
 }

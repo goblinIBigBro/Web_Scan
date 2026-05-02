@@ -42,6 +42,8 @@ from web.server.adapter_registry import (
 from web.server.remote_executor import (
   RemoteExecutionError,
   build_remote_paths,
+  build_remote_tmux_attach_command,
+  build_remote_tmux_session_name,
   cancel_remote_detached_job,
   poll_remote_detached_job,
   remote_preflight_check,
@@ -2104,6 +2106,8 @@ def build_remote_algorithm_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
     family=family,
     job_id=preview_job_id,
   )
+  remote_tmux_session = build_remote_tmux_session_name(family=family, job_id=preview_job_id)
+  remote_tmux_attach_command = build_remote_tmux_attach_command(remote_config, remote_tmux_session)
 
   checkpoint_path = str(payload.get("remote_checkpoint_path", payload.get("checkpoint_path", ""))).strip()
   input_path = str(payload.get("input_path", "")).strip()
@@ -2136,6 +2140,14 @@ def build_remote_algorithm_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
     "preview_job_id": preview_job_id,
     "algorithm_family": family,
     "operation": operation,
+    "execution_backend": "tmux",
+    "remote_tmux_session": remote_tmux_session,
+    "remote_tmux_attach_command": remote_tmux_attach_command,
+    "tmux_available": None,
+    "tmux_install": {
+      "policy": "submit_time_sudo_n",
+      "uses_password_sudo": False,
+    },
     "dataset_name": dataset_name,
     "remote_dataset_id": remote_dataset_id,
     "remote_workspace": remote_workspace_for_command,
@@ -2576,6 +2588,8 @@ def apply_remote_poll_result(job: Dict[str, Any], poll_result: Dict[str, Any]) -
     job["return_code"] = poll_result.get("return_code")
   if poll_result.get("remote_pid"):
     job["remote_pid"] = poll_result.get("remote_pid")
+  if poll_result.get("remote_tmux_session"):
+    job["remote_tmux_session"] = poll_result.get("remote_tmux_session")
   remote_result = job.setdefault("remote_result", {})
   for target_key, source_key in (
     ("remote_output_dir", "remote_output_dir"),
@@ -2689,6 +2703,7 @@ def cancel_flow_job(job: Dict[str, Any], remote_config: Dict[str, Any] | None = 
       remote_config=remote_config,
       remote_job_dir=str(job.get("remote_job_dir", "")),
       remote_pid=str(job.get("remote_pid", "")),
+      remote_tmux_session=str(job.get("remote_tmux_session", "")),
     )
   else:
     process = job.get("_process")
@@ -2969,9 +2984,14 @@ def start_remote_job_thread(
         cancel_checker=lambda: bool(job.get("cancel_requested")),
       )
       job["remote_detached"] = True
+      job["execution_backend"] = result.get("execution_backend", "tmux")
       job["safe_to_close_web"] = True
       job["monitor_state"] = result.get("monitor_state", "monitoring")
       job["remote_pid"] = result.get("remote_pid", "")
+      job["remote_tmux_session"] = result.get("remote_tmux_session", job.get("remote_tmux_session", ""))
+      job["remote_tmux_attach_command"] = result.get("remote_tmux_attach_command", job.get("remote_tmux_attach_command", ""))
+      job["tmux_available"] = result.get("tmux_available", True)
+      job["tmux_install"] = result.get("tmux_install", job.get("tmux_install", {}))
       job["remote_job_dir"] = result.get("remote_job_dir", "")
       job["remote_run_script"] = result.get("remote_run_script", "")
       job["remote_log_path"] = result.get("remote_log_path", "")
@@ -2995,7 +3015,7 @@ def start_remote_job_thread(
       else:
         job["status"] = "running"
         job["remote_stage"] = "remote_detached_running"
-        append_job_log_line(job, "stdout", "[Detached] Safe to close page. Remote training will continue on the server.\n")
+        append_job_log_line(job, "stdout", "[Tmux] Safe to close page. Remote training will continue inside the tmux session.\n")
         persist_job_state(job)
         start_remote_monitor_thread(job, remote_config)
     except Exception as exc:  # pragma: no cover - network/runtime dependent
@@ -3253,6 +3273,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
             remote_config=remote_config,
             remote_job_dir=str(job.get("remote_job_dir", "")),
             remote_pid=str(job.get("remote_pid", "")),
+            remote_tmux_session=str(job.get("remote_tmux_session", "")),
           )
         except Exception as exc:
           job["cancel_requested"] = False
@@ -3777,6 +3798,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
       command_override = str(payload.get("command_override", "")).strip()
       requested_job_id = str(payload.get("job_id", payload.get("preview_job_id", ""))).strip()
       job_id = requested_job_id if requested_job_id and requested_job_id not in JOBS else str(uuid.uuid4())
+      job_tmux_session = build_remote_tmux_session_name(family=family, job_id=job_id)
       job = {
         "id": job_id,
         "status": "queued",
@@ -3798,6 +3820,14 @@ class ApiHandler(SimpleHTTPRequestHandler):
         "repo_path": definition.get("repo_path", ""),
         "cwd": definition.get("default_cwd", ""),
         "remote": sanitize_remote_config(validated_remote),
+        "execution_backend": "tmux",
+        "remote_tmux_session": job_tmux_session,
+        "remote_tmux_attach_command": build_remote_tmux_attach_command(validated_remote, job_tmux_session),
+        "tmux_available": None,
+        "tmux_install": {
+          "policy": "submit_time_sudo_n",
+          "uses_password_sudo": False,
+        },
         "remote_stage": "queued",
         "remote_detached": False,
         "safe_to_close_web": False,
@@ -3842,7 +3872,12 @@ class ApiHandler(SimpleHTTPRequestHandler):
           "materialized": materialized_result,
           "remote_check": preflight_report,
           "remote_detached": bool(job.get("remote_detached")),
+          "execution_backend": job.get("execution_backend", "tmux"),
           "remote_pid": job.get("remote_pid", ""),
+          "remote_tmux_session": job.get("remote_tmux_session", ""),
+          "remote_tmux_attach_command": job.get("remote_tmux_attach_command", ""),
+          "tmux_available": job.get("tmux_available"),
+          "tmux_install": job.get("tmux_install", {}),
           "remote_log_path": job.get("remote_log_path", ""),
           "remote_status_path": job.get("remote_status_path", ""),
           "safe_to_close_web": bool(job.get("safe_to_close_web")),

@@ -357,6 +357,21 @@ def remote_preflight_check(
       "python": validated["python"],
     })
 
+    tmux_available = _check_remote_command_available(client, "tmux")
+    tmux_install_candidate = {} if tmux_available else _detect_remote_tmux_install_candidate(client)
+    checks.append({
+      "name": "remote_tmux",
+      "ok": tmux_available,
+      "message": "Remote tmux executable is available" if tmux_available else "Remote tmux executable not found; submit will try sudo -n installation",
+      "required": False,
+      "details": {
+        "install_manager": tmux_install_candidate.get("manager", ""),
+        "install_command": tmux_install_candidate.get("command", ""),
+        "manual_command": tmux_install_candidate.get("manual_command", ""),
+        "uses_password_sudo": False,
+      },
+    })
+
     xvfb_run_available = _check_remote_command_available(client, "xvfb-run")
     checks.append({
       "name": "remote_xvfb_run",
@@ -405,6 +420,13 @@ def remote_preflight_check(
       "remote": sanitize_remote_config(validated),
       "checks": checks,
       "datasets": datasets,
+      "tmux": {
+        "available": tmux_available,
+        "install_manager": tmux_install_candidate.get("manager", ""),
+        "install_command": tmux_install_candidate.get("command", ""),
+        "manual_command": tmux_install_candidate.get("manual_command", ""),
+        "uses_password_sudo": False,
+      },
       "summary": (
         f"SSH and remote path preflight checks passed. "
         f"Found {len(datasets)} reusable remote dataset(s)."
@@ -454,6 +476,116 @@ def build_remote_paths(
 
 def _quote(value: str) -> str:
   return shlex.quote(str(value))
+
+
+def build_remote_tmux_session_name(*, family: str, job_id: str) -> str:
+  raw = f"wgsc-{family}-{job_id}".strip("-")
+  normalized = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw).strip("-")
+  normalized = re.sub(r"-{2,}", "-", normalized)
+  return (normalized or "wgsc-remote-job")[:80]
+
+
+def build_remote_tmux_attach_command(remote_config: Dict[str, Any], tmux_session: str) -> str:
+  validated = validate_remote_config(remote_config)
+  remote_target = f"{validated['username']}@{validated['host']}"
+  remote_command = f"tmux attach -t {_quote(tmux_session)}"
+  return f"ssh -t -p {validated['port']} {_quote(remote_target)} {_quote(remote_command)}"
+
+
+def _tmux_install_candidates() -> list[Dict[str, str]]:
+  return [
+    {
+      "manager": "apt-get",
+      "detect": "command -v apt-get >/dev/null 2>&1",
+      "command": "sudo -n apt-get update && sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y tmux",
+      "manual_command": "sudo apt-get update && sudo apt-get install -y tmux",
+    },
+    {
+      "manager": "dnf",
+      "detect": "command -v dnf >/dev/null 2>&1",
+      "command": "sudo -n dnf install -y tmux",
+      "manual_command": "sudo dnf install -y tmux",
+    },
+    {
+      "manager": "yum",
+      "detect": "command -v yum >/dev/null 2>&1",
+      "command": "sudo -n yum install -y tmux",
+      "manual_command": "sudo yum install -y tmux",
+    },
+    {
+      "manager": "pacman",
+      "detect": "command -v pacman >/dev/null 2>&1",
+      "command": "sudo -n pacman -Sy --noconfirm tmux",
+      "manual_command": "sudo pacman -Sy tmux",
+    },
+    {
+      "manager": "zypper",
+      "detect": "command -v zypper >/dev/null 2>&1",
+      "command": "sudo -n zypper --non-interactive install tmux",
+      "manual_command": "sudo zypper install tmux",
+    },
+  ]
+
+
+def _detect_remote_tmux_install_candidate(client) -> Dict[str, str]:
+  for candidate in _tmux_install_candidates():
+    if _run_remote_command(client, f"bash -lc {_quote(candidate['detect'])}", None) == 0:
+      return dict(candidate)
+  return {}
+
+
+def _assert_safe_tmux_install_command(command: str) -> None:
+  if "sudo -S" in command or "--stdin" in command:
+    raise RemoteExecutionError(
+      "Unsafe tmux install command rejected: password-based sudo is not allowed.",
+      code_hint="WGSC-STEP5-TMUX-INSTALL-UNSAFE",
+      stage="tmux",
+    )
+  if "sudo -n" not in command:
+    raise RemoteExecutionError(
+      "Unsafe tmux install command rejected: only non-interactive sudo -n is allowed.",
+      code_hint="WGSC-STEP5-TMUX-INSTALL-UNSAFE",
+      stage="tmux",
+    )
+
+
+def _ensure_remote_tmux_available(client, log_callback: Callable[[str, str], None] | None = None) -> Dict[str, Any]:
+  if _check_remote_command_available(client, "tmux"):
+    return {"available": True, "installed": False, "manager": "", "command": "", "manual_command": ""}
+
+  candidate = _detect_remote_tmux_install_candidate(client)
+  if not candidate:
+    raise RemoteExecutionError(
+      "Remote tmux is not installed and no supported package manager was detected. Install tmux manually, then retry.",
+      code_hint="WGSC-STEP5-TMUX-001",
+      stage="tmux",
+    )
+
+  install_command = str(candidate.get("command", ""))
+  _assert_safe_tmux_install_command(install_command)
+  if log_callback:
+    log_callback("stdout", f"[Tmux] tmux not found. Trying non-interactive install with {candidate['manager']}.\n")
+    log_callback("stdout", f"[Tmux] Install command: {install_command}\n")
+
+  install_rc = _run_remote_command(client, f"bash -lc {_quote(install_command)}", log_callback)
+  if install_rc != 0 or not _check_remote_command_available(client, "tmux"):
+    manual = str(candidate.get("manual_command", "")).strip()
+    raise RemoteExecutionError(
+      (
+        "Remote tmux is not installed and automatic non-interactive sudo install failed. "
+        f"Run manually on the remote host: {manual or 'install tmux with your package manager'}"
+      ),
+      code_hint="WGSC-STEP5-TMUX-001",
+      stage="tmux",
+    )
+
+  return {
+    "available": True,
+    "installed": True,
+    "manager": candidate.get("manager", ""),
+    "command": install_command,
+    "manual_command": candidate.get("manual_command", ""),
+  }
 
 
 def _sftp_mkdir_p(sftp, remote_dir: str) -> None:
@@ -937,8 +1069,8 @@ finish_with() {{
   exit "$return_code"
 }}
 
-echo "[Web-GSC] Detached remote job started at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-write_status "running" "remote_detached_running" "" "Remote job is detached. It is safe to close the web page."
+echo "[Web-GSC] Tmux remote job started at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+write_status "running" "remote_detached_running" "" "Remote tmux job is running. It is safe to close the web page."
 
 {colmap_block}
 
@@ -962,6 +1094,29 @@ def _build_remote_detached_start_command(remote_job_paths: Dict[str, str]) -> st
     f" && chmod +x {_quote(remote_job_paths['run_script'])}"
     f" && (cd {_quote(remote_job_paths['job_dir'])}"
     f" && (setsid nohup bash {_quote(remote_job_paths['run_script'])} >> {_quote(remote_job_paths['runtime_log'])} 2>&1 < /dev/null & echo $! > {_quote(remote_job_paths['launcher_pid_file'])}))"
+    " && sleep 0.5"
+  )
+
+
+def _build_remote_tmux_start_command(remote_job_paths: Dict[str, str], tmux_session: str) -> str:
+  launcher_script = f"""tmux set-window-option remain-on-exit on >/dev/null 2>&1 || true
+echo "[Tmux] Session {tmux_session} started at $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a {_quote(remote_job_paths['runtime_log'])}
+set -o pipefail
+bash {_quote(remote_job_paths['run_script'])} 2>&1 | tee -a {_quote(remote_job_paths['runtime_log'])}
+run_rc=${{PIPESTATUS[0]}}
+echo "[Tmux] run.sh exited with code $run_rc at $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a {_quote(remote_job_paths['runtime_log'])}
+exit "$run_rc"
+"""
+  tmux_shell_command = f"bash -lc {_quote(launcher_script)}"
+  return (
+    f"mkdir -p {_quote(remote_job_paths['job_dir'])}"
+    f" && rm -f {_quote(remote_job_paths['pid_file'])} {_quote(remote_job_paths['launcher_pid_file'])} "
+    f"{_quote(remote_job_paths['exit_code_file'])} {_quote(remote_job_paths['status_file'])}"
+    f" && : > {_quote(remote_job_paths['runtime_log'])}"
+    f" && chmod +x {_quote(remote_job_paths['run_script'])}"
+    f" && if tmux has-session -t {_quote(tmux_session)} 2>/dev/null; then tmux kill-session -t {_quote(tmux_session)}; fi"
+    f" && tmux new-session -d -s {_quote(tmux_session)} -c {_quote(remote_job_paths['job_dir'])} {_quote(tmux_shell_command)}"
+    f" && tmux display-message -p -t {_quote(tmux_session)} {_quote('#{pane_pid}')} > {_quote(remote_job_paths['launcher_pid_file'])}"
     " && sleep 0.5"
   )
 
@@ -1009,6 +1164,8 @@ def start_remote_algorithm_detached(
     job_id=job_id,
   )
   remote_job_paths = _remote_job_paths(remote_paths["output_dir"])
+  remote_tmux_session = build_remote_tmux_session_name(family=family, job_id=job_id)
+  remote_tmux_attach_command = build_remote_tmux_attach_command(validated, remote_tmux_session)
 
   resolved_dataset_id = str(remote_dataset_id or "").strip()
   resolved_dataset_name = str(dataset_name or "").strip() or resolved_dataset_id
@@ -1086,6 +1243,11 @@ def start_remote_algorithm_detached(
     sftp = client.open_sftp()
     assert_not_cancelled()
 
+    if stage_callback:
+      stage_callback("checking_tmux")
+    tmux_install = _ensure_remote_tmux_available(client, log_callback)
+    assert_not_cancelled()
+
     if use_existing_remote_dataset:
       if stage_callback:
         stage_callback("using_existing_dataset")
@@ -1143,7 +1305,7 @@ def start_remote_algorithm_detached(
       use_existing_remote_dataset=use_existing_remote_dataset,
     )
     _write_remote_text(sftp, remote_job_paths["run_script"], run_script)
-    start_command = _build_remote_detached_start_command(remote_job_paths)
+    start_command = _build_remote_tmux_start_command(remote_job_paths, remote_tmux_session)
     start_rc = _run_remote_command(
       client,
       f"bash -lc {_quote(start_command)}",
@@ -1163,8 +1325,9 @@ def start_remote_algorithm_detached(
       log_callback(
         "stdout",
         (
-          f"[Detached] Remote job started in background. PID: {remote_pid or '-'}; "
-          f"log: {remote_job_paths['runtime_log']}\n"
+          f"[Tmux] Remote job started in tmux session {remote_tmux_session}. "
+          f"PID: {remote_pid or '-'}; log: {remote_job_paths['runtime_log']}\n"
+          f"[Tmux] Attach command: {remote_tmux_attach_command}\n"
         ),
       )
     if stage_callback:
@@ -1172,10 +1335,15 @@ def start_remote_algorithm_detached(
 
     return {
       "return_code": None,
+      "execution_backend": "tmux",
       "remote_detached": True,
       "safe_to_close_web": True,
       "monitor_state": "monitoring",
       "remote_pid": remote_pid,
+      "remote_tmux_session": remote_tmux_session,
+      "remote_tmux_attach_command": remote_tmux_attach_command,
+      "tmux_available": True,
+      "tmux_install": tmux_install,
       "remote_workspace_dir": remote_workspace_for_command,
       "remote_output_dir": remote_paths["output_dir"],
       "remote_job_dir": remote_job_paths["job_dir"],
@@ -1244,6 +1412,7 @@ def poll_remote_detached_job(
       "stage": stage,
       "return_code": return_code,
       "remote_pid": str(status_payload.get("pid", "")),
+      "remote_tmux_session": str(status_payload.get("remote_tmux_session", "")),
       "message": str(status_payload.get("message", "")),
       "remote_log_path": str(status_payload.get("remote_log_path") or remote_log_path),
       "remote_output_dir": str(status_payload.get("remote_output_dir") or remote_output_dir),
@@ -1268,11 +1437,30 @@ def poll_remote_detached_job(
       pass
 
 
+def _build_remote_cancel_script(remote_job_paths: Dict[str, str], resolved_pid: str = "", tmux_session: str = "") -> str:
+  return (
+    f"pid={_quote(resolved_pid)}; "
+    f"tmux_session={_quote(tmux_session)}; "
+    f"if [ -n \"$tmux_session\" ] && command -v tmux >/dev/null 2>&1; then "
+    "tmux kill-session -t \"$tmux_session\" >/dev/null 2>&1 || true; "
+    "fi; "
+    f"if [ -z \"$pid\" ] && [ -f {_quote(remote_job_paths['pid_file'])} ]; then pid=$(cat {_quote(remote_job_paths['pid_file'])}); fi; "
+    "if [ -n \"$pid\" ]; then "
+    "kill -TERM -- -$pid >/dev/null 2>&1 || kill -TERM $pid >/dev/null 2>&1 || true; "
+    "sleep 1; "
+    "kill -KILL -- -$pid >/dev/null 2>&1 || true; "
+    "fi; "
+    f"echo 130 > {_quote(remote_job_paths['exit_code_file'])}; "
+    f"printf '%s\\n' '[Cancel] Remote tmux job cancellation requested.' >> {_quote(remote_job_paths['runtime_log'])}"
+  )
+
+
 def cancel_remote_detached_job(
   *,
   remote_config: Dict[str, Any],
   remote_job_dir: str,
   remote_pid: str = "",
+  remote_tmux_session: str = "",
 ) -> Dict[str, Any]:
   validated = validate_remote_config(remote_config)
   remote_job_paths = {
@@ -1298,29 +1486,21 @@ def cancel_remote_detached_job(
     )
     sftp = client.open_sftp()
     resolved_pid = str(remote_pid or "").strip() or _read_remote_text_file(sftp, remote_job_paths["pid_file"]).strip()
-    cancel_script = (
-      f"pid={_quote(resolved_pid)}"
-      f" && if [ -z \"$pid\" ] && [ -f {_quote(remote_job_paths['pid_file'])} ]; then pid=$(cat {_quote(remote_job_paths['pid_file'])}); fi"
-      " && if [ -n \"$pid\" ]; then "
-      "kill -TERM -- -$pid >/dev/null 2>&1 || kill -TERM $pid >/dev/null 2>&1 || true; "
-      "sleep 1; "
-      "kill -KILL -- -$pid >/dev/null 2>&1 || true; "
-      "fi"
-      f" && echo 130 > {_quote(remote_job_paths['exit_code_file'])}"
-      f" && printf '%s\\n' '[Cancel] Detached remote job cancellation requested.' >> {_quote(remote_job_paths['runtime_log'])}"
-    )
+    tmux_session = str(remote_tmux_session or "").strip()
+    cancel_script = _build_remote_cancel_script(remote_job_paths, resolved_pid, tmux_session)
     _run_remote_command(client, f"bash -lc {_quote(cancel_script)}", None)
     status_payload = {
       "status": "canceled",
       "stage": "canceled",
       "return_code": 130,
       "pid": resolved_pid,
-      "message": "Detached remote job cancellation requested.",
+      "message": "Remote tmux job cancellation requested.",
       "remote_log_path": remote_job_paths["runtime_log"],
+      "remote_tmux_session": tmux_session,
       "updated_at": time.time(),
     }
     _write_remote_text(sftp, remote_job_paths["status_file"], json.dumps(status_payload, ensure_ascii=False, indent=2))
-    return {"ok": True, "remote_pid": resolved_pid, "status": "canceled"}
+    return {"ok": True, "remote_pid": resolved_pid, "remote_tmux_session": tmux_session, "status": "canceled"}
   finally:
     try:
       if sftp is not None:

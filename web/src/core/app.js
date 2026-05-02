@@ -1241,10 +1241,24 @@ function renderCommandPreview() {
         <p class="panel-copy">Remote Workspace: ${escapeHtml(preview.remote_workspace)}</p>
         <p class="panel-copy">Remote Output: ${escapeHtml(preview.remote_output_dir)}</p>
         <p class="panel-copy">Local Output: ${escapeHtml(preview.local_output_dir)}</p>
+        ${renderTmuxAttachInfo(preview)}
         ${preview.missing_inputs?.length ? `<p class="badge bad">Missing template inputs: ${escapeHtml(preview.missing_inputs.join(", "))}</p>` : `<p class="badge ok">Template inputs complete</p>`}
         ${commandMarkup}
       </div>
     </section>
+  `;
+}
+
+function renderTmuxAttachInfo(source) {
+  const attachCommand = String(source?.remote_tmux_attach_command || "").trim();
+  if (!attachCommand) return "";
+  const session = String(source?.remote_tmux_session || "").trim();
+  return `
+    <div class="tmux-attach-box">
+      <p class="panel-copy">Tmux Session: ${escapeHtml(session || "-")}</p>
+      <p class="panel-copy">Attach from another SSH tool to enter the same remote window:</p>
+      <pre>${escapeHtml(attachCommand)}</pre>
+    </div>
   `;
 }
 
@@ -1331,13 +1345,14 @@ function renderLogPanel() {
           <h3>Logs and Metrics</h3>
           <p class="panel-copy">${escapeHtml(job.id)} · ${escapeHtml(job.status || "-")}</p>
           ${job.safe_to_close_web && !isTerminal(job.status) ? `<p class="status-dot ok">Safe to close page · remote training keeps running.</p>` : ""}
-          ${job.monitor_state === "needs_remote_config" ? `<p class="status-dot warn">Detached remote job needs reattach with the saved remote config.</p>` : ""}
+          ${job.monitor_state === "needs_remote_config" ? `<p class="status-dot warn">Remote tmux monitor needs reattach with the saved remote config.</p>` : ""}
         </div>
         <div class="button-row">
           <a class="button-link ${downloadsEnabled ? "" : "disabled"}" href="${downloadsEnabled ? escapeHtml(logUrl) : "#"}" download>Download Logs</a>
           <a class="button-link ${downloadsEnabled ? "" : "disabled"}" href="${downloadsEnabled ? escapeHtml(csvUrl) : "#"}" download>Download metrics.csv</a>
         </div>
       </div>
+      ${renderTmuxAttachInfo(job)}
       <pre id="log-tail" class="logs">${escapeHtml(state.logText || "Waiting for log output...")}</pre>
     </section>
   `;

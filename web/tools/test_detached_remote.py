@@ -11,9 +11,13 @@ sys.path.insert(0, str(ROOT_DIR))
 
 from web.server import api_server
 from web.server.remote_executor import (
+  _build_remote_cancel_script,
   _build_remote_detached_run_script,
-  _build_remote_detached_start_command,
+  _build_remote_tmux_start_command,
   _remote_job_paths,
+  _tmux_install_candidates,
+  build_remote_tmux_attach_command,
+  build_remote_tmux_session_name,
 )
 
 
@@ -41,15 +45,35 @@ def test_detached_script_contract() -> None:
     resolved_dataset_name="Demo",
     use_existing_remote_dataset=False,
   )
-  start_command = _build_remote_detached_start_command(job_paths)
+  tmux_session = build_remote_tmux_session_name(family="hac", job_id="job 1:unsafe/name")
+  start_command = _build_remote_tmux_start_command(job_paths, tmux_session)
+  attach_command = build_remote_tmux_attach_command(
+    {
+      "host": "10.0.0.5",
+      "port": 2222,
+      "username": "ubuntu",
+      "password": "secret-password",
+      "repo_path": "/remote/repo",
+      "workspace_root": "/tmp/web_scan/workspaces",
+      "output_root": "/tmp/web_scan/outputs",
+      "python": "python3",
+      "activate_cmd": "",
+    },
+    tmux_session,
+  )
 
   assert "status.json" in script
   assert "runtime.log" in script
   assert "echo \"$$\" > \"$PID_FILE\"" in script
   assert "EXIT_CODE_FILE" in script
   assert "sequential_matcher" in script
-  assert "setsid" in start_command
-  assert "nohup" in start_command
+  assert "tmux new-session" in start_command
+  assert "tee -a" in start_command
+  assert "setsid" not in start_command
+  assert "nohup" not in start_command
+  assert tmux_session == "wgsc-hac-job-1-unsafe-name"
+  assert "tmux attach -t" in attach_command
+  assert "secret-password" not in attach_command
 
 
 def test_existing_dataset_disables_auto_colmap_contract() -> None:
@@ -96,6 +120,27 @@ def test_existing_dataset_colmap_preflight_is_optional() -> None:
     "check_colmap_required": True,
     "use_existing_remote_dataset": False,
   }) is True
+
+
+def test_tmux_install_candidates_use_noninteractive_sudo_only() -> None:
+  candidates = _tmux_install_candidates()
+  assert candidates
+  for candidate in candidates:
+    command = candidate["command"]
+    assert "sudo -n" in command
+    assert "sudo -S" not in command
+    assert "secret" not in command.lower()
+    assert "password" not in command.lower()
+
+
+def test_tmux_cancel_script_kills_session_and_preserves_logs() -> None:
+  job_paths = _remote_job_paths("/tmp/web_scan/outputs/session/hac/job/output")
+  cancel_script = _build_remote_cancel_script(job_paths, "12345", "wgsc-hac-job")
+
+  assert "tmux kill-session -t" in cancel_script
+  assert "echo 130" in cancel_script
+  assert "runtime.log" in cancel_script
+  assert "rm -rf" not in cancel_script
 
 
 def test_job_persistence_sanitizes_password() -> None:
@@ -167,6 +212,8 @@ def main() -> None:
   test_detached_script_contract()
   test_existing_dataset_disables_auto_colmap_contract()
   test_existing_dataset_colmap_preflight_is_optional()
+  test_tmux_install_candidates_use_noninteractive_sudo_only()
+  test_tmux_cancel_script_kills_session_and_preserves_logs()
   test_job_persistence_sanitizes_password()
   test_apply_remote_poll_statuses()
   print("detached remote tests passed")

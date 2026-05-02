@@ -303,6 +303,32 @@
       "repo_path": "../ContextGS-main",
       "repo_url": "https://github.com/wyf0912/ContextGS",
       "default_cwd": "../ContextGS-main",
+      "requirements": {
+        "python_modules": [
+          "torch",
+          "torchvision",
+          "diff_gaussian_rasterization",
+          "simple_knn",
+          "torch_scatter",
+          "compressai",
+          "torchac",
+          "lpips",
+          "plyfile",
+          "einops",
+          "cv2"
+        ],
+        "install_commands": {
+          "cuda121": [
+            "conda create -y -n contextgs python=3.10 pip",
+            "conda activate contextgs",
+            "conda install -y -c pytorch -c nvidia pytorch==2.2.2 torchvision==0.17.2 torchaudio==2.2.2 pytorch-cuda=12.1",
+            "conda install -y -c conda-forge numpy=1.26.* pillow=10.* plyfile=1.1.* scipy tqdm",
+            "python -m pip install einops lpips wandb==0.16.4 opencv-python colorama compressai==1.2.8 torchac==0.8.15",
+            "python -m pip install torch-scatter -f https://data.pyg.org/whl/torch-2.2.0+cu121.html",
+            "TORCH_CUDA_ARCH_LIST=8.9 CUDA_HOME=/usr/local/cuda-12.1 python -m pip install --no-build-isolation submodules/diff-gaussian-rasterization submodules/simple-knn"
+          ]
+        }
+      },
       "operations": {
         "train": {
           "enabled": true,

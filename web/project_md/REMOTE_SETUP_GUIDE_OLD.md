@@ -1,7 +1,8 @@
 # 远程 SSH 环境配置指南 — 旧版算法组
 
-> **适用项目**：CompGS、ContextGS、MEGS-2、reduced-3dgs、Scaffold-GS  
+> **适用项目**：CompGS、MEGS-2、reduced-3dgs、Scaffold-GS  
 > **环境**：Python 3.7.13 + PyTorch 1.12.1 + CUDA 11.6  
+> **说明**：ContextGS 已升级到 Python 3.10 + PyTorch 2.2 + CUDA 12.1，请使用 [REMOTE_SETUP_GUIDE_NEW.md](REMOTE_SETUP_GUIDE_NEW.md)。
 > **更新日期**：2026 年 4 月  
 > **作者**：Web_Scan 文档
 
@@ -46,11 +47,6 @@ conda activate CompGS_env
 conda install pytorch=1.12.1 torchvision=0.13.1 torchaudio=0.12.1 pytorch-cuda=11.6 -c pytorch -c nvidia -y
 # 安装其他依赖
 pip install -r requirements.txt
-
-# ContextGS
-cd ~/Web_Scan/ContextGS-main
-conda env create --file environment.yml
-conda activate contextgs
 
 # MEGS-2
 cd ~/Web_Scan/MEGS-2-main
@@ -103,8 +99,8 @@ pip install compressai pytorch_msssim torchac
 ### 第二步：准备项目代码
 
 ```bash
-# 以 ContextGS 为例（其他算法类似）
-cd ~/Web_Scan/ContextGS-main
+# 以 MEGS-2 为例（其他算法类似）
+cd ~/Web_Scan/MEGS-2-main
 
 # 初始化子模块（非常重要）
 git submodule update --init --recursive
@@ -185,9 +181,6 @@ if failed:
 # CompGS
 source ~/.bashrc && conda activate CompGS_env
 
-# ContextGS
-source ~/.bashrc && conda activate contextgs
-
 # MEGS-2
 source ~/.bashrc && conda activate MEGS2
 
@@ -206,7 +199,7 @@ source ~/.bashrc && conda activate GS_legacy
 | 错误信息 | 原因 | 解决方案 |
 |---------|------|--------|
 | `conda: command not found` | conda 路径未找到 | 检查 `~/.bashrc` 中的 conda 初始化 |
-| `(contextgs)` 前缀消失 | 非交互 shell 中 conda 激活失败 | 使用 `source ~/.bashrc && conda activate contextgs` 的完整形式 |
+| 环境前缀消失 | 非交互 shell 中 conda 激活失败 | 使用 `source ~/.bashrc && conda activate <env>` 的完整形式 |
 | `environment not found` | 环境名称拼写错误 | 运行 `conda env list` 确认环境名称 |
 
 ---
@@ -304,11 +297,22 @@ python Train.py --config Configs/standard.yaml
 
 ---
 
-### ContextGS（命令行参数方式）
+### ContextGS（已迁移到新版环境）
+
+ContextGS 当前使用 Python 3.10 + PyTorch 2.2 + CUDA 12.1，并针对 RTX 4090 检查 CUDA capability 8.9。请参考 [REMOTE_SETUP_GUIDE_NEW.md](REMOTE_SETUP_GUIDE_NEW.md)，并使用：
+
+```bash
+cd ~/Web_Scan/ContextGS-main
+conda env create --file environment.yml
+conda activate contextgs
+bash ../web/tools/remote_verify_setup.sh contextgs
+```
+
+### 旧版命令行算法（MEGS-2 / reduced-3dgs / Scaffold-GS）
 
 #### 参数配置方式
 
-**ContextGS 使用命令行参数**。完整参数通过 `train.py -h` 查看。
+这些旧版算法使用命令行参数。完整参数通过各项目的 `train.py -h` 查看。
 
 #### 必需参数
 
@@ -668,8 +672,8 @@ colmap -h
 - [ ] Python 版本 3.7.13：`python3 --version`
 
 ### ✅ 环境检查
-- [ ] Conda 环境已创建：`conda env list` 显示 contextgs、MEGS2 等
-- [ ] 环境激活命令可用：`source ~/.bashrc && conda activate contextgs`
+- [ ] Conda 环境已创建：`conda env list` 显示 MEGS2、scaffold_gs 等
+- [ ] 环境激活命令可用：`source ~/.bashrc && conda activate MEGS2`
 
 ### ✅ 项目检查
 - [ ] 项目代码已克隆到远程主机
@@ -686,7 +690,7 @@ colmap -h
 | 算法 | Conda 环境名 | 激活命令 | 训练脚本 | 参数方式 | 状态 |
 |------|-------------|---------|---------|---------|------|
 | CompGS | CompGS_env | `conda activate CompGS_env` | Train.py | YAML 配置 | ✓ |
-| ContextGS | contextgs | `conda activate contextgs` | train.py | 命令行参数 | ✓ |
+| ContextGS | contextgs | `conda activate contextgs` | train.py | 命令行参数 | 已迁移到新版 |
 | MEGS-2 | MEGS2 | `conda activate MEGS2` | train.py | 命令行参数 | ✓ |
 | reduced-3dgs | gaussian_splatting | `conda activate gaussian_splatting` | train.py | 命令行参数 | ✓ |
 | Scaffold-GS | scaffold_gs | `conda activate scaffold_gs` | train.py | 命令行参数 | ✓ |

@@ -7,7 +7,8 @@
 # 用法：
 #   bash remote_verify_setup.sh              # 自动检测
 #   bash remote_verify_setup.sh new          # 新版（HAC-plus/FCGS）
-#   bash remote_verify_setup.sh old          # 旧版（CompGS/ContextGS/MEGS-2 等）
+#   bash remote_verify_setup.sh contextgs    # ContextGS Python 3.10 + CUDA 12.1
+#   bash remote_verify_setup.sh old          # 旧版（CompGS/MEGS-2 等）
 #
 
 set -e
@@ -61,7 +62,9 @@ detect_version() {
   local python_ver=$(get_python_version)
   local pytorch_ver=$(get_pytorch_version)
   
-  if [[ "$python_ver" == 3.10* ]]; then
+  if [[ "$python_ver" == 3.10* ]] && python3 -c 'import compressai, torchac' >/dev/null 2>&1; then
+    echo "contextgs"
+  elif [[ "$python_ver" == 3.10* ]]; then
     echo "new"
   elif [[ "$python_ver" == 3.7* ]]; then
     echo "old"
@@ -122,6 +125,65 @@ check_new_version() {
   fi
 }
 
+# ContextGS 检查（Python 3.10 + PyTorch 2.2 + CUDA 12.1 + RTX 4090）
+check_contextgs_version() {
+  echo -e "\n${BLUE}=== ContextGS 检查 (Python 3.10 + PyTorch 2.2 + CUDA 12.1 + RTX 4090) ===${NC}"
+  echo ""
+
+  # 系统检查
+  echo "--- 系统信息 ---"
+  check_item "Linux 系统" "uname -a | grep -i linux"
+  check_item "磁盘空间 (≥100GB)" "[ \$(df / 2>/dev/null | awk 'NR==2 {print \$4}') -gt 100000000 ]"
+  check_item "GPU 驱动" "nvidia-smi > /dev/null"
+  check_item "CUDA Toolkit / nvcc" "command -v nvcc >/dev/null 2>&1"
+
+  # Python 检查
+  echo ""
+  echo "--- Python 环境 ---"
+  check_item "Python 3.10" "python3 --version | grep '3.10'"
+  check_item "PyTorch 2.2" "python3 -c 'import torch; assert torch.__version__.startswith(\"2.2\")'"
+  check_item "CUDA 可用" "python3 -c 'import torch; assert torch.cuda.is_available()'"
+  check_item "GPU 可见" "python3 -c 'import torch; assert torch.cuda.device_count() > 0'"
+  check_item "RTX 4090" "python3 -c 'import torch; assert torch.cuda.is_available() and \"4090\" in torch.cuda.get_device_name(0)'"
+
+  # CUDA 版本检查
+  echo ""
+  echo "--- CUDA 版本 ---"
+  check_item "PyTorch CUDA 12.1" "python3 -c 'import torch; v=torch.version.cuda; assert v and v.startswith(\"12.1\")'"
+  check_item "CUDA 架构 sm_89" "python3 -c 'import torch; assert torch.cuda.is_available() and torch.cuda.get_device_capability(0) == (8, 9)'"
+
+  # 依赖包检查
+  echo ""
+  echo "--- 依赖包 ---"
+  check_item "torchvision" "python3 -c 'import torchvision'"
+  check_item "plyfile" "python3 -c 'import plyfile'"
+  check_item "lpips" "python3 -c 'import lpips'"
+  check_item "einops" "python3 -c 'import einops'"
+  check_item "numpy" "python3 -c 'import numpy'"
+  check_item "scipy" "python3 -c 'import scipy'"
+  check_item "tqdm" "python3 -c 'import tqdm'"
+  check_item "compressai" "python3 -c 'import compressai'"
+  check_item "torchac" "python3 -c 'import torchac'"
+  check_item "opencv-python" "python3 -c 'import cv2'"
+  check_item "torch-scatter" "python3 -c 'import torch_scatter'"
+
+  # 子模块检查
+  echo ""
+  echo "--- ContextGS CUDA 子模块 ---"
+  check_item "diff-gaussian-rasterization" "python3 -c 'import diff_gaussian_rasterization'"
+  check_item "simple-knn" "python3 -c 'import simple_knn'"
+
+  # 环境激活检查
+  echo ""
+  echo "--- 环境激活 ---"
+  if command -v conda &> /dev/null; then
+    check_item "Conda 命令" "conda --version"
+    check_item "contextgs 环境存在" "conda env list | grep -E '^contextgs[[:space:]]|[[:space:]]contextgs$|/contextgs$'" true
+  else
+    echo -e "${YELLOW}⚠ Conda 不在 PATH 中（可能使用绝对路径激活）${NC}"
+  fi
+}
+
 # 旧版检查（Python 3.7.13 + PyTorch 1.12.1 + CUDA 11.6）
 check_old_version() {
   echo -e "\n${BLUE}=== 旧版算法组检查 (Python 3.7.13 + PyTorch 1.12.1) ===${NC}"
@@ -168,7 +230,7 @@ check_old_version() {
   echo "--- 环境激活 ---"
   if command -v conda &> /dev/null; then
     check_item "Conda 命令" "conda --version"
-    check_item "contextgs/MEGS2/scaffold_gs 环境存在" "conda env list | grep -E 'contextgs|MEGS2|scaffold_gs|CompGS_env|gaussian_splatting'" true
+    check_item "MEGS2/scaffold_gs 环境存在" "conda env list | grep -E 'MEGS2|scaffold_gs|CompGS_env|gaussian_splatting'" true
   else
     echo -e "${YELLOW}⚠ Conda 不在 PATH 中（可能使用绝对路径激活）${NC}"
   fi
@@ -214,6 +276,7 @@ main() {
       echo -e "${YELLOW}无法自动检测环境版本${NC}"
       echo "请手动指定:"
       echo "  bash remote_verify_setup.sh new   (新版: Python 3.10 + PyTorch 2.2)"
+      echo "  bash remote_verify_setup.sh contextgs   (ContextGS: Python 3.10 + PyTorch 2.2 + CUDA 12.1)"
       echo "  bash remote_verify_setup.sh old   (旧版: Python 3.7 + PyTorch 1.12)"
       return 1
     fi
@@ -226,12 +289,15 @@ main() {
     new)
       check_new_version
       ;;
+    contextgs)
+      check_contextgs_version
+      ;;
     old)
       check_old_version
       ;;
     *)
       echo -e "${RED}未知的版本: $version${NC}"
-      echo "请使用 'new' 或 'old'"
+      echo "请使用 'new'、'contextgs' 或 'old'"
       return 1
       ;;
   esac

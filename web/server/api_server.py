@@ -881,6 +881,157 @@ def _runtime_check_item(name: str, ok: bool, *, required: bool, message: str, hi
   }
 
 
+def _python_probe(script: str, timeout: int = 15) -> Dict[str, Any]:
+  try:
+    result = subprocess.run(
+      [sys.executable, "-c", script],
+      cwd=str(ROOT_DIR),
+      capture_output=True,
+      text=True,
+      timeout=timeout,
+      check=False,
+    )
+  except Exception as exc:
+    return {"ok": False, "stdout": "", "stderr": str(exc), "returncode": -1}
+  return {
+    "ok": result.returncode == 0,
+    "stdout": result.stdout.strip(),
+    "stderr": result.stderr.strip(),
+    "returncode": result.returncode,
+  }
+
+
+def _contextgs_environment_checks() -> tuple[list[Dict[str, Any]], list[str], Dict[str, Any]]:
+  checks: list[Dict[str, Any]] = []
+  warnings: list[str] = []
+  metadata: Dict[str, Any] = {}
+
+  contextgs_root = ROOT_DIR / "ContextGS-main"
+  repo_ok = contextgs_root.exists()
+  checks.append(_runtime_check_item(
+    "contextgs_repo",
+    repo_ok,
+    required=True,
+    message="ContextGS repository exists." if repo_ok else "Missing ContextGS-main repository.",
+    hint="Place ContextGS-main next to web/ or update the adapter repo path.",
+    details={"path": str(contextgs_root)},
+  ))
+
+  python_ok = sys.version_info[:2] == (3, 10)
+  checks.append(_runtime_check_item(
+    "contextgs_python310",
+    python_ok,
+    required=True,
+    message=f"Python {sys.version_info.major}.{sys.version_info.minor} is active." if python_ok else f"Expected Python 3.10, got {sys.version.split()[0]}.",
+    hint="Activate the contextgs conda environment before launching the API server.",
+    details={"python_executable": sys.executable, "version": sys.version.split()[0]},
+  ))
+
+  torch_probe = _python_probe(
+    "import json, torch; "
+    "info={'torch_version': torch.__version__, 'cuda_version': torch.version.cuda, "
+    "'cuda_available': torch.cuda.is_available(), 'device_count': torch.cuda.device_count(), "
+    "'device_name': torch.cuda.get_device_name(0) if torch.cuda.is_available() else '', "
+    "'capability': torch.cuda.get_device_capability(0) if torch.cuda.is_available() else None}; "
+    "print(json.dumps(info))"
+  )
+  torch_info: Dict[str, Any] = {}
+  if torch_probe["ok"]:
+    try:
+      torch_info = json.loads(torch_probe["stdout"] or "{}")
+    except Exception:
+      torch_info = {}
+  metadata["torch"] = torch_info
+
+  torch_version = str(torch_info.get("torch_version", ""))
+  torch_ok = torch_probe["ok"] and torch_version.startswith("2.2")
+  checks.append(_runtime_check_item(
+    "contextgs_torch22",
+    torch_ok,
+    required=True,
+    message=f"PyTorch {torch_version} is active." if torch_ok else "Expected PyTorch 2.2.x for ContextGS.",
+    hint="Install PyTorch 2.2.2 with pytorch-cuda=12.1 in the contextgs environment.",
+    details={"probe": torch_probe, "torch": torch_info},
+  ))
+
+  cuda_version = str(torch_info.get("cuda_version", "") or "")
+  cuda_ok = torch_probe["ok"] and cuda_version.startswith("12.1")
+  checks.append(_runtime_check_item(
+    "contextgs_cuda121",
+    cuda_ok,
+    required=True,
+    message=f"PyTorch CUDA runtime is {cuda_version}." if cuda_ok else f"Expected torch.version.cuda to be 12.1, got {cuda_version or 'unavailable'}.",
+    hint="Reinstall PyTorch with `pytorch-cuda=12.1`.",
+    details={"cuda_version": cuda_version},
+  ))
+
+  cuda_available = bool(torch_info.get("cuda_available"))
+  checks.append(_runtime_check_item(
+    "contextgs_cuda_available",
+    cuda_available,
+    required=True,
+    message="CUDA is available to PyTorch." if cuda_available else "PyTorch cannot access CUDA.",
+    hint="Check NVIDIA driver, nvidia-smi, CUDA_VISIBLE_DEVICES, and conda environment activation.",
+    details={"torch": torch_info},
+  ))
+
+  device_name = str(torch_info.get("device_name", "") or "")
+  rtx4090_ok = cuda_available and "4090" in device_name
+  checks.append(_runtime_check_item(
+    "contextgs_rtx4090",
+    rtx4090_ok,
+    required=True,
+    message=f"First CUDA device is {device_name}." if rtx4090_ok else f"Expected RTX 4090, got {device_name or 'no CUDA device'}.",
+    hint="Run ContextGS on the remote Linux RTX 4090 host, or set CUDA_VISIBLE_DEVICES to the 4090.",
+    details={"device_name": device_name, "capability": torch_info.get("capability")},
+  ))
+
+  toolkit = detect_cuda_toolkit()
+  checks.append(_runtime_check_item(
+    "contextgs_cuda_toolkit",
+    bool(toolkit.get("toolkit_ready")),
+    required=True,
+    message="CUDA Toolkit and nvcc are available." if toolkit.get("toolkit_ready") else "CUDA Toolkit or nvcc was not found.",
+    hint="Install CUDA Toolkit 12.1 and set CUDA_HOME before rebuilding ContextGS CUDA extensions.",
+    details=toolkit,
+  ))
+
+  required_modules = [
+    ("torchvision", "torchvision"),
+    ("diff_gaussian_rasterization", "diff_gaussian_rasterization"),
+    ("simple_knn", "simple_knn"),
+    ("torch_scatter", "torch_scatter"),
+    ("compressai", "compressai"),
+    ("torchac", "torchac"),
+    ("lpips", "lpips"),
+    ("plyfile", "plyfile"),
+    ("einops", "einops"),
+    ("cv2", "opencv-python"),
+  ]
+  missing_modules: list[str] = []
+  if not torch_probe["ok"]:
+    missing_modules.append("torch")
+  for module_name, package_name in required_modules:
+    probe = _python_probe(f"import {module_name}")
+    if not probe["ok"]:
+      missing_modules.append(module_name)
+    checks.append(_runtime_check_item(
+      f"contextgs_module_{module_name}",
+      probe["ok"],
+      required=True,
+      message=f"Python module {module_name} imports successfully." if probe["ok"] else f"Missing or broken Python module {module_name}.",
+      hint=f"Install/rebuild {package_name} in the contextgs environment.",
+      details={"probe": probe},
+    ))
+
+  if missing_modules:
+    warnings.append("ContextGS missing modules: " + ", ".join(missing_modules))
+
+  metadata["missing_python_modules"] = missing_modules
+  metadata["python_modules"] = [name for name, _package in required_modules]
+  return checks, warnings, metadata
+
+
 def environment_check(family: str | None = None) -> Dict[str, Any]:
   checks: list[Dict[str, Any]] = []
   warnings: list[str] = []
@@ -952,32 +1103,50 @@ def environment_check(family: str | None = None) -> Dict[str, Any]:
   if not paramiko_available:
     warnings.append("Remote SSH features are unavailable until paramiko is installed.")
 
+  family_key = (family or "").strip().lower()
+  algorithm_metadata: Dict[str, Any] = {}
+  if family_key == "contextgs":
+    contextgs_checks, contextgs_warnings, algorithm_metadata = _contextgs_environment_checks()
+    checks.extend(contextgs_checks)
+    warnings.extend(contextgs_warnings)
+
   required_checks_ok = all(item["ok"] for item in checks if item["required"])
-  runtime_ready = required_checks_ok
+  web_required_names = {"api_runtime", "web_index", "viewer_assets", "generated_dir_writable"}
+  web_required_ok = all(item["ok"] for item in checks if item["required"] and item["name"] in web_required_names)
+  runtime_ready = web_required_ok
+  algorithm_ready = required_checks_ok
   remote_ready = runtime_ready and paramiko_available
 
   summary = "Web runtime checks passed."
   if not runtime_ready:
     summary = "Web runtime checks failed. Fix required items before continuing."
+  elif family_key == "contextgs" and not algorithm_ready:
+    summary = "Web runtime is ready, but ContextGS Python/CUDA checks failed."
   elif not remote_ready:
     summary = "Web runtime is ready, but remote SSH checks require paramiko."
+  elif family_key == "contextgs":
+    summary = "Web runtime and ContextGS Python/CUDA checks passed."
+
+  adapter = get_adapter(family_key) if family_key else None
+  requirement_spec = adapter_requirement_spec(adapter) if adapter else {"python_modules": [], "install_commands": {}}
 
   return {
     "family": family or "",
     "runtime_ready": runtime_ready,
+    "algorithm_ready": algorithm_ready,
     "remote_ready": remote_ready,
     "checks": checks,
     "warnings": warnings,
     "summary": summary,
     # Backward-compatible fields used by previous UI versions.
     "web_runnable": runtime_ready,
-    "pipeline_ready": runtime_ready,
+    "pipeline_ready": algorithm_ready,
     "repo_exists": True,
     "gpu_visible": bool(which("nvidia-smi")),
     "python_executable": sys.executable,
-    "python_modules": [],
-    "missing_python_modules": [],
-    "install_commands": {},
+    "python_modules": algorithm_metadata.get("python_modules", requirement_spec.get("python_modules", [])),
+    "missing_python_modules": algorithm_metadata.get("missing_python_modules", []),
+    "install_commands": requirement_spec.get("install_commands", {}),
     "cuda_toolkit": detect_cuda_toolkit(),
     "commands": {
       "python3": {"found": python3_ok, "path": python3_path},

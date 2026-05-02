@@ -1,6 +1,6 @@
 # 远程 SSH 环境配置指南 — 新版算法组
 
-> **适用项目**：HAC-plus、FCGS  
+> **适用项目**：HAC-plus、FCGS、ContextGS  
 > **环境**：Python 3.10 + PyTorch 2.2.* + CUDA 11.8/12.1  
 > **更新日期**：2026 年 4 月  
 > **作者**：Web_Scan 文档
@@ -44,6 +44,11 @@ conda activate HAC_env
 cd ~/Web_Scan/FCGS-main
 conda env create --file environment.yml
 conda activate FCGS_env
+
+# 或者 ContextGS（RTX 4090 推荐 CUDA 12.1）
+cd ~/Web_Scan/ContextGS-main
+conda env create --file environment.yml
+conda activate contextgs
 ```
 
 **预计时间**：10-15 分钟（首次下载）
@@ -72,7 +77,11 @@ conda install -y pytorch=2.2 torchvision=0.17 pytorch-cuda=11.8 -c pytorch -c nv
 
 # 安装其他依赖
 conda install -y numpy scipy tqdm plyfile pip
-pip install einops wandb lpips colorama opencv-python imageio matplotlib torch-scatter
+pip install einops wandb lpips colorama opencv-python imageio matplotlib
+
+# ContextGS 额外依赖
+pip install compressai==1.2.8 torchac==0.8.15
+pip install torch-scatter -f https://data.pyg.org/whl/torch-2.2.0+cu121.html
 ```
 
 ---
@@ -81,7 +90,7 @@ pip install einops wandb lpips colorama opencv-python imageio matplotlib torch-s
 
 ```bash
 # 进入项目目录
-cd ~/Web_Scan/HAC-plus-main  # 或 FCGS-main
+cd ~/Web_Scan/HAC-plus-main  # 或 FCGS-main / ContextGS-main
 
 # 初始化子模块（非常重要）
 git submodule update --init --recursive
@@ -97,6 +106,8 @@ done
 cd ..
 ```
 
+**ContextGS 注意**：当前仓库不提交 `ContextGS-main/submodules`，需要先恢复 `diff-gaussian-rasterization` 和 `simple-knn`，再用 `CUDA_HOME=/usr/local/cuda-12.1 TORCH_CUDA_ARCH_LIST=8.9` 编译。
+
 **常见问题**：如果子模块中的 `simple-knn` 或 `diff-gaussian-rasterization` 编译失败，参考 [故障排除](#️-故障排除) 章节。
 
 ---
@@ -111,6 +122,9 @@ python diagnose.py
 
 # 或 FCGS
 python FCGS-main/diagnose.py
+
+# 或 ContextGS
+bash ../web/tools/remote_verify_setup.sh contextgs
 ```
 
 如果没有诊断脚本，手动运行以下检查：
@@ -590,8 +604,8 @@ pip install git+https://github.com/richzhang/PerceptualSimilarity.git
 - [ ] Python 版本 3.10：`python3 --version`
 
 ### ✅ 环境检查
-- [ ] Conda 环境已创建：`conda env list | grep -E "HAC_env|FCGS_env"`
-- [ ] 环境激活命令可用：`source ~/.bashrc && conda activate HAC_env`
+- [ ] Conda 环境已创建：`conda env list | grep -E "HAC_env|FCGS_env|contextgs"`
+- [ ] 环境激活命令可用：`source ~/.bashrc && conda activate HAC_env` 或 `source ~/.bashrc && conda activate contextgs`
 
 ### ✅ 项目检查
 - [ ] 项目代码已克隆/复制到远程主机
@@ -606,7 +620,7 @@ pip install git+https://github.com/richzhang/PerceptualSimilarity.git
 ## 📞 联系与支持
 
 - **文档位置**：[web/project_md/REMOTE_SETUP_GUIDE_NEW.md](../REMOTE_SETUP_GUIDE_NEW.md)
-- **诊断工具**：`python diagnose.py` (HAC-plus / FCGS)
+- **诊断工具**：`python diagnose.py` (HAC-plus / FCGS) 或 `bash web/tools/remote_verify_setup.sh contextgs` (ContextGS)
 - **问题报告**：记录 `diagnose.py` 的输出，提交至项目 Issue
 
 ---

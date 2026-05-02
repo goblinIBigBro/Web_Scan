@@ -8,7 +8,7 @@
 
 ## 🎯 快速选择：我应该读哪份文档？
 
-### 情景 1: 使用 HAC-plus 或 FCGS
+### 情景 1: 使用 HAC-plus、FCGS 或 ContextGS
 
 👉 **阅读**：[REMOTE_SETUP_GUIDE_NEW.md](REMOTE_SETUP_GUIDE_NEW.md)
 
@@ -24,11 +24,14 @@ python train.py -s /data/scene -m /output/result --iterations 30000 --eval
 
 # FCGS 压缩示例
 python encode_single_scene.py --lmd 4e-4 --ply_path_from input.ply --bit_path_to output
+
+# ContextGS 训练示例
+python train.py -s /data/scene -m /output/result --iterations 30000 --eval
 ```
 
 ---
 
-### 情景 2: 使用 CompGS、ContextGS、MEGS-2、reduced-3dgs 或 Scaffold-GS
+### 情景 2: 使用 CompGS、MEGS-2、reduced-3dgs 或 Scaffold-GS
 
 👉 **阅读**：[REMOTE_SETUP_GUIDE_OLD.md](REMOTE_SETUP_GUIDE_OLD.md)
 
@@ -42,8 +45,6 @@ python encode_single_scene.py --lmd 4e-4 --ply_path_from input.ply --bit_path_to
 # CompGS 训练示例（YAML 配置）
 python Train.py --config Configs/my_training.yaml
 
-# ContextGS 训练示例（命令行参数）
-python train.py -s /data/scene -m /output/result --iterations 30000 --eval
 ```
 
 ---
@@ -54,8 +55,8 @@ python train.py -s /data/scene -m /output/result --iterations 30000 --eval
 |------|------|------|--------|---------|------|---------|
 | **HAC-plus** | [NEW](REMOTE_SETUP_GUIDE_NEW.md) | 新版 | 3.10 | 2.2.* | 12.1 | 命令行 |
 | **FCGS** | [NEW](REMOTE_SETUP_GUIDE_NEW.md) | 新版 | 3.10 | 2.2.* | 11.8 | 命令行 |
+| **ContextGS** | [NEW](REMOTE_SETUP_GUIDE_NEW.md) | 新版 | 3.10 | 2.2.* | 12.1 | 命令行 |
 | **CompGS** | [OLD](REMOTE_SETUP_GUIDE_OLD.md) | 旧版 | 3.7.13 | 1.12.1 | 11.6 | YAML 配置 |
-| **ContextGS** | [OLD](REMOTE_SETUP_GUIDE_OLD.md) | 旧版 | 3.7.13 | 1.12.1 | 11.6 | 命令行 |
 | **MEGS-2** | [OLD](REMOTE_SETUP_GUIDE_OLD.md) | 旧版 | 3.7.13 | 1.12.1 | 11.6 | 命令行 |
 | **reduced-3dgs** | [OLD](REMOTE_SETUP_GUIDE_OLD.md) | 旧版 | 3.7.13 | 1.12.1 | 11.6 | 命令行 |
 | **Scaffold-GS** | [OLD](REMOTE_SETUP_GUIDE_OLD.md) | 旧版 | 3.7.13 | 1.12.1 | 11.6 | 命令行 |
@@ -77,6 +78,7 @@ bash remote_verify_setup.sh
 
 # 或手动指定版本
 bash remote_verify_setup.sh new   # 新版（Python 3.10 + PyTorch 2.2）
+bash remote_verify_setup.sh contextgs   # ContextGS（Python 3.10 + PyTorch 2.2 + CUDA 12.1 + RTX 4090）
 bash remote_verify_setup.sh old   # 旧版（Python 3.7 + PyTorch 1.12）
 ```
 
@@ -124,10 +126,17 @@ bash remote_verify_setup.sh old   # 旧版（Python 3.7 + PyTorch 1.12）
    conda activate HAC_env
    git submodule update --init --recursive
 
-   【旧版算法】
+   【ContextGS】
    cd ContextGS-main
    conda env create --file environment.yml
    conda activate contextgs
+   export CUDA_HOME=/usr/local/cuda-12.1
+   export TORCH_CUDA_ARCH_LIST=8.9
+
+   【旧版算法】
+   cd MEGS-2-main
+   conda env create --file environment.yml
+   conda activate MEGS2
    git submodule update --init --recursive
 
 4. 验证环境
@@ -206,13 +215,13 @@ python Train.py --config Configs/my_training.yaml
 
 ---
 
-### 旧版算法（ContextGS/MEGS-2 - 命令行参数）
+### ContextGS / 旧版命令行算法
 
 ```bash
-# 基础训练
+# ContextGS 基础训练（Python 3.10 + PyTorch 2.2 + CUDA 12.1）
 python train.py -s /workspace/data/scene -m /output/result --eval
 
-# 完整训练
+# MEGS-2/reduced-3dgs/Scaffold-GS 仍使用各自旧版环境，但参数形式类似
 python train.py -s /workspace/data/scene -m /output/result \
   --iterations 30000 --eval --test_iterations 7000
 ```
@@ -230,7 +239,9 @@ python train.py -s /workspace/data/scene -m /output/result \
 - [ ] 项目代码已获取（克隆或复制）
 
 **环境检查**：
-- [ ] 运行 `bash remote_verify_setup.sh new` 或 `bash remote_verify_setup.sh old`
+- [ ] ContextGS 运行 `bash remote_verify_setup.sh contextgs`
+- [ ] HAC-plus/FCGS 运行 `bash remote_verify_setup.sh new`
+- [ ] 旧版算法运行 `bash remote_verify_setup.sh old`
 - [ ] 所有检查项显示 ✓ PASS
 
 ---
@@ -239,7 +250,7 @@ python train.py -s /workspace/data/scene -m /output/result \
 
 ### Q: 我不确定应该使用哪份文档
 
-**A**: 查看 [算法速查表](#-算法速查表)。如果你使用 **HAC-plus 或 FCGS**，选择 **NEW** 文档。其他算法选择 **OLD** 文档。
+**A**: 查看 [算法速查表](#-算法速查表)。如果你使用 **HAC-plus、FCGS 或 ContextGS**，选择 **NEW** 文档。其他算法选择 **OLD** 文档。
 
 ---
 
@@ -259,7 +270,7 @@ conda activate HAC_env
 
 **A**: 
 - **CompGS**：参数通过修改 YAML 配置文件传入
-- **其他旧版算法**（ContextGS/MEGS-2 等）：参数通过命令行传入
+- **其他旧版算法**（MEGS-2、reduced-3dgs、Scaffold-GS 等）：参数通过命令行传入
 
 详见 [REMOTE_SETUP_GUIDE_OLD.md](REMOTE_SETUP_GUIDE_OLD.md) 的"训练启动指南"部分。
 

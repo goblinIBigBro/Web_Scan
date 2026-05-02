@@ -1211,7 +1211,10 @@ function renderCommandPreview() {
   if (!preview) {
     return `
       <section class="panel pad">
-        <h3>Command Review</h3>
+        <div class="button-row" style="justify-content: space-between;">
+          <h3>Command Review</h3>
+          <button type="button" disabled>修改</button>
+        </div>
         <p class="panel-copy">Generate a command preview after SSH precheck. Submission opens a custom confirmation dialog instead of the native browser confirm.</p>
       </section>
     `;

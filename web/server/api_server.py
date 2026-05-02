@@ -2145,7 +2145,7 @@ def build_remote_algorithm_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
     "remote_tmux_attach_command": remote_tmux_attach_command,
     "tmux_available": None,
     "tmux_install": {
-      "policy": "submit_time_sudo_n",
+      "policy": "submit_time_mamba_or_sudo_n",
       "uses_password_sudo": False,
     },
     "dataset_name": dataset_name,
@@ -3825,7 +3825,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
         "remote_tmux_attach_command": build_remote_tmux_attach_command(validated_remote, job_tmux_session),
         "tmux_available": None,
         "tmux_install": {
-          "policy": "submit_time_sudo_n",
+          "policy": "submit_time_mamba_or_sudo_n",
           "uses_password_sudo": False,
         },
         "remote_stage": "queued",

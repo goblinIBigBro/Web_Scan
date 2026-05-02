@@ -122,15 +122,18 @@ def test_existing_dataset_colmap_preflight_is_optional() -> None:
   }) is True
 
 
-def test_tmux_install_candidates_use_noninteractive_sudo_only() -> None:
+def test_tmux_install_candidates_use_mamba_or_noninteractive_sudo_only() -> None:
   candidates = _tmux_install_candidates()
   assert candidates
+  assert candidates[0]["manager"] == "mamba"
+  assert candidates[0]["command"] == "mamba install -y -c conda-forge tmux"
   for candidate in candidates:
     command = candidate["command"]
-    assert "sudo -n" in command
     assert "sudo -S" not in command
     assert "secret" not in command.lower()
     assert "password" not in command.lower()
+    if candidate["manager"] != "mamba":
+      assert "sudo -n" in command
 
 
 def test_tmux_cancel_script_kills_session_and_preserves_logs() -> None:
@@ -212,7 +215,7 @@ def main() -> None:
   test_detached_script_contract()
   test_existing_dataset_disables_auto_colmap_contract()
   test_existing_dataset_colmap_preflight_is_optional()
-  test_tmux_install_candidates_use_noninteractive_sudo_only()
+  test_tmux_install_candidates_use_mamba_or_noninteractive_sudo_only()
   test_tmux_cancel_script_kills_session_and_preserves_logs()
   test_job_persistence_sanitizes_password()
   test_apply_remote_poll_statuses()

@@ -362,7 +362,7 @@ def remote_preflight_check(
     checks.append({
       "name": "remote_tmux",
       "ok": tmux_available,
-      "message": "Remote tmux executable is available" if tmux_available else "Remote tmux executable not found; submit will try sudo -n installation",
+      "message": "Remote tmux executable is available" if tmux_available else "Remote tmux executable not found; submit will try mamba or sudo -n installation",
       "required": False,
       "details": {
         "install_manager": tmux_install_candidate.get("manager", ""),
@@ -495,6 +495,12 @@ def build_remote_tmux_attach_command(remote_config: Dict[str, Any], tmux_session
 def _tmux_install_candidates() -> list[Dict[str, str]]:
   return [
     {
+      "manager": "mamba",
+      "detect": "command -v mamba >/dev/null 2>&1",
+      "command": "mamba install -y -c conda-forge tmux",
+      "manual_command": "mamba install -y -c conda-forge tmux",
+    },
+    {
       "manager": "apt-get",
       "detect": "command -v apt-get >/dev/null 2>&1",
       "command": "sudo -n apt-get update && sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y tmux",
@@ -541,9 +547,11 @@ def _assert_safe_tmux_install_command(command: str) -> None:
       code_hint="WGSC-STEP5-TMUX-INSTALL-UNSAFE",
       stage="tmux",
     )
+  if command.strip() == "mamba install -y -c conda-forge tmux":
+    return
   if "sudo -n" not in command:
     raise RemoteExecutionError(
-      "Unsafe tmux install command rejected: only non-interactive sudo -n is allowed.",
+      "Unsafe tmux install command rejected: only mamba or non-interactive sudo -n is allowed.",
       code_hint="WGSC-STEP5-TMUX-INSTALL-UNSAFE",
       stage="tmux",
     )

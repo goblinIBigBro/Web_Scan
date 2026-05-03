@@ -1535,6 +1535,32 @@ def newest_image_from_globs(directory: Path, patterns: list[str]) -> Path | None
   return newest_file(candidates)
 
 
+def path_mtime(path: Path) -> float:
+  try:
+    return path.stat().st_mtime
+  except OSError:
+    return 0.0
+
+
+def compgs_result_candidate_dirs(directory: Path, family: str | None = None) -> list[Path]:
+  family = str(family or "").strip()
+  if family != "compgs" or not directory.is_dir():
+    return [directory]
+
+  nested: list[Path] = []
+  result_markers = ("point_cloud", "eval", "eval_training", "Log")
+  for child in directory.iterdir():
+    if not child.is_dir() or child.name.startswith("."):
+      continue
+    if child.name in RESULT_SCAN_EXCLUDED_DIRS or child.name == "config":
+      continue
+    if any((child / marker).exists() for marker in result_markers):
+      nested.append(child)
+
+  nested.sort(key=lambda path: (path_mtime(path), path.name), reverse=True)
+  return [directory, *nested]
+
+
 def latest_iteration_dir(point_cloud_dir: Path) -> Path | None:
   if not point_cloud_dir.exists() or not point_cloud_dir.is_dir():
     return None
@@ -1558,6 +1584,25 @@ def direct_ply_candidates(directory: Path, names: list[str] | None = None) -> li
   return [directory / name for name in target_names]
 
 
+def find_result_ply_in_directory(directory: Path, names: list[str]) -> Path | None:
+  direct = newest_file([path for path in direct_ply_candidates(directory, names) if is_ply_file(path)])
+  if direct:
+    return direct
+
+  iteration_dir = latest_iteration_dir(directory / "point_cloud")
+  if iteration_dir:
+    for candidate in direct_ply_candidates(iteration_dir, names):
+      if is_ply_file(candidate):
+        return candidate
+
+  if directory.name.startswith("iteration_"):
+    for candidate in direct_ply_candidates(directory, names):
+      if is_ply_file(candidate):
+        return candidate
+
+  return None
+
+
 def find_result_ply(directory: Path, family: str | None = None) -> Path | None:
   family = str(family or "").strip()
   if is_ply_file(directory):
@@ -1568,20 +1613,10 @@ def find_result_ply(directory: Path, family: str | None = None) -> Path | None:
     names = ["point_cloud_quantised_half.ply", "point_cloud_quantised.ply", "point_cloud.ply", "latest.ply", "scene.ply"]
 
   if directory.is_dir():
-    direct = newest_file([path for path in direct_ply_candidates(directory, names) if is_ply_file(path)])
-    if direct:
-      return direct
-
-    iteration_dir = latest_iteration_dir(directory / "point_cloud")
-    if iteration_dir:
-      for candidate in direct_ply_candidates(iteration_dir, names):
-        if is_ply_file(candidate):
-          return candidate
-
-    if directory.name.startswith("iteration_"):
-      for candidate in direct_ply_candidates(directory, names):
-        if is_ply_file(candidate):
-          return candidate
+    for candidate_dir in compgs_result_candidate_dirs(directory, family):
+      result = find_result_ply_in_directory(candidate_dir, names)
+      if result:
+        return result
 
   return None
 
@@ -1601,10 +1636,6 @@ def find_result_image(directory: Path, family: str | None = None) -> Path | None
   if not directory.is_dir():
     return None
 
-  direct_latest = newest_file([directory / f"latest{suffix}" for suffix in IMAGE_EXTENSIONS])
-  if direct_latest:
-    return direct_latest
-
   family = str(family or "").strip()
   if family == "compgs":
     patterns = [
@@ -1621,7 +1652,16 @@ def find_result_image(directory: Path, family: str | None = None) -> Path | None
       "test/ours_*/renders/*",
       "train/ours_*/renders/*",
     ]
-  return newest_image_from_globs(directory, patterns)
+
+  for candidate_dir in compgs_result_candidate_dirs(directory, family):
+    direct_latest = newest_file([candidate_dir / f"latest{suffix}" for suffix in IMAGE_EXTENSIONS])
+    if direct_latest:
+      return direct_latest
+    image_path = newest_image_from_globs(candidate_dir, patterns)
+    if image_path:
+      return image_path
+
+  return None
 
 
 def result_payload_for_ply(path: Path, *, family: str | None = None, representation: str | None = None) -> Dict[str, Any]:

@@ -81,6 +81,29 @@ def test_compgs_image_fallback() -> None:
   assert result["result_url"].endswith("/0000.png"), result
 
 
+def test_compgs_timestamp_ply_from_parent() -> None:
+  result_dir = TEST_ROOT / "compgs-timestamp-ply"
+  write_file(result_dir / "2026-05-02_10-00" / "point_cloud" / "iteration_10000" / "point_cloud.ply", b"old")
+  write_file(result_dir / "2026-05-03_10-27" / "point_cloud" / "iteration_30000" / "point_cloud.ply", b"new")
+
+  result = load_result_path(str(result_dir), family="compgs")
+  assert result["ok"], result
+  assert result["type"] == "ply", result
+  assert "2026-05-03_10-27" in result["resolved_path"], result
+  assert result["resolved_path"].endswith("point_cloud/iteration_30000/point_cloud.ply"), result
+
+
+def test_compgs_timestamp_image_fallback_from_parent() -> None:
+  result_dir = TEST_ROOT / "compgs-timestamp-image"
+  write_file(result_dir / "2026-05-03_10-27" / "eval_training" / "rendered" / "0000.png", b"png")
+
+  result = load_result_path(str(result_dir), family="compgs")
+  assert result["ok"], result
+  assert result["type"] == "image", result
+  assert "2026-05-03_10-27" in result["resolved_path"], result
+  assert result["result_url"].endswith("/eval_training/rendered/0000.png"), result
+
+
 def test_fcgs_bitstream_message() -> None:
   result_dir = TEST_ROOT / "fcgs-bitstream"
   write_file(result_dir / "0.0001" / "0" / "chunk.bin", b"bits")
@@ -118,6 +141,8 @@ def main() -> None:
     test_image_fallback()
     test_reduced_prefers_quantised_half()
     test_compgs_image_fallback()
+    test_compgs_timestamp_ply_from_parent()
+    test_compgs_timestamp_image_fallback_from_parent()
     test_fcgs_bitstream_message()
     test_empty_directory()
     test_discover_generated_runs()

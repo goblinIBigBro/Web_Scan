@@ -61,6 +61,15 @@ MAX_PROCESS_FRAME_COMPLETED_HISTORY = 80
 MAX_METRICS_HISTORY = 5000
 JOB_STATE_FILE = "job.json"
 TERMINAL_STATUSES = {"completed", "failed", "canceled"}
+ARTIFACT_RESULT_FIELDS = (
+  "manifest_url",
+  "viewer_url",
+  "point_cloud_url",
+  "result_url",
+  "result_urls",
+  "render_images",
+  "render_image_count",
+)
 
 MANUAL_ZH_URL = "/web/WEB_TRAINING_MANUAL_ZH.md"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"}
@@ -903,29 +912,69 @@ def _python_probe(script: str, timeout: int = 15) -> Dict[str, Any]:
   }
 
 
-def _contextgs_environment_checks() -> tuple[list[Dict[str, Any]], list[str], Dict[str, Any]]:
+ALGORITHM_CUDA_CHECK_SPECS: Dict[str, Dict[str, Any]] = {
+  "contextgs": {
+    "label": "ContextGS",
+    "root": ROOT_DIR / "ContextGS-main",
+    "env_name": "contextgs",
+    "required_modules": [
+      ("torchvision", "torchvision"),
+      ("diff_gaussian_rasterization", "diff_gaussian_rasterization"),
+      ("simple_knn", "simple_knn"),
+      ("torch_scatter", "torch_scatter"),
+      ("compressai", "compressai"),
+      ("torchac", "torchac"),
+      ("lpips", "lpips"),
+      ("plyfile", "plyfile"),
+      ("einops", "einops"),
+      ("cv2", "opencv-python"),
+    ],
+  },
+  "reduced-3dgs": {
+    "label": "Reduced-3DGS",
+    "root": ROOT_DIR / "reduced-3dgs-main",
+    "env_name": "gaussian_splatting",
+    "required_modules": [
+      ("torchvision", "torchvision"),
+      ("diff_gaussian_rasterization", "diff_gaussian_rasterization"),
+      ("simple_knn", "simple_knn"),
+      ("pandas", "pandas"),
+      ("plyfile", "plyfile"),
+      ("PIL", "pillow"),
+      ("tqdm", "tqdm"),
+    ],
+  },
+}
+
+
+def _algorithm_cuda_environment_checks(family_key: str) -> tuple[list[Dict[str, Any]], list[str], Dict[str, Any]]:
   checks: list[Dict[str, Any]] = []
   warnings: list[str] = []
   metadata: Dict[str, Any] = {}
+  spec = ALGORITHM_CUDA_CHECK_SPECS[family_key]
+  label = str(spec["label"])
+  check_prefix = family_key.replace("-", "_")
+  repo_root = spec["root"]
+  env_name = str(spec["env_name"])
+  required_modules = spec["required_modules"]
 
-  contextgs_root = ROOT_DIR / "ContextGS-main"
-  repo_ok = contextgs_root.exists()
+  repo_ok = repo_root.exists()
   checks.append(_runtime_check_item(
-    "contextgs_repo",
+    f"{check_prefix}_repo",
     repo_ok,
     required=True,
-    message="ContextGS repository exists." if repo_ok else "Missing ContextGS-main repository.",
-    hint="Place ContextGS-main next to web/ or update the adapter repo path.",
-    details={"path": str(contextgs_root)},
+    message=f"{label} repository exists." if repo_ok else f"Missing {repo_root.name} repository.",
+    hint=f"Place {repo_root.name} next to web/ or update the adapter repo path.",
+    details={"path": str(repo_root)},
   ))
 
   python_ok = sys.version_info[:2] == (3, 10)
   checks.append(_runtime_check_item(
-    "contextgs_python310",
+    f"{check_prefix}_python310",
     python_ok,
     required=True,
     message=f"Python {sys.version_info.major}.{sys.version_info.minor} is active." if python_ok else f"Expected Python 3.10, got {sys.version.split()[0]}.",
-    hint="Activate the contextgs conda environment before launching the API server.",
+    hint=f"Activate the {env_name} conda environment before launching the API server.",
     details={"python_executable": sys.executable, "version": sys.version.split()[0]},
   ))
 
@@ -948,18 +997,18 @@ def _contextgs_environment_checks() -> tuple[list[Dict[str, Any]], list[str], Di
   torch_version = str(torch_info.get("torch_version", ""))
   torch_ok = torch_probe["ok"] and torch_version.startswith("2.2")
   checks.append(_runtime_check_item(
-    "contextgs_torch22",
+    f"{check_prefix}_torch22",
     torch_ok,
     required=True,
-    message=f"PyTorch {torch_version} is active." if torch_ok else "Expected PyTorch 2.2.x for ContextGS.",
-    hint="Install PyTorch 2.2.2 with pytorch-cuda=12.1 in the contextgs environment.",
+    message=f"PyTorch {torch_version} is active." if torch_ok else f"Expected PyTorch 2.2.x for {label}.",
+    hint=f"Install PyTorch 2.2.2 with pytorch-cuda=12.1 in the {env_name} environment.",
     details={"probe": torch_probe, "torch": torch_info},
   ))
 
   cuda_version = str(torch_info.get("cuda_version", "") or "")
   cuda_ok = torch_probe["ok"] and cuda_version.startswith("12.1")
   checks.append(_runtime_check_item(
-    "contextgs_cuda121",
+    f"{check_prefix}_cuda121",
     cuda_ok,
     required=True,
     message=f"PyTorch CUDA runtime is {cuda_version}." if cuda_ok else f"Expected torch.version.cuda to be 12.1, got {cuda_version or 'unavailable'}.",
@@ -969,7 +1018,7 @@ def _contextgs_environment_checks() -> tuple[list[Dict[str, Any]], list[str], Di
 
   cuda_available = bool(torch_info.get("cuda_available"))
   checks.append(_runtime_check_item(
-    "contextgs_cuda_available",
+    f"{check_prefix}_cuda_available",
     cuda_available,
     required=True,
     message="CUDA is available to PyTorch." if cuda_available else "PyTorch cannot access CUDA.",
@@ -980,36 +1029,24 @@ def _contextgs_environment_checks() -> tuple[list[Dict[str, Any]], list[str], Di
   device_name = str(torch_info.get("device_name", "") or "")
   rtx4090_ok = cuda_available and "4090" in device_name
   checks.append(_runtime_check_item(
-    "contextgs_rtx4090",
+    f"{check_prefix}_rtx4090",
     rtx4090_ok,
     required=True,
     message=f"First CUDA device is {device_name}." if rtx4090_ok else f"Expected RTX 4090, got {device_name or 'no CUDA device'}.",
-    hint="Run ContextGS on the remote Linux RTX 4090 host, or set CUDA_VISIBLE_DEVICES to the 4090.",
+    hint=f"Run {label} on the remote Linux RTX 4090 host, or set CUDA_VISIBLE_DEVICES to the 4090.",
     details={"device_name": device_name, "capability": torch_info.get("capability")},
   ))
 
   toolkit = detect_cuda_toolkit()
   checks.append(_runtime_check_item(
-    "contextgs_cuda_toolkit",
+    f"{check_prefix}_cuda_toolkit",
     bool(toolkit.get("toolkit_ready")),
     required=True,
     message="CUDA Toolkit and nvcc are available." if toolkit.get("toolkit_ready") else "CUDA Toolkit or nvcc was not found.",
-    hint="Install CUDA Toolkit 12.1 and set CUDA_HOME before rebuilding ContextGS CUDA extensions.",
+    hint=f"Install CUDA Toolkit 12.1 and set CUDA_HOME before rebuilding {label} CUDA extensions.",
     details=toolkit,
   ))
 
-  required_modules = [
-    ("torchvision", "torchvision"),
-    ("diff_gaussian_rasterization", "diff_gaussian_rasterization"),
-    ("simple_knn", "simple_knn"),
-    ("torch_scatter", "torch_scatter"),
-    ("compressai", "compressai"),
-    ("torchac", "torchac"),
-    ("lpips", "lpips"),
-    ("plyfile", "plyfile"),
-    ("einops", "einops"),
-    ("cv2", "opencv-python"),
-  ]
   missing_modules: list[str] = []
   if not torch_probe["ok"]:
     missing_modules.append("torch")
@@ -1018,19 +1055,19 @@ def _contextgs_environment_checks() -> tuple[list[Dict[str, Any]], list[str], Di
     if not probe["ok"]:
       missing_modules.append(module_name)
     checks.append(_runtime_check_item(
-      f"contextgs_module_{module_name}",
+      f"{check_prefix}_module_{module_name}",
       probe["ok"],
       required=True,
       message=f"Python module {module_name} imports successfully." if probe["ok"] else f"Missing or broken Python module {module_name}.",
-      hint=f"Install/rebuild {package_name} in the contextgs environment.",
+      hint=f"Install/rebuild {package_name} in the {env_name} environment.",
       details={"probe": probe},
     ))
 
   if missing_modules:
-    warnings.append("ContextGS missing modules: " + ", ".join(missing_modules))
+    warnings.append(f"{label} missing modules: " + ", ".join(missing_modules))
 
   metadata["missing_python_modules"] = missing_modules
-  metadata["python_modules"] = [name for name, _package in required_modules]
+  metadata["python_modules"] = ["torch"] + [name for name, _package in required_modules]
   return checks, warnings, metadata
 
 
@@ -1107,10 +1144,12 @@ def environment_check(family: str | None = None) -> Dict[str, Any]:
 
   family_key = (family or "").strip().lower()
   algorithm_metadata: Dict[str, Any] = {}
-  if family_key == "contextgs":
-    contextgs_checks, contextgs_warnings, algorithm_metadata = _contextgs_environment_checks()
-    checks.extend(contextgs_checks)
-    warnings.extend(contextgs_warnings)
+  cuda_check_spec = ALGORITHM_CUDA_CHECK_SPECS.get(family_key)
+  algorithm_label = str(cuda_check_spec.get("label", family_key)) if cuda_check_spec else family_key
+  if cuda_check_spec:
+    algorithm_checks, algorithm_warnings, algorithm_metadata = _algorithm_cuda_environment_checks(family_key)
+    checks.extend(algorithm_checks)
+    warnings.extend(algorithm_warnings)
 
   required_checks_ok = all(item["ok"] for item in checks if item["required"])
   web_required_names = {"api_runtime", "web_index", "viewer_assets", "generated_dir_writable"}
@@ -1122,12 +1161,12 @@ def environment_check(family: str | None = None) -> Dict[str, Any]:
   summary = "Web runtime checks passed."
   if not runtime_ready:
     summary = "Web runtime checks failed. Fix required items before continuing."
-  elif family_key == "contextgs" and not algorithm_ready:
-    summary = "Web runtime is ready, but ContextGS Python/CUDA checks failed."
+  elif cuda_check_spec and not algorithm_ready:
+    summary = f"Web runtime is ready, but {algorithm_label} Python/CUDA checks failed."
   elif not remote_ready:
     summary = "Web runtime is ready, but remote SSH checks require paramiko."
-  elif family_key == "contextgs":
-    summary = "Web runtime and ContextGS Python/CUDA checks passed."
+  elif cuda_check_spec:
+    summary = f"Web runtime and {algorithm_label} Python/CUDA checks passed."
 
   adapter = get_adapter(family_key) if family_key else None
   requirement_spec = adapter_requirement_spec(adapter) if adapter else {"python_modules": [], "install_commands": {}}
@@ -1630,38 +1669,114 @@ def find_result_manifest(directory: Path) -> Path | None:
   return candidate if candidate.exists() and candidate.is_file() else None
 
 
-def find_result_image(directory: Path, family: str | None = None) -> Path | None:
-  if is_image_file(directory):
-    return directory
-  if not directory.is_dir():
-    return None
-
+def result_image_patterns_for_family(family: str | None = None) -> list[str]:
   family = str(family or "").strip()
   if family == "compgs":
-    patterns = [
+    return [
       "eval/rendered/*",
       "eval_training/rendered/*",
     ]
-  elif family == "reduced-3dgs":
-    patterns = [
+  if family == "reduced-3dgs":
+    return [
       "test/*/renders/*",
       "train/*/renders/*",
     ]
-  else:
-    patterns = [
-      "test/ours_*/renders/*",
-      "train/ours_*/renders/*",
-    ]
+  return [
+    "test/ours_*/renders/*",
+    "train/ours_*/renders/*",
+  ]
+
+
+def dedupe_paths(paths: list[Path]) -> list[Path]:
+  deduped: list[Path] = []
+  seen: set[str] = set()
+  for path in paths:
+    try:
+      resolved = path.resolve()
+    except OSError:
+      continue
+    key = str(resolved)
+    if key in seen:
+      continue
+    seen.add(key)
+    deduped.append(resolved)
+  return deduped
+
+
+def find_result_images(directory: Path, family: str | None = None) -> list[Path]:
+  if is_image_file(directory):
+    return [directory.resolve()]
+  if not directory.is_dir():
+    return []
+
+  patterns = result_image_patterns_for_family(family)
+  candidates: list[Path] = []
 
   for candidate_dir in compgs_result_candidate_dirs(directory, family):
-    direct_latest = newest_file([candidate_dir / f"latest{suffix}" for suffix in IMAGE_EXTENSIONS])
-    if direct_latest:
-      return direct_latest
-    image_path = newest_image_from_globs(candidate_dir, patterns)
-    if image_path:
-      return image_path
+    candidates.extend(candidate_dir / f"latest{suffix}" for suffix in IMAGE_EXTENSIONS)
+    for pattern in patterns:
+      candidates.extend(path for path in candidate_dir.glob(pattern) if is_image_file(path))
 
-  return None
+  images = [path for path in dedupe_paths(candidates) if is_image_file(path)]
+  images.sort(key=lambda path: (path_mtime(path), str(path)), reverse=True)
+  return images
+
+
+def find_result_image(directory: Path, family: str | None = None) -> Path | None:
+  images = find_result_images(directory, family)
+  return images[0] if images else None
+
+
+def image_search_dirs_for_result_file(path: Path) -> list[Path]:
+  if is_image_file(path):
+    return [path]
+  candidates = [path.parent]
+  current = path.parent
+  for ancestor in current.parents:
+    if ancestor == ROOT_DIR.parent:
+      break
+    candidates.append(ancestor)
+    if len(candidates) >= 5:
+      break
+  return dedupe_paths(candidates)
+
+
+def find_result_images_for_file(path: Path, family: str | None = None) -> list[Path]:
+  images: list[Path] = []
+  for candidate_dir in image_search_dirs_for_result_file(path):
+    images.extend(find_result_images(candidate_dir, family))
+  images = dedupe_paths(images)
+  images.sort(key=lambda item: (path_mtime(item), str(item)), reverse=True)
+  return images
+
+
+def render_image_payloads(paths: list[Path]) -> list[Dict[str, Any]]:
+  items: list[Dict[str, Any]] = []
+  for path in paths:
+    if not is_image_file(path):
+      continue
+    resolved = path.resolve()
+    stat = resolved.stat()
+    items.append({
+      "name": resolved.name,
+      "url": file_url_for_path(resolved, "images"),
+      "path": str(resolved),
+      "file_size": stat.st_size,
+      "mtime": stat.st_mtime,
+    })
+  return items
+
+
+def attach_render_images(payload: Dict[str, Any], image_paths: list[Path]) -> Dict[str, Any]:
+  image_items = render_image_payloads(image_paths)
+  if not image_items:
+    return payload
+  image_urls = [item["url"] for item in image_items]
+  payload["result_url"] = payload.get("result_url") or image_urls[0]
+  payload["result_urls"] = image_urls
+  payload["render_images"] = image_items
+  payload["render_image_count"] = len(image_items)
+  return payload
 
 
 def result_payload_for_ply(path: Path, *, family: str | None = None, representation: str | None = None) -> Dict[str, Any]:
@@ -1748,11 +1863,17 @@ def load_result_path(path_value: str, family: str | None = None, representation:
     }
 
   if is_ply_file(resolved):
-    return result_payload_for_ply(resolved, family=resolved_family, representation=resolved_representation)
+    return attach_render_images(
+      result_payload_for_ply(resolved, family=resolved_family, representation=resolved_representation),
+      find_result_images_for_file(resolved, resolved_family),
+    )
   if is_image_file(resolved):
-    return result_payload_for_image(resolved, family=resolved_family)
+    return attach_render_images(result_payload_for_image(resolved, family=resolved_family), [resolved])
   if resolved.is_file() and resolved.name == "scene_manifest.json":
-    return result_payload_for_manifest(resolved, family=resolved_family, representation=resolved_representation)
+    return attach_render_images(
+      result_payload_for_manifest(resolved, family=resolved_family, representation=resolved_representation),
+      find_result_images_for_file(resolved, resolved_family),
+    )
   if resolved.is_file():
     reason = f"Unsupported result file type: {resolved.suffix or resolved.name}"
     return {
@@ -1765,17 +1886,27 @@ def load_result_path(path_value: str, family: str | None = None, representation:
       "resolved_path": str(resolved),
     }
 
+  render_image_paths = find_result_images(resolved, resolved_family)
+
   ply_path = find_result_ply(resolved, resolved_family)
   if ply_path:
-    return result_payload_for_ply(ply_path, family=resolved_family, representation=resolved_representation)
+    return attach_render_images(
+      result_payload_for_ply(ply_path, family=resolved_family, representation=resolved_representation),
+      render_image_paths,
+    )
 
   manifest_path = find_result_manifest(resolved)
   if manifest_path:
-    return result_payload_for_manifest(manifest_path, family=resolved_family, representation=resolved_representation)
+    return attach_render_images(
+      result_payload_for_manifest(manifest_path, family=resolved_family, representation=resolved_representation),
+      render_image_paths,
+    )
 
-  image_path = find_result_image(resolved, resolved_family)
-  if image_path:
-    return result_payload_for_image(image_path, family=resolved_family)
+  if render_image_paths:
+    return attach_render_images(
+      result_payload_for_image(render_image_paths[0], family=resolved_family),
+      render_image_paths,
+    )
 
   reason = "No supported PLY, scene manifest, or rendered image was found in this result directory."
   if resolved_family == "fcgs" and looks_like_fcgs_bitstream_dir(resolved):
@@ -1907,7 +2038,7 @@ def read_runtime_artifacts(output_dir: str | None, representation: str | None = 
       pass
   artifact = load_result_path(str(directory), representation=representation)
   if artifact.get("ok"):
-    for key in ("type", "family", "representation", "manifest_url", "viewer_url", "point_cloud_url", "result_url", "resolved_path"):
+    for key in ("type", "family", "representation", "resolved_path", *ARTIFACT_RESULT_FIELDS):
       if artifact.get(key):
         payload[key] = artifact[key]
   return payload
@@ -2249,7 +2380,7 @@ def enrich_job(job: Dict[str, Any]) -> Dict[str, Any]:
       **enriched.get("metrics", {}),
       **artifacts["metrics"],
     }
-  for key in ("manifest_url", "viewer_url", "point_cloud_url", "result_url"):
+  for key in ARTIFACT_RESULT_FIELDS:
     if artifacts.get(key):
       enriched[key] = artifacts[key]
   job_id = str(enriched.get("id", "")).strip()
@@ -2344,7 +2475,7 @@ def discover_runtime_results(*, limit: int = 30, max_scan_dirs: int = 1800) -> l
         "representation": artifact.get("representation") or ("sg" if str(artifact.get("viewer_url", "")).find("/viewers/sg.html") >= 0 else "sh"),
         "score": score,
       }
-      for key in ("manifest_url", "viewer_url", "point_cloud_url", "result_url", "reason"):
+      for key in (*ARTIFACT_RESULT_FIELDS, "reason"):
         if artifact.get(key):
           item[key] = artifact[key]
 
@@ -2610,7 +2741,7 @@ def update_job_artifacts(job: Dict[str, Any]) -> None:
       **job.get("metrics", {}),
       **artifacts["metrics"],
     }
-  for key in ("manifest_url", "viewer_url", "point_cloud_url", "result_url"):
+  for key in ARTIFACT_RESULT_FIELDS:
     if artifacts.get(key):
       job[key] = artifacts[key]
 
@@ -2860,7 +2991,7 @@ def start_job_thread(job: Dict[str, Any], command: str, cwd: str | None = None) 
             **job.get("metrics", {}),
             **artifacts["metrics"],
           }
-        for key in ("manifest_url", "viewer_url", "point_cloud_url", "result_url"):
+        for key in ARTIFACT_RESULT_FIELDS:
           if artifacts.get(key):
             job[key] = artifacts[key]
       stream.close()
@@ -2914,7 +3045,7 @@ def start_job_thread(job: Dict[str, Any], command: str, cwd: str | None = None) 
           **job.get("metrics", {}),
           **artifacts["metrics"],
         }
-      for key in ("manifest_url", "viewer_url", "point_cloud_url", "result_url"):
+      for key in ARTIFACT_RESULT_FIELDS:
         if artifacts.get(key):
           job[key] = artifacts[key]
       job["return_code"] = return_code
@@ -2987,7 +3118,7 @@ def start_remote_job_thread(
           **job.get("metrics", {}),
           **artifacts["metrics"],
         }
-      for key in ("manifest_url", "viewer_url", "point_cloud_url", "result_url"):
+      for key in ARTIFACT_RESULT_FIELDS:
         if artifacts.get(key):
           job[key] = artifacts[key]
 
@@ -4147,6 +4278,10 @@ class ApiHandler(SimpleHTTPRequestHandler):
         "capture_id": frame_info.get("capture_id", capture_id),
         "input_url": frame_info["input_url"],
         "output_url": stream_artifacts.get("result_url", frame_info["output_url"]),
+        "result_url": stream_artifacts.get("result_url"),
+        "result_urls": stream_artifacts.get("result_urls", []),
+        "render_images": stream_artifacts.get("render_images", []),
+        "render_image_count": stream_artifacts.get("render_image_count", 0),
         "viewer_url": stream_artifacts.get("viewer_url"),
         "job": enrich_job(job) if job else None,
       }, status=202 if job else 200)

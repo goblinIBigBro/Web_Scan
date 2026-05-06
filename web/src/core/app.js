@@ -261,12 +261,34 @@ function getRenderablePlyAsset(asset = {}) {
   };
 }
 
+function uniqueRenderableImageUrls(asset = {}) {
+  const urls = [];
+  const add = (value) => {
+    const url = String(value || "").trim();
+    if (url && classifyAssetUrl(url) === "image" && !urls.includes(url)) {
+      urls.push(url);
+    }
+  };
+  add(asset.result_url);
+  add(asset.output_url);
+  add(asset.image_url);
+  if (Array.isArray(asset.result_urls)) {
+    asset.result_urls.forEach(add);
+  }
+  if (Array.isArray(asset.render_images)) {
+    asset.render_images.forEach((item) => add(item?.url || item?.result_url || item?.image_url));
+  }
+  return urls;
+}
+
 function getRenderableImageAsset(asset = {}) {
-  const imageUrl = asset.result_url || asset.output_url || asset.image_url || "";
-  if (classifyAssetUrl(imageUrl) !== "image") return null;
+  const imageUrls = uniqueRenderableImageUrls(asset);
+  const imageUrl = imageUrls[0] || "";
+  if (!imageUrl) return null;
   return {
     type: "image",
     imageUrl,
+    imageUrls,
     sourceUrl: imageUrl,
   };
 }
@@ -1402,8 +1424,24 @@ function renderBrowserPage() {
   `;
 }
 
+function renderImageGallery(imageUrls = []) {
+  if (!imageUrls.length) return "";
+  return `
+    <div class="render-image-grid">
+      ${imageUrls.map((url, index) => `
+        <a class="render-image-thumb" href="${escapeHtml(url)}" target="_blank" rel="noreferrer">
+          <img src="${escapeHtml(url)}" alt="render ${index + 1}" loading="lazy" />
+        </a>
+      `).join("")}
+    </div>
+  `;
+}
+
 function renderResultSurface(asset, options = {}) {
-  const classified = classifyResultAsset(asset || {});
+  const sourceAsset = asset || {};
+  const classified = classifyResultAsset(sourceAsset);
+  const imageAsset = getRenderableImageAsset(sourceAsset);
+  const imageUrls = imageAsset?.imageUrls || [];
   const frameClass = `viewer-frame${options.tall === false ? "" : " tall"}`;
   if (classified.type === "ply" || classified.type === "manifest") {
     if (!classified.viewerUrl) {
@@ -1424,6 +1462,7 @@ function renderResultSurface(asset, options = {}) {
           <span class="panel-copy">Use the 3D viewer controls to rotate and zoom.</span>
         </div>
         <iframe class="${frameClass}" src="${escapeHtml(classified.viewerUrl)}" title="PLY 3D model viewer"></iframe>
+        ${renderImageGallery(imageUrls)}
       </section>
     `;
   }
@@ -1431,10 +1470,11 @@ function renderResultSurface(asset, options = {}) {
     return `
       <section class="result-surface result-surface-image">
         <div class="result-toolbar">
-          <span class="badge ok">Image Result</span>
-          <span class="panel-copy">Displayed as an image. 3D rendering is skipped.</span>
+          <span class="badge ok">Image Result${imageUrls.length > 1 ? ` · ${imageUrls.length}` : ""}</span>
+          <span class="panel-copy">${imageUrls.length > 1 ? "Render images" : "Displayed as an image."}</span>
         </div>
         <img class="result-image" src="${escapeHtml(classified.imageUrl)}" alt="model result" />
+        ${imageUrls.length > 1 ? renderImageGallery(imageUrls) : ""}
       </section>
     `;
   }
@@ -1514,9 +1554,10 @@ function renderResultPage() {
   const imageAsset = job ? getRenderableImageAsset(job) : null;
   const preferredMode = state.renderMode || "ply";
   const mode = preferredMode === "image" && imageAsset ? "image" : plyAsset ? "ply" : imageAsset ? "image" : preferredMode;
+  const imageFields = { result_url: imageAsset?.imageUrl || "", result_urls: imageAsset?.imageUrls || [], render_images: job?.render_images || [] };
   const surfaceAsset = mode === "image"
-    ? { result_url: imageAsset?.imageUrl || "" }
-    : { viewer_url: plyAsset?.viewerUrl || "", point_cloud_url: plyAsset?.sourceUrl || "" };
+    ? imageFields
+    : { ...imageFields, viewer_url: plyAsset?.viewerUrl || "", point_cloud_url: plyAsset?.sourceUrl || "" };
   return `
     <section class="panel">
       <div class="panel-head">

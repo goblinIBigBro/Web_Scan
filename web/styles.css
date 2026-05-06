@@ -830,6 +830,27 @@ pre {
   max-height: min(560px, 58vh);
 }
 
+.render-image-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 10px;
+}
+
+.render-image-thumb {
+  display: block;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+  background: #030913;
+}
+
+.render-image-thumb img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 1.4;
+  object-fit: cover;
+}
+
 .result-placeholder {
   display: grid;
   place-items: center;

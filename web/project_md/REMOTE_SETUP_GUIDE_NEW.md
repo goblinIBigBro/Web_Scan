@@ -1,6 +1,6 @@
 # 远程 SSH 环境配置指南 — 新版算法组
 
-> **适用项目**：HAC-plus、FCGS、ContextGS  
+> **适用项目**：HAC-plus、FCGS、ContextGS、reduced-3dgs  
 > **环境**：Python 3.10 + PyTorch 2.2.* + CUDA 11.8/12.1  
 > **更新日期**：2026 年 4 月  
 > **作者**：Web_Scan 文档
@@ -49,6 +49,11 @@ conda activate FCGS_env
 cd ~/Web_Scan/ContextGS-main
 conda env create --file environment.yml
 conda activate contextgs
+
+# 或者 reduced-3dgs（RTX 4090 推荐 CUDA 12.1）
+cd ~/Web_Scan/reduced-3dgs-main
+conda env create --file environment.yml
+conda activate gaussian_splatting
 ```
 
 **预计时间**：10-15 分钟（首次下载）
@@ -90,7 +95,7 @@ pip install torch-scatter -f https://data.pyg.org/whl/torch-2.2.0+cu121.html
 
 ```bash
 # 进入项目目录
-cd ~/Web_Scan/HAC-plus-main  # 或 FCGS-main / ContextGS-main
+cd ~/Web_Scan/HAC-plus-main  # 或 FCGS-main / ContextGS-main / reduced-3dgs-main
 
 # 初始化子模块（非常重要）
 git submodule update --init --recursive
@@ -107,6 +112,8 @@ cd ..
 ```
 
 **ContextGS 注意**：当前仓库不提交 `ContextGS-main/submodules`，需要先恢复 `diff-gaussian-rasterization` 和 `simple-knn`，再用 `CUDA_HOME=/usr/local/cuda-12.1 TORCH_CUDA_ARCH_LIST=8.9` 编译。
+
+**reduced-3dgs 注意**：仓库内已有 `diff-gaussian-rasterization` 和 `simple-knn` 子模块源码，升级后仍需要在 Python 3.10 / CUDA 12.1 环境中重新编译。
 
 **常见问题**：如果子模块中的 `simple-knn` 或 `diff-gaussian-rasterization` 编译失败，参考 [故障排除](#️-故障排除) 章节。
 
@@ -125,6 +132,9 @@ python FCGS-main/diagnose.py
 
 # 或 ContextGS
 bash ../web/tools/remote_verify_setup.sh contextgs
+
+# 或 reduced-3dgs
+bash ../web/tools/remote_verify_setup.sh reduced-3dgs
 ```
 
 如果没有诊断脚本，手动运行以下检查：
@@ -604,8 +614,8 @@ pip install git+https://github.com/richzhang/PerceptualSimilarity.git
 - [ ] Python 版本 3.10：`python3 --version`
 
 ### ✅ 环境检查
-- [ ] Conda 环境已创建：`conda env list | grep -E "HAC_env|FCGS_env|contextgs"`
-- [ ] 环境激活命令可用：`source ~/.bashrc && conda activate HAC_env` 或 `source ~/.bashrc && conda activate contextgs`
+- [ ] Conda 环境已创建：`conda env list | grep -E "HAC_env|FCGS_env|contextgs|gaussian_splatting"`
+- [ ] 环境激活命令可用：`source ~/.bashrc && conda activate HAC_env`、`source ~/.bashrc && conda activate contextgs` 或 `source ~/.bashrc && conda activate gaussian_splatting`
 
 ### ✅ 项目检查
 - [ ] 项目代码已克隆/复制到远程主机
@@ -620,7 +630,7 @@ pip install git+https://github.com/richzhang/PerceptualSimilarity.git
 ## 📞 联系与支持
 
 - **文档位置**：[web/project_md/REMOTE_SETUP_GUIDE_NEW.md](../REMOTE_SETUP_GUIDE_NEW.md)
-- **诊断工具**：`python diagnose.py` (HAC-plus / FCGS) 或 `bash web/tools/remote_verify_setup.sh contextgs` (ContextGS)
+- **诊断工具**：`python diagnose.py` (HAC-plus / FCGS)、`bash web/tools/remote_verify_setup.sh contextgs` (ContextGS) 或 `bash web/tools/remote_verify_setup.sh reduced-3dgs` (reduced-3dgs)
 - **问题报告**：记录 `diagnose.py` 的输出，提交至项目 Issue
 
 ---

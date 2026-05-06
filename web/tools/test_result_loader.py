@@ -41,21 +41,28 @@ def test_ply_priority() -> None:
   result_dir = TEST_ROOT / "hac"
   write_file(result_dir / "point_cloud" / "iteration_10" / "point_cloud.ply", b"ply\n")
   write_file(result_dir / "test" / "ours_10" / "renders" / "00001.png", b"png")
+  write_file(result_dir / "train" / "ours_10" / "renders" / "00002.png", b"png")
 
   result = load_result_path(str(result_dir), family="hac-plus-plus")
   assert result["ok"], result
   assert result["type"] == "ply", result
   assert result["point_cloud_url"].endswith("/point_cloud.ply"), result
+  assert result["render_image_count"] == 2, result
+  assert len(result["result_urls"]) == 2, result
+  assert all(url.endswith(".png") for url in result["result_urls"]), result
 
 
 def test_image_fallback() -> None:
   result_dir = TEST_ROOT / "image-only"
   write_file(result_dir / "test" / "ours_30" / "renders" / "00001.png", b"png")
+  write_file(result_dir / "test" / "ours_30" / "renders" / "00002.png", b"png")
 
   result = load_result_path(str(result_dir), family="contextgs")
   assert result["ok"], result
   assert result["type"] == "image", result
-  assert result["result_url"].endswith("/00001.png"), result
+  assert result["result_url"].endswith(".png"), result
+  assert result["render_image_count"] == 2, result
+  assert len(result["render_images"]) == 2, result
 
 
 def test_reduced_prefers_quantised_half() -> None:
@@ -125,11 +132,13 @@ def test_empty_directory() -> None:
 def test_discover_generated_runs() -> None:
   result_dir = DISCOVER_ROOT / "session-a" / "hac-plus-plus"
   write_file(result_dir / "point_cloud" / "iteration_3" / "point_cloud.ply", b"ply\n")
+  write_file(result_dir / "test" / "ours_3" / "renders" / "00001.png", b"png")
 
   results = discover_runtime_results(limit=20, max_scan_dirs=500)
   assert any(
     item.get("point_cloud_url", "").endswith("/point_cloud.ply")
     and "result_loader_tests_discover" in item.get("output_dir", "")
+    and item.get("render_image_count") == 1
     for item in results
   ), results
 

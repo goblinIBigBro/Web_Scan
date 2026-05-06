@@ -1,8 +1,8 @@
 # 远程 SSH 环境配置指南 — 旧版算法组
 
-> **适用项目**：CompGS、MEGS-2、reduced-3dgs、Scaffold-GS  
+> **适用项目**：CompGS、MEGS-2、Scaffold-GS  
 > **环境**：Python 3.7.13 + PyTorch 1.12.1 + CUDA 11.6  
-> **说明**：ContextGS 已升级到 Python 3.10 + PyTorch 2.2 + CUDA 12.1，请使用 [REMOTE_SETUP_GUIDE_NEW.md](REMOTE_SETUP_GUIDE_NEW.md)。
+> **说明**：ContextGS 和 reduced-3dgs 已升级到 Python 3.10 + PyTorch 2.2 + CUDA 12.1，请使用 [REMOTE_SETUP_GUIDE_NEW.md](REMOTE_SETUP_GUIDE_NEW.md)。
 > **更新日期**：2026 年 4 月  
 > **作者**：Web_Scan 文档
 
@@ -52,11 +52,6 @@ pip install -r requirements.txt
 cd ~/Web_Scan/MEGS-2-main
 conda env create --file environment.yml
 conda activate MEGS2
-
-# reduced-3dgs
-cd ~/Web_Scan/reduced-3dgs-main
-conda env create --file environment.yml
-conda activate gaussian_splatting
 
 # Scaffold-GS
 cd ~/Web_Scan/Scaffold-GS-main
@@ -184,9 +179,6 @@ source ~/.bashrc && conda activate CompGS_env
 # MEGS-2
 source ~/.bashrc && conda activate MEGS2
 
-# reduced-3dgs
-source ~/.bashrc && conda activate gaussian_splatting
-
 # Scaffold-GS
 source ~/.bashrc && conda activate scaffold_gs
 
@@ -308,7 +300,7 @@ conda activate contextgs
 bash ../web/tools/remote_verify_setup.sh contextgs
 ```
 
-### 旧版命令行算法（MEGS-2 / reduced-3dgs / Scaffold-GS）
+### 旧版命令行算法（MEGS-2 / Scaffold-GS）
 
 #### 参数配置方式
 
@@ -382,26 +374,15 @@ python train.py \
 
 ---
 
-### reduced-3dgs（命令行参数方式）
+### reduced-3dgs（已迁移到新版环境）
 
-#### 参数配置方式
-
-**reduced-3dgs 使用命令行参数**。
-
-#### 快速启动示例
+reduced-3dgs 当前使用 Python 3.10 + PyTorch 2.2 + CUDA 12.1，并针对 RTX 4090 检查 CUDA capability 8.9。请参考 [REMOTE_SETUP_GUIDE_NEW.md](REMOTE_SETUP_GUIDE_NEW.md)，并使用：
 
 ```bash
-# 基础训练
-python train.py \
-  -s /workspace/data/scene \
-  -m /output/reduced_result
-
-# 完整训练（与标准 3DGS 类似）
-python train.py \
-  -s /workspace/data/scene \
-  -m /output/reduced_full \
-  --eval \
-  --iterations 30000
+cd ~/Web_Scan/reduced-3dgs-main
+conda env create --file environment.yml
+conda activate gaussian_splatting
+bash ../web/tools/remote_verify_setup.sh reduced-3dgs
 ```
 
 ---
@@ -692,7 +673,7 @@ colmap -h
 | CompGS | CompGS_env | `conda activate CompGS_env` | Train.py | YAML 配置 | ✓ |
 | ContextGS | contextgs | `conda activate contextgs` | train.py | 命令行参数 | 已迁移到新版 |
 | MEGS-2 | MEGS2 | `conda activate MEGS2` | train.py | 命令行参数 | ✓ |
-| reduced-3dgs | gaussian_splatting | `conda activate gaussian_splatting` | train.py | 命令行参数 | ✓ |
+| reduced-3dgs | gaussian_splatting | `conda activate gaussian_splatting` | train.py | 命令行参数 | 已迁移到新版 |
 | Scaffold-GS | scaffold_gs | `conda activate scaffold_gs` | train.py | 命令行参数 | ✓ |
 
 ---

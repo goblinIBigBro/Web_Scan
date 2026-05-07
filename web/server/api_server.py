@@ -748,28 +748,32 @@ def adapter_requirement_spec(adapter: Dict[str, Any]) -> Dict[str, Any]:
       python_modules = [
         "torch",
         "lightning",
+        "torchvision",
         "jsonargparse",
         "wandb",
         "viser",
         "plyfile",
+        "PIL",
+        "cv2",
+        "mediapy",
         "diff_gaussian_rasterization",
         "simple_knn",
+        "gsplat",
       ]
     if not install_commands:
       install_commands = {
         "cuda121": [
-          "python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121",
-          "python -m pip install lightning",
-          "python -m pip install jsonargparse",
-          "python -m pip install wandb plyfile==0.8.1 viser==0.2.3",
-          "python -m pip install --no-build-isolation git+https://github.com/graphdeco-inria/diff-gaussian-rasterization.git@59f5f77e3ddbac3ed9db93ec2cfe99ed6c5d121d",
-          "python -m pip install --no-build-isolation git+https://github.com/yzslab/simple-knn.git@44f764299fa305faf6ec5ebd99939e0508331503",
+          "conda create -y -n gspl python=3.10 pip",
+          "conda activate gspl",
+          "conda install -y -c pytorch -c nvidia -c conda-forge pytorch==2.2.2 torchvision==0.17.2 torchaudio==2.2.2 pytorch-cuda=12.1 numpy=1.26.* pillow=10.* plyfile=1.1.* tqdm matplotlib pyyaml",
+          "python -m pip install \"lightning[pytorch-extra]==2.3.*\" \"pytorch-lightning==2.3.*\" \"jsonargparse[signatures]\" \"bitsandbytes==0.45.*\" wandb tensorboard viser==0.2.3 mediapy==1.2.2 opencv-python-headless==4.10.* splines==0.3.0",
+          "TORCH_CUDA_ARCH_LIST=8.9 CUDA_HOME=/usr/local/cuda-12.1 python -m pip install --no-build-isolation git+https://github.com/graphdeco-inria/diff-gaussian-rasterization.git@59f5f77e3ddbac3ed9db93ec2cfe99ed6c5d121d",
+          "TORCH_CUDA_ARCH_LIST=8.9 CUDA_HOME=/usr/local/cuda-12.1 python -m pip install --no-build-isolation git+https://github.com/yzslab/simple-knn.git@44f764299fa305faf6ec5ebd99939e0508331503",
+          "TORCH_CUDA_ARCH_LIST=8.9 CUDA_HOME=/usr/local/cuda-12.1 python -m pip install --no-build-isolation git+https://github.com/yzslab/gsplat.git@c27a44d4ad72ece2c32f99702083ac3d911d4ced",
         ],
         "cpu": [
           "python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu",
-          "python -m pip install lightning",
-          "python -m pip install jsonargparse",
-          "python -m pip install wandb plyfile==0.8.1 viser==0.2.3",
+          "python -m pip install \"lightning[pytorch-extra]==2.3.*\" \"pytorch-lightning==2.3.*\" \"jsonargparse[signatures]\" wandb tensorboard plyfile==1.1.* viser==0.2.3 mediapy==1.2.2 opencv-python-headless==4.10.* splines==0.3.0",
         ],
       }
 
@@ -917,6 +921,25 @@ def _python_probe(script: str, timeout: int = 15) -> Dict[str, Any]:
 
 
 ALGORITHM_CUDA_CHECK_SPECS: Dict[str, Dict[str, Any]] = {
+  "gaussian-splatting-lightning": {
+    "label": "Gaussian Splatting Lightning",
+    "root": ROOT_DIR / "gaussian-splatting-lightning-main",
+    "env_name": "gspl",
+    "required_modules": [
+      ("torchvision", "torchvision"),
+      ("lightning", "lightning"),
+      ("jsonargparse", "jsonargparse"),
+      ("wandb", "wandb"),
+      ("viser", "viser"),
+      ("plyfile", "plyfile"),
+      ("PIL", "pillow"),
+      ("cv2", "opencv-python-headless"),
+      ("mediapy", "mediapy"),
+      ("diff_gaussian_rasterization", "diff_gaussian_rasterization"),
+      ("simple_knn", "simple_knn"),
+      ("gsplat", "gsplat"),
+    ],
+  },
   "contextgs": {
     "label": "ContextGS",
     "root": ROOT_DIR / "ContextGS-main",

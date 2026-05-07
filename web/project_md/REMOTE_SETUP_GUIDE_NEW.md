@@ -1,6 +1,6 @@
 # 远程 SSH 环境配置指南 — 新版算法组
 
-> **适用项目**：HAC-plus、FCGS、ContextGS、reduced-3dgs、MEGS-2  
+> **适用项目**：Gaussian Splatting Lightning、HAC-plus、FCGS、ContextGS、reduced-3dgs、MEGS-2  
 > **环境**：Python 3.10 + PyTorch 2.2.* + CUDA 11.8/12.1  
 > **更新日期**：2026 年 4 月  
 > **作者**：Web_Scan 文档
@@ -39,6 +39,11 @@ python3 -c "import plyfile, lpips, einops, numpy, tqdm; print('✓ All deps foun
 cd ~/Web_Scan/HAC-plus-main
 conda env create --file environment.yml
 conda activate HAC_env
+
+# Gaussian Splatting Lightning（RTX 4090 推荐 CUDA 12.1）
+cd ~/Web_Scan/gaussian-splatting-lightning-main
+conda env create --file environment.yml
+conda activate gspl
 
 # 或者 FCGS
 cd ~/Web_Scan/FCGS-main
@@ -100,7 +105,7 @@ pip install torch-scatter -f https://data.pyg.org/whl/torch-2.2.0+cu121.html
 
 ```bash
 # 进入项目目录
-cd ~/Web_Scan/HAC-plus-main  # 或 FCGS-main / ContextGS-main / reduced-3dgs-main / MEGS-2-main
+cd ~/Web_Scan/HAC-plus-main  # 或 FCGS-main / ContextGS-main / reduced-3dgs-main / MEGS-2-main / gaussian-splatting-lightning-main
 
 # 初始化子模块（非常重要）
 git submodule update --init --recursive
@@ -121,6 +126,8 @@ cd ..
 **reduced-3dgs 注意**：仓库内已有 `diff-gaussian-rasterization` 和 `simple-knn` 子模块源码，升级后仍需要在 Python 3.10 / CUDA 12.1 环境中重新编译。
 
 **MEGS-2 注意**：仓库内有 `diff-gaussian-rasterization`、`diff-gaussian-rasterization_ms`、`diff-gaussian-rasterization_ms_light` 和 `simple-knn` 四个 CUDA 扩展，升级后必须在 Python 3.10 / CUDA 12.1 环境中全部重新编译。
+
+**Gaussian Splatting Lightning 注意**：基础链路需要 `diff-gaussian-rasterization`、`simple-knn` 和 `gsplat`。`setup_env.sh` 会优先使用本地 `submodules` 源码，缺失时从 pinned git URL 拉取并用 `CUDA_HOME=/usr/local/cuda-12.1 TORCH_CUDA_ARCH_LIST=8.9` 编译。SAM、2DGS、Taming 3DGS、PyTorch3D、tiny-cuda-nn 仍是可选功能，不纳入基础验证。
 
 **常见问题**：如果子模块中的 `simple-knn` 或 `diff-gaussian-rasterization` 编译失败，参考 [故障排除](#️-故障排除) 章节。
 
@@ -145,6 +152,9 @@ bash ../web/tools/remote_verify_setup.sh reduced-3dgs
 
 # 或 MEGS-2
 bash ../web/tools/remote_verify_setup.sh megs2
+
+# 或 Gaussian Splatting Lightning
+bash ../web/tools/remote_verify_setup.sh gaussian-splatting-lightning
 ```
 
 如果没有诊断脚本，手动运行以下检查：
@@ -624,8 +634,8 @@ pip install git+https://github.com/richzhang/PerceptualSimilarity.git
 - [ ] Python 版本 3.10：`python3 --version`
 
 ### ✅ 环境检查
-- [ ] Conda 环境已创建：`conda env list | grep -E "HAC_env|FCGS_env|contextgs|gaussian_splatting|MEGS2"`
-- [ ] 环境激活命令可用：`source ~/.bashrc && conda activate HAC_env`、`source ~/.bashrc && conda activate contextgs`、`source ~/.bashrc && conda activate gaussian_splatting` 或 `source ~/.bashrc && conda activate MEGS2`
+- [ ] Conda 环境已创建：`conda env list | grep -E "HAC_env|FCGS_env|contextgs|gaussian_splatting|MEGS2|gspl"`
+- [ ] 环境激活命令可用：`source ~/.bashrc && conda activate HAC_env`、`source ~/.bashrc && conda activate contextgs`、`source ~/.bashrc && conda activate gaussian_splatting`、`source ~/.bashrc && conda activate MEGS2` 或 `source ~/.bashrc && conda activate gspl`
 
 ### ✅ 项目检查
 - [ ] 项目代码已克隆/复制到远程主机
@@ -640,7 +650,7 @@ pip install git+https://github.com/richzhang/PerceptualSimilarity.git
 ## 📞 联系与支持
 
 - **文档位置**：[web/project_md/REMOTE_SETUP_GUIDE_NEW.md](../REMOTE_SETUP_GUIDE_NEW.md)
-- **诊断工具**：`python diagnose.py` (HAC-plus / FCGS)、`bash web/tools/remote_verify_setup.sh contextgs` (ContextGS)、`bash web/tools/remote_verify_setup.sh reduced-3dgs` (reduced-3dgs) 或 `bash web/tools/remote_verify_setup.sh megs2` (MEGS-2)
+- **诊断工具**：`python diagnose.py` (HAC-plus / FCGS)、`bash web/tools/remote_verify_setup.sh contextgs` (ContextGS)、`bash web/tools/remote_verify_setup.sh reduced-3dgs` (reduced-3dgs)、`bash web/tools/remote_verify_setup.sh megs2` (MEGS-2) 或 `bash web/tools/remote_verify_setup.sh gaussian-splatting-lightning` (GSL)
 - **问题报告**：记录 `diagnose.py` 的输出，提交至项目 Issue
 
 ---

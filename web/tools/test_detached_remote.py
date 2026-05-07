@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import stat
 import sys
 import uuid
 from pathlib import Path
@@ -14,6 +16,7 @@ from web.server.remote_executor import (
   _build_remote_cancel_script,
   _build_remote_detached_run_script,
   _build_remote_tmux_start_command,
+  _download_directory,
   _remote_job_paths,
   _tmux_install_candidates,
   build_remote_tmux_attach_command,
@@ -211,6 +214,159 @@ def test_apply_remote_poll_statuses() -> None:
   assert job["remote_result"]["download"]["files"] == 2
 
 
+class FakeSftpAttr:
+  def __init__(self, filename: str, *, is_dir: bool = False, size: int = 0):
+    self.filename = filename
+    self.st_size = size
+    self.st_mode = stat.S_IFDIR if is_dir else stat.S_IFREG
+
+
+class FakeSftp:
+  def __init__(self) -> None:
+    self.files = {
+      "/remote/point_cloud.ply": b"new-point-cloud",
+      "/remote/nested/meta.json": b"{\"ok\": true}",
+    }
+    self.get_calls: list[str] = []
+
+  def listdir_attr(self, remote_path: str):
+    if remote_path == "/remote":
+      return [
+        FakeSftpAttr("point_cloud.ply", size=len(self.files["/remote/point_cloud.ply"])),
+        FakeSftpAttr("nested", is_dir=True),
+      ]
+    if remote_path == "/remote/nested":
+      return [FakeSftpAttr("meta.json", size=len(self.files["/remote/nested/meta.json"]))]
+    return []
+
+  def get(self, remote_item: str, local_item: str, callback=None):
+    self.get_calls.append(remote_item)
+    payload = self.files[remote_item]
+    target = Path(local_item)
+    target.write_bytes(payload)
+    if callback:
+      callback(len(payload), len(payload))
+
+
+def test_remote_download_uses_temp_file_and_reports_progress() -> None:
+  target_dir = Path(api_server.WEB_DIR) / "generated" / "download_tests" / f"download-{uuid.uuid4().hex[:8]}"
+  try:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    stale_file = target_dir / "point_cloud.ply"
+    stale_file.write_bytes(b"old")
+    progress = []
+
+    result = _download_directory(FakeSftp(), "/remote", target_dir, progress_callback=progress.append)
+
+    assert result["pending"] is False
+    assert result["files"] == 2
+    assert result["total_files"] == 2
+    assert result["skipped_files"] == 0
+    assert stale_file.read_bytes() == b"new-point-cloud"
+    assert (target_dir / "nested" / "meta.json").read_bytes() == b"{\"ok\": true}"
+    assert not list(target_dir.glob("*.wgsc-download"))
+    assert progress
+    assert progress[0]["pending"] is True
+  finally:
+    if target_dir.exists():
+      shutil.rmtree(target_dir)
+
+
+def test_remote_download_skips_complete_local_files() -> None:
+  target_dir = Path(api_server.WEB_DIR) / "generated" / "download_tests" / f"skip-{uuid.uuid4().hex[:8]}"
+  fake = FakeSftp()
+  try:
+    (target_dir / "nested").mkdir(parents=True, exist_ok=True)
+    (target_dir / "point_cloud.ply").write_bytes(fake.files["/remote/point_cloud.ply"])
+    (target_dir / "nested" / "meta.json").write_bytes(fake.files["/remote/nested/meta.json"])
+
+    result = _download_directory(fake, "/remote", target_dir, progress_callback=lambda _: None)
+
+    assert result["pending"] is False
+    assert result["complete"] is True
+    assert result["files"] == 0
+    assert result["bytes"] == 0
+    assert result["skipped_files"] == 2
+    assert fake.get_calls == []
+  finally:
+    if target_dir.exists():
+      shutil.rmtree(target_dir)
+
+
+def test_result_download_validation_allows_completed_only() -> None:
+  base = {
+    "remote_detached": True,
+    "remote_output_dir": "/remote/output",
+    "output_dir": "/local/output",
+  }
+  assert api_server.validate_completed_result_download_job({**base, "status": "completed"}) == ("/remote/output", "/local/output")
+
+  for status in ("failed", "canceled", "running", "detached"):
+    try:
+      api_server.validate_completed_result_download_job({**base, "status": status})
+    except ValueError as exc:
+      assert "Only completed jobs can download results" in str(exc)
+    else:
+      raise AssertionError(f"status should be rejected: {status}")
+
+  try:
+    api_server.validate_completed_result_download_job({
+      **base,
+      "status": "completed",
+      "remote_detached": False,
+    })
+  except ValueError as exc:
+    assert "Only completed remote jobs" in str(exc)
+  else:
+    raise AssertionError("local completed job should be rejected")
+
+
+class AliveDownloadThread:
+  def is_alive(self) -> bool:
+    return True
+
+
+def test_result_download_repeated_request_returns_already_running() -> None:
+  base = {
+    "id": f"result-download-{uuid.uuid4().hex[:8]}",
+    "status": "completed",
+    "remote_detached": True,
+    "remote_output_dir": "/remote/output",
+    "output_dir": str(Path(api_server.WEB_DIR) / "generated" / "download_tests" / "already-running"),
+  }
+
+  active = api_server.start_completed_result_download({**base, "_result_download_thread": AliveDownloadThread()}, {})
+  starting = api_server.start_completed_result_download({**base, "_result_download_starting": True}, {})
+
+  assert active["started"] is False
+  assert active["already_running"] is True
+  assert starting["started"] is False
+  assert starting["already_running"] is True
+
+
+def test_pending_remote_download_hides_partial_artifacts() -> None:
+  target_dir = Path(api_server.WEB_DIR) / "generated" / "download_tests" / f"pending-{uuid.uuid4().hex[:8]}"
+  try:
+    (target_dir / "point_cloud" / "iteration_1").mkdir(parents=True, exist_ok=True)
+    (target_dir / "point_cloud" / "iteration_1" / "point_cloud.ply").write_bytes(b"partial")
+    job = {
+      "id": f"pending-{uuid.uuid4().hex[:8]}",
+      "status": "completed",
+      "remote_detached": True,
+      "remote_result": {"download": {"pending": True, "files": 0, "bytes": 0}},
+      "output_dir": str(target_dir),
+      "representation": "sh",
+    }
+
+    enriched = api_server.enrich_job(job)
+
+    assert "point_cloud_url" not in enriched
+    assert api_server.is_remote_download_pending(enriched)
+  finally:
+    if target_dir.exists():
+      shutil.rmtree(target_dir)
+
+
 def main() -> None:
   test_detached_script_contract()
   test_existing_dataset_disables_auto_colmap_contract()
@@ -219,6 +375,11 @@ def main() -> None:
   test_tmux_cancel_script_kills_session_and_preserves_logs()
   test_job_persistence_sanitizes_password()
   test_apply_remote_poll_statuses()
+  test_remote_download_uses_temp_file_and_reports_progress()
+  test_remote_download_skips_complete_local_files()
+  test_result_download_validation_allows_completed_only()
+  test_result_download_repeated_request_returns_already_running()
+  test_pending_remote_download_hides_partial_artifacts()
   print("detached remote tests passed")
 
 

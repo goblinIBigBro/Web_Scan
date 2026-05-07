@@ -647,35 +647,298 @@ def _upload_directory(sftp, local_dir: Path, remote_dir: str) -> Dict[str, Any]:
   }
 
 
-def _download_directory(sftp, remote_dir: str, local_dir: Path) -> Dict[str, Any]:
+def _collect_remote_download_files(sftp, remote_dir: str, local_dir: Path) -> list[Dict[str, Any]]:
+  remote_root = PurePosixPath(remote_dir)
+  local_root = Path(local_dir)
+  files: list[Dict[str, Any]] = []
+
+  def walk(remote_path: PurePosixPath, relative_parts: tuple[str, ...]) -> None:
+    entries = sftp.listdir_attr(str(remote_path))
+    for entry in entries:
+      remote_item = remote_path / entry.filename
+      child_parts = (*relative_parts, entry.filename)
+      if stat.S_ISDIR(entry.st_mode):
+        walk(remote_item, child_parts)
+        continue
+      size = int(getattr(entry, "st_size", 0) or 0)
+      files.append({
+        "remote_path": str(remote_item),
+        "local_path": str(local_root.joinpath(*child_parts)),
+        "relative_path": PurePosixPath(*child_parts).as_posix(),
+        "size": size,
+      })
+
+  walk(remote_root, ())
+  return files
+
+
+def _build_remote_download_plan(sftp, remote_dir: str, local_dir: Path) -> Dict[str, Any]:
+  local_root = Path(local_dir).expanduser().resolve()
+  remote_files = _collect_remote_download_files(sftp, remote_dir, local_root)
+  files_to_download: list[Dict[str, Any]] = []
+  skipped_files = 0
+  skipped_bytes = 0
+  missing_files = 0
+  mismatched_files = 0
+  bytes_to_download = 0
+  total_bytes = 0
+
+  for item in remote_files:
+    size = int(item.get("size", 0) or 0)
+    total_bytes += size
+    local_path = Path(str(item["local_path"]))
+    local_size = -1
+    if local_path.exists() and local_path.is_file():
+      try:
+        local_size = local_path.stat().st_size
+      except OSError:
+        local_size = -1
+    if local_size == size:
+      skipped_files += 1
+      skipped_bytes += size
+      continue
+
+    reason = "missing" if local_size < 0 else "size_mismatch"
+    if reason == "missing":
+      missing_files += 1
+    else:
+      mismatched_files += 1
+    bytes_to_download += size
+    files_to_download.append({
+      **item,
+      "reason": reason,
+      "local_size": None if local_size < 0 else local_size,
+    })
+
+  return {
+    "ok": True,
+    "complete": not files_to_download,
+    "remote_output_dir": str(PurePosixPath(remote_dir)),
+    "local_output_dir": str(local_root),
+    "total_files": len(remote_files),
+    "total_bytes": total_bytes,
+    "files_to_download": files_to_download,
+    "download_files": len(files_to_download),
+    "download_bytes": bytes_to_download,
+    "missing_files": missing_files,
+    "mismatched_files": mismatched_files,
+    "skipped_files": skipped_files,
+    "skipped_bytes": skipped_bytes,
+    "sample_files": [item["relative_path"] for item in files_to_download[:20]],
+  }
+
+
+def _public_download_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
+  return {
+    "ok": plan.get("ok", True),
+    "complete": plan.get("complete", False),
+    "remote_output_dir": plan.get("remote_output_dir", ""),
+    "local_output_dir": plan.get("local_output_dir", ""),
+    "remote_total_files": int(plan.get("total_files", 0) or 0),
+    "remote_total_bytes": int(plan.get("total_bytes", 0) or 0),
+    "total_files": int(plan.get("download_files", 0) or 0),
+    "total_bytes": int(plan.get("download_bytes", 0) or 0),
+    "download_files": int(plan.get("download_files", 0) or 0),
+    "download_bytes": int(plan.get("download_bytes", 0) or 0),
+    "missing_files": int(plan.get("missing_files", 0) or 0),
+    "mismatched_files": int(plan.get("mismatched_files", 0) or 0),
+    "skipped_files": int(plan.get("skipped_files", 0) or 0),
+    "skipped_bytes": int(plan.get("skipped_bytes", 0) or 0),
+    "sample_files": plan.get("sample_files", []),
+  }
+
+
+def _download_directory(
+  sftp,
+  remote_dir: str,
+  local_dir: Path,
+  progress_callback: Callable[[Dict[str, Any]], None] | None = None,
+) -> Dict[str, Any]:
   downloaded_files = 0
   downloaded_bytes = 0
-  local_dir.mkdir(parents=True, exist_ok=True)
+  local_root = Path(local_dir).expanduser().resolve()
+  local_root.mkdir(parents=True, exist_ok=True)
+  plan = _build_remote_download_plan(sftp, remote_dir, local_root)
+  files_to_download = plan["files_to_download"]
+  total_files = int(plan.get("download_files", 0) or 0)
+  total_bytes = int(plan.get("download_bytes", 0) or 0)
 
-  def walk(remote_path: str, local_path: Path) -> None:
-    nonlocal downloaded_files, downloaded_bytes
-    try:
-      entries = sftp.listdir_attr(remote_path)
-    except Exception:
+  def emit_progress(extra: Dict[str, Any] | None = None) -> None:
+    if not progress_callback:
       return
+    payload = {
+      "files": downloaded_files,
+      "bytes": downloaded_bytes,
+      "total_files": total_files,
+      "total_bytes": total_bytes,
+      "remote_total_files": plan["total_files"],
+      "remote_total_bytes": plan["total_bytes"],
+      "skipped_files": plan["skipped_files"],
+      "skipped_bytes": plan["skipped_bytes"],
+      "missing_files": plan["missing_files"],
+      "mismatched_files": plan["mismatched_files"],
+      "complete": plan["complete"],
+      "phase": "downloading",
+      "pending": True,
+    }
+    if extra:
+      payload.update(extra)
+    progress_callback(payload)
 
-    for entry in entries:
-      remote_item = str(PurePosixPath(remote_path) / entry.filename)
-      local_item = local_path / entry.filename
-      if stat.S_ISDIR(entry.st_mode):
-        local_item.mkdir(parents=True, exist_ok=True)
-        walk(remote_item, local_item)
-      else:
-        local_item.parent.mkdir(parents=True, exist_ok=True)
-        sftp.get(remote_item, str(local_item))
-        downloaded_files += 1
-        downloaded_bytes += int(getattr(entry, "st_size", 0) or 0)
+  if not files_to_download:
+    if progress_callback:
+      progress_callback({
+        **_public_download_plan(plan),
+        "files": 0,
+        "bytes": 0,
+        "pending": False,
+        "phase": "complete",
+      })
+    return {
+      **_public_download_plan(plan),
+      "files": 0,
+      "bytes": 0,
+      "pending": False,
+      "phase": "complete",
+    }
 
-  walk(remote_dir, local_dir)
+  emit_progress({"current_file": ""})
+
+  for file_item in files_to_download:
+    remote_item = str(file_item["remote_path"])
+    local_item = Path(str(file_item["local_path"]))
+    remote_size = int(file_item.get("size", 0) or 0)
+    local_item.parent.mkdir(parents=True, exist_ok=True)
+    temp_item = local_item.with_name(f".{local_item.name}.wgsc-download")
+    try:
+      if temp_item.exists():
+        temp_item.unlink()
+    except OSError:
+      pass
+
+    last_emit = 0.0
+
+    def on_file_progress(transferred: int, total: int) -> None:
+      nonlocal last_emit
+      now = time.time()
+      if transferred < total and now - last_emit < 1.0:
+        return
+      last_emit = now
+      emit_progress({
+        "bytes": downloaded_bytes + int(transferred or 0),
+        "current_file": str(file_item["relative_path"]),
+        "current_bytes": int(transferred or 0),
+        "current_total": int(total or remote_size or 0),
+      })
+
+    try:
+      sftp.get(remote_item, str(temp_item), callback=on_file_progress)
+      temp_item.replace(local_item)
+    except Exception:
+      try:
+        if temp_item.exists():
+          temp_item.unlink()
+      except OSError:
+        pass
+      raise
+
+    try:
+      written_size = local_item.stat().st_size
+    except OSError:
+      written_size = remote_size
+    completed_size = int(written_size or remote_size or 0)
+    downloaded_files += 1
+    downloaded_bytes += completed_size
+    emit_progress({
+      "current_file": str(file_item["relative_path"]),
+      "current_bytes": completed_size,
+      "current_total": int(remote_size or completed_size),
+    })
+
   return {
+    **_public_download_plan(plan),
     "files": downloaded_files,
     "bytes": downloaded_bytes,
+    "pending": False,
+    "phase": "complete",
   }
+
+
+def check_remote_output_download(
+  *,
+  remote_config: Dict[str, Any],
+  remote_output_dir: str,
+  local_output_dir: str,
+) -> Dict[str, Any]:
+  validated = validate_remote_config(remote_config)
+  paramiko = _load_paramiko()
+  client = paramiko.SSHClient()
+  client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+  sftp = None
+  try:
+    client.connect(
+      hostname=validated["host"],
+      port=validated["port"],
+      username=validated["username"],
+      password=validated["password"],
+      timeout=20,
+      look_for_keys=False,
+      allow_agent=False,
+    )
+    sftp = client.open_sftp()
+    plan = _build_remote_download_plan(sftp, remote_output_dir, Path(local_output_dir))
+    return _public_download_plan(plan)
+  finally:
+    try:
+      if sftp is not None:
+        sftp.close()
+    except Exception:
+      pass
+    try:
+      client.close()
+    except Exception:
+      pass
+
+
+def download_remote_output_directory(
+  *,
+  remote_config: Dict[str, Any],
+  remote_output_dir: str,
+  local_output_dir: str,
+  progress_callback: Callable[[Dict[str, Any]], None] | None = None,
+) -> Dict[str, Any]:
+  validated = validate_remote_config(remote_config)
+  paramiko = _load_paramiko()
+  client = paramiko.SSHClient()
+  client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+  sftp = None
+  try:
+    client.connect(
+      hostname=validated["host"],
+      port=validated["port"],
+      username=validated["username"],
+      password=validated["password"],
+      timeout=20,
+      look_for_keys=False,
+      allow_agent=False,
+    )
+    sftp = client.open_sftp()
+    return _download_directory(
+      sftp,
+      remote_output_dir,
+      Path(local_output_dir),
+      progress_callback=progress_callback,
+    )
+  finally:
+    try:
+      if sftp is not None:
+        sftp.close()
+    except Exception:
+      pass
+    try:
+      client.close()
+    except Exception:
+      pass
 
 
 def _remote_job_paths(remote_output_dir: str) -> Dict[str, str]:
@@ -1387,6 +1650,7 @@ def poll_remote_detached_job(
   local_output_dir: str,
   log_cursor: int = 0,
   download_output: bool = False,
+  download_progress_callback: Callable[[Dict[str, Any]], None] | None = None,
 ) -> Dict[str, Any]:
   validated = validate_remote_config(remote_config)
   paramiko = _load_paramiko()
@@ -1410,9 +1674,14 @@ def poll_remote_detached_job(
     status = str(status_payload.get("status") or "running")
     stage = str(status_payload.get("stage") or "remote_detached_running")
     return_code = status_payload.get("return_code")
-    download_info = {"files": 0, "bytes": 0, "pending": True}
+    download_info: Dict[str, Any] = {}
     if download_output and status in {"completed", "failed", "canceled"}:
-      download_info = _download_directory(sftp, remote_output_dir, Path(local_output_dir).expanduser().resolve())
+      download_info = _download_directory(
+        sftp,
+        remote_output_dir,
+        Path(local_output_dir).expanduser().resolve(),
+        progress_callback=download_progress_callback,
+      )
 
     return {
       "ok": True,

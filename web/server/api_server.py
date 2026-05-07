@@ -45,6 +45,8 @@ from web.server.remote_executor import (
   build_remote_tmux_attach_command,
   build_remote_tmux_session_name,
   cancel_remote_detached_job,
+  check_remote_output_download,
+  download_remote_output_directory,
   poll_remote_detached_job,
   remote_preflight_check,
   sanitize_remote_config,
@@ -56,6 +58,7 @@ from web.tools.export_scene_package import build_scene_package
 
 JOBS: Dict[str, Dict[str, Any]] = {}
 JOB_LOG_LOCKS: Dict[str, threading.Lock] = {}
+RESULT_DOWNLOAD_LOCK = threading.Lock()
 MAX_JOB_HISTORY = 300
 MAX_PROCESS_FRAME_COMPLETED_HISTORY = 80
 MAX_METRICS_HISTORY = 5000
@@ -2374,15 +2377,19 @@ def file_download_response(
 def enrich_job(job: Dict[str, Any]) -> Dict[str, Any]:
   ensure_job_logging(job)
   enriched = dict(job)
-  artifacts = read_runtime_artifacts(enriched.get("output_dir"), enriched.get("representation"))
-  if artifacts.get("metrics"):
-    enriched["metrics"] = {
-      **enriched.get("metrics", {}),
-      **artifacts["metrics"],
-    }
-  for key in ARTIFACT_RESULT_FIELDS:
-    if artifacts.get(key):
-      enriched[key] = artifacts[key]
+  if not is_remote_download_pending(enriched):
+    artifacts = read_runtime_artifacts(enriched.get("output_dir"), enriched.get("representation"))
+    if artifacts.get("metrics"):
+      enriched["metrics"] = {
+        **enriched.get("metrics", {}),
+        **artifacts["metrics"],
+      }
+    for key in ARTIFACT_RESULT_FIELDS:
+      if artifacts.get(key):
+        enriched[key] = artifacts[key]
+  else:
+    for key in ARTIFACT_RESULT_FIELDS:
+      enriched.pop(key, None)
   job_id = str(enriched.get("id", "")).strip()
   if job_id:
     enriched["logs_api_url"] = f"/api/jobs/{job_id}/logs"
@@ -2455,6 +2462,8 @@ def discover_runtime_results(*, limit: int = 30, max_scan_dirs: int = 1800) -> l
       if scanned_dirs > safe_max_scan_dirs:
         break
       directory = Path(current_root)
+      if output_dir_has_pending_remote_download(directory):
+        continue
       artifact = load_result_path(str(directory), family=family)
       if not artifact.get("ok"):
         continue
@@ -2644,6 +2653,201 @@ def is_job_terminal(job: Dict[str, Any]) -> bool:
   return str(job.get("status", "")).strip().lower() in TERMINAL_STATUSES
 
 
+def remote_download_info(job: Dict[str, Any]) -> Dict[str, Any]:
+  remote_result = job.get("remote_result")
+  if not isinstance(remote_result, dict):
+    return {}
+  download = remote_result.get("download")
+  return download if isinstance(download, dict) else {}
+
+
+def is_remote_download_pending(job: Dict[str, Any]) -> bool:
+  download = remote_download_info(job)
+  return bool(job.get("remote_detached") and download.get("pending"))
+
+
+def is_remote_download_active(job: Dict[str, Any]) -> bool:
+  thread = job.get("_result_download_thread")
+  return bool(thread is not None and getattr(thread, "is_alive", lambda: False)())
+
+
+def is_remote_download_starting(job: Dict[str, Any]) -> bool:
+  return bool(job.get("_result_download_starting"))
+
+
+def completed_remote_result_paths(job: Dict[str, Any]) -> tuple[str, str]:
+  remote_result = job.get("remote_result") if isinstance(job.get("remote_result"), dict) else {}
+  remote_output_dir = str(job.get("remote_output_dir") or remote_result.get("remote_output_dir") or "").strip()
+  local_output_dir = str(job.get("output_dir") or "").strip()
+  return remote_output_dir, local_output_dir
+
+
+def result_download_remote_config(job: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+  remote_config = payload.get("remote") if isinstance(payload.get("remote"), dict) else job.get("_remote_config")
+  if not isinstance(remote_config, dict) or not str(remote_config.get("password", "")).strip():
+    raise RemoteExecutionError(
+      "Remote credentials are required to download completed job results.",
+      code_hint="WGSC-JOB-RESULTS-REMOTE-CONFIG",
+      stage="config",
+    )
+  validate_remote_config(remote_config)
+  return remote_config
+
+
+def validate_completed_result_download_job(job: Dict[str, Any]) -> tuple[str, str]:
+  status = str(job.get("status", "")).strip().lower()
+  if status != "completed":
+    raise ValueError("Only completed jobs can download results.")
+  if not job.get("remote_detached"):
+    raise ValueError("Only completed remote jobs can download results.")
+  remote_output_dir, local_output_dir = completed_remote_result_paths(job)
+  if not remote_output_dir:
+    raise ValueError("Completed remote job has no remote_output_dir to download.")
+  if not local_output_dir:
+    raise ValueError("Completed remote job has no local output_dir to download into.")
+  return remote_output_dir, local_output_dir
+
+
+def set_remote_download_progress(job: Dict[str, Any], progress: Dict[str, Any]) -> None:
+  remote_result = job.setdefault("remote_result", {})
+  if not isinstance(remote_result, dict):
+    remote_result = {}
+    job["remote_result"] = remote_result
+  download = {
+    **remote_download_info(job),
+    **progress,
+    "updated_at": time.time(),
+  }
+  remote_result["download"] = download
+  job["safe_to_close_web"] = True
+  if download.get("pending"):
+    job["remote_stage"] = "remote_downloading"
+    job["monitor_state"] = "downloading"
+
+
+def apply_completed_result_check(job: Dict[str, Any], check: Dict[str, Any]) -> None:
+  set_remote_download_progress(job, {
+    **check,
+    "pending": False,
+    "phase": "complete" if check.get("complete") else "incomplete",
+  })
+  if check.get("complete"):
+    update_job_artifacts(job)
+  job["remote_stage"] = "completed"
+  job["monitor_state"] = "completed"
+
+
+def check_completed_result_download(job: Dict[str, Any], remote_config: Dict[str, Any]) -> Dict[str, Any]:
+  remote_output_dir, local_output_dir = validate_completed_result_download_job(job)
+  check = check_remote_output_download(
+    remote_config=remote_config,
+    remote_output_dir=remote_output_dir,
+    local_output_dir=local_output_dir,
+  )
+  apply_completed_result_check(job, check)
+  persist_job_state(job)
+  return check
+
+
+def start_completed_result_download(job: Dict[str, Any], remote_config: Dict[str, Any]) -> Dict[str, Any]:
+  with RESULT_DOWNLOAD_LOCK:
+    if is_remote_download_active(job) or is_remote_download_starting(job):
+      return {"ok": True, "started": False, "already_running": True, "job": enrich_job(job)}
+    remote_output_dir, local_output_dir = validate_completed_result_download_job(job)
+    job["_result_download_starting"] = True
+
+  try:
+    check = check_remote_output_download(
+      remote_config=remote_config,
+      remote_output_dir=remote_output_dir,
+      local_output_dir=local_output_dir,
+    )
+  except Exception:
+    with RESULT_DOWNLOAD_LOCK:
+      job.pop("_result_download_starting", None)
+    raise
+
+  if check.get("complete"):
+    with RESULT_DOWNLOAD_LOCK:
+      apply_completed_result_check(job, check)
+      job.pop("_result_download_starting", None)
+    persist_job_state(job)
+    return {"ok": True, "started": False, "complete": True, "check": check, "job": enrich_job(job)}
+
+  set_remote_download_progress(job, {
+    **check,
+    "pending": True,
+    "phase": "queued",
+    "files": 0,
+    "bytes": 0,
+    "current_file": "",
+  })
+  persist_job_state(job)
+
+  def runner() -> None:
+    try:
+      def record_download_progress(progress: Dict[str, Any]) -> None:
+        set_remote_download_progress(job, progress)
+        persist_job_state(job)
+
+      result = download_remote_output_directory(
+        remote_config=remote_config,
+        remote_output_dir=remote_output_dir,
+        local_output_dir=local_output_dir,
+        progress_callback=record_download_progress,
+      )
+      set_remote_download_progress(job, {
+        **result,
+        "pending": False,
+        "phase": "complete",
+      })
+      job["remote_stage"] = "completed"
+      job["monitor_state"] = "completed"
+      update_job_artifacts(job)
+      persist_job_state(job)
+    except Exception as exc:  # pragma: no cover - network dependent
+      set_remote_download_progress(job, {
+        "pending": False,
+        "phase": "error",
+        "error": str(exc),
+      })
+      job["remote_stage"] = "result_download_failed"
+      job["monitor_state"] = "completed"
+      append_job_log_line(job, "stderr", f"[ResultDownload] Failed to download completed result: {exc}\n")
+      persist_job_state(job)
+    finally:
+      with RESULT_DOWNLOAD_LOCK:
+        job.pop("_result_download_thread", None)
+        job.pop("_result_download_starting", None)
+
+  thread = threading.Thread(target=runner, daemon=True)
+  with RESULT_DOWNLOAD_LOCK:
+    job["_result_download_thread"] = thread
+    job.pop("_result_download_starting", None)
+  thread.start()
+  return {"ok": True, "started": True, "complete": False, "check": check, "job": enrich_job(job)}
+
+
+def output_dir_has_pending_remote_download(directory: Path) -> bool:
+  try:
+    resolved = directory.resolve()
+  except OSError:
+    return False
+  for job in JOBS.values():
+    if not is_remote_download_pending(job):
+      continue
+    output_dir = str(job.get("output_dir") or "").strip()
+    if not output_dir:
+      continue
+    try:
+      root = Path(output_dir).resolve()
+    except OSError:
+      continue
+    if resolved == root or root in resolved.parents:
+      return True
+  return False
+
+
 def job_log_dir_for_id(job_id: str) -> Path:
   raw = str(job_id or "").strip()
   if not raw:
@@ -2735,6 +2939,8 @@ def clear_job_records(statuses_value: Any = None) -> Dict[str, Any]:
 
 
 def update_job_artifacts(job: Dict[str, Any]) -> None:
+  if is_remote_download_pending(job):
+    return
   artifacts = read_runtime_artifacts(job.get("output_dir"), job.get("representation"))
   if artifacts.get("metrics"):
     job["metrics"] = {
@@ -2789,7 +2995,6 @@ def start_remote_monitor_thread(job: Dict[str, Any], remote_config: Dict[str, An
         if job.get("cancel_requested"):
           break
         try:
-          terminal = is_job_terminal(job)
           poll_result = poll_remote_detached_job(
             remote_config=remote_config,
             remote_status_path=str(job.get("remote_status_path", "")),
@@ -2797,11 +3002,23 @@ def start_remote_monitor_thread(job: Dict[str, Any], remote_config: Dict[str, An
             remote_output_dir=str(job.get("remote_output_dir", "")),
             local_output_dir=str(job.get("output_dir", "")),
             log_cursor=int(job.get("remote_log_cursor", 0) or 0),
-            download_output=terminal,
+            download_output=False,
           )
           apply_remote_poll_result(job, poll_result)
           persist_job_state(job)
           if is_job_terminal(job):
+            set_remote_download_progress(job, {
+              "files": 0,
+              "bytes": 0,
+              "pending": True,
+              "current_file": "",
+            })
+            persist_job_state(job)
+
+            def record_download_progress(progress: Dict[str, Any]) -> None:
+              set_remote_download_progress(job, progress)
+              persist_job_state(job)
+
             final_poll = poll_remote_detached_job(
               remote_config=remote_config,
               remote_status_path=str(job.get("remote_status_path", "")),
@@ -2810,6 +3027,7 @@ def start_remote_monitor_thread(job: Dict[str, Any], remote_config: Dict[str, An
               local_output_dir=str(job.get("output_dir", "")),
               log_cursor=int(job.get("remote_log_cursor", 0) or 0),
               download_output=True,
+              download_progress_callback=record_download_progress,
             )
             apply_remote_poll_result(job, final_poll)
             if str(job.get("monitor_state", "")) != "completed":
@@ -3372,6 +3590,48 @@ class ApiHandler(SimpleHTTPRequestHandler):
         manual_anchor="#9-%E5%B8%B8%E8%A7%81%E9%94%99%E8%AF%AF%E7%A0%81%E4%B8%8E%E8%A7%A3%E5%86%B3%E6%96%B9%E6%A1%88",
       )
       return
+
+    if parsed.path.startswith("/api/jobs/") and "/results/" in parsed.path:
+      parts = parsed.path.strip("/").split("/")
+      job_id = parts[2] if len(parts) >= 3 else ""
+      action = parts[4] if len(parts) == 5 and parts[3] == "results" else ""
+      job = JOBS.get(job_id)
+      if not job:
+        json_response(self, {"ok": False, "error": f"Unknown job: {job_id}"}, status=404)
+        return
+      if action not in {"check", "download"}:
+        json_response(self, {"ok": False, "error": f"Unsupported endpoint: {parsed.path}"}, status=404)
+        return
+      try:
+        validate_completed_result_download_job(job)
+        remote_config = result_download_remote_config(job, payload)
+        if action == "check":
+          result = check_completed_result_download(job, remote_config)
+          json_response(self, {"ok": True, "check": result, "job": enrich_job(job)})
+          return
+        result = start_completed_result_download(job, remote_config)
+        json_response(self, result)
+        return
+      except RemoteExecutionError as exc:
+        error_response(
+          self,
+          code=exc.code_hint or "WGSC-JOB-RESULTS-REMOTE-001",
+          step="job",
+          message=str(exc),
+          status=400,
+          details={"job_id": job_id, "stage": exc.stage},
+        )
+        return
+      except Exception as exc:
+        error_response(
+          self,
+          code="WGSC-JOB-RESULTS-001",
+          step="job",
+          message=str(exc),
+          status=400,
+          details={"job_id": job_id},
+        )
+        return
 
     if parsed.path.startswith("/api/jobs/") and parsed.path.endswith("/delete"):
       parts = parsed.path.strip("/").split("/")

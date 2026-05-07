@@ -2,9 +2,11 @@ import {
   buildJobLogDownloadUrl,
   buildJobMetricsCsvUrl,
   cancelJob,
+  checkJobResultDownload,
   clearJobs,
   deleteFlowData,
   deleteJob,
+  downloadJobResult,
   fetchAlgorithms,
   fetchDiscoveredResults,
   fetchFlowData,
@@ -315,6 +317,86 @@ function formatBytes(bytes) {
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
   if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
   return `${(value / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+function downloadInfo(job = {}) {
+  return job.remote_result?.download || {};
+}
+
+function isRemoteDownloadPending(job = {}) {
+  return Boolean(job.remote_detached && downloadInfo(job).pending);
+}
+
+function canDownloadCompletedResult(job = {}) {
+  return String(job.status || "").toLowerCase() === "completed" && Boolean(job.remote_detached);
+}
+
+function formatDownloadProgress(info = {}) {
+  const bytes = Number(info.bytes || 0);
+  const totalBytes = Number(info.total_bytes || 0);
+  const files = Number(info.files || 0);
+  const totalFiles = Number(info.total_files || 0);
+  if (info.pending && bytes === 0 && totalBytes === 0 && files === 0 && totalFiles === 0) {
+    return "Waiting for local download to start";
+  }
+  const byteText = totalBytes > 0 ? `${formatBytes(bytes)} / ${formatBytes(totalBytes)}` : formatBytes(bytes);
+  const fileText = totalFiles > 0 ? `${files} / ${totalFiles} files` : `${files} files`;
+  const percent = totalBytes > 0 ? ` · ${Math.min(100, Math.max(0, (bytes / totalBytes) * 100)).toFixed(1)}%` : "";
+  return `${byteText} · ${fileText}${percent}`;
+}
+
+function downloadProgressPercent(info = {}) {
+  const bytes = Number(info.bytes || 0);
+  const totalBytes = Number(info.total_bytes || 0);
+  if (!Number.isFinite(bytes) || !Number.isFinite(totalBytes) || totalBytes <= 0) {
+    return info.complete ? 100 : 0;
+  }
+  return Math.min(100, Math.max(0, (bytes / totalBytes) * 100));
+}
+
+function renderRemoteDownloadStatus(job = {}, options = {}) {
+  if (!job.remote_detached) return "";
+  const info = downloadInfo(job);
+  if (!info || info.pending === undefined) return "";
+  const pending = Boolean(info.pending);
+  const complete = Boolean(info.complete);
+  const failed = String(info.phase || "") === "error";
+  const currentFile = String(info.current_file || "").trim();
+  const label = failed
+    ? "Result download failed"
+    : pending
+      ? "Result files downloading"
+      : complete
+        ? "Result files complete"
+        : "Result files incomplete";
+  const detail = `${formatDownloadProgress(info)}${currentFile ? ` · ${currentFile}` : ""}`;
+  const statusClassName = failed ? "bad" : pending ? "warn" : complete ? "ok" : "warn";
+  const progress = pending ? `
+    <div class="download-progress" aria-label="Result download progress">
+      <div style="width: ${downloadProgressPercent(info).toFixed(1)}%;"></div>
+    </div>
+  ` : "";
+  const remoteOutput = options.paths && job.remote_result?.remote_output_dir
+    ? `<p class="panel-copy">Remote Output: ${escapeHtml(job.remote_result.remote_output_dir)}</p>`
+    : "";
+  const localOutput = options.paths && job.output_dir
+    ? `<p class="panel-copy">Local Output: ${escapeHtml(job.output_dir)}</p>`
+    : "";
+  return `
+    <div class="status-dot ${statusClassName}">
+      ${escapeHtml(label)} · ${escapeHtml(detail)}
+    </div>
+    ${progress}
+    ${remoteOutput}
+    ${localOutput}
+  `;
+}
+
+function renderResultDownloadButton(job = {}, compact = false) {
+  if (!canDownloadCompletedResult(job)) return "";
+  const pending = isRemoteDownloadPending(job);
+  const label = pending ? "Downloading" : "Check Result";
+  return `<button class="${compact ? "compact-button" : ""}" data-action="check-result-download" data-job-id="${escapeHtml(job.id || "")}" type="button" ${pending ? "disabled" : ""}>${label}</button>`;
 }
 
 function statusClass(status) {
@@ -649,6 +731,7 @@ function renderCurrentJobSummary() {
       <strong>${escapeHtml(job.algorithm_family || "-")}</strong>
       <p class="panel-copy">ID: ${escapeHtml(job.id)}</p>
       <p class="panel-copy">Stage: ${escapeHtml(job.remote_stage || "-")}</p>
+      ${renderRemoteDownloadStatus(job)}
       <p class="panel-copy">FPS ${escapeHtml(job.metrics?.fps || "-")} · PSNR ${escapeHtml(job.metrics?.psnr || "-")} · Loss ${escapeHtml(job.metrics?.loss || "-")}</p>
       <div class="button-row">
         <button data-action="select-job" data-job-id="${escapeHtml(job.id)}" type="button">Logs</button>
@@ -1332,6 +1415,7 @@ function renderJobsTable(items) {
                 <span class="badge ${statusClass(job.status)}">${escapeHtml(job.status || "-")}</span>
                 ${job.safe_to_close_web && !isTerminal(job.status) ? `<span class="badge ok">Safe to close page</span>` : ""}
                 <p class="panel-copy">${escapeHtml(job.remote_stage || job.operation || "-")}</p>
+                ${renderRemoteDownloadStatus(job)}
                 ${job.monitor_state === "needs_remote_config" ? `<p class="panel-copy">Waiting for remote reattach.</p>` : ""}
               </td>
               <td>FPS ${escapeHtml(job.metrics?.fps || "-")}<br />PSNR ${escapeHtml(job.metrics?.psnr || "-")}<br />Loss ${escapeHtml(job.metrics?.loss || "-")}</td>
@@ -1340,6 +1424,7 @@ function renderJobsTable(items) {
                 <div class="table-actions">
                   <button class="compact-button" data-action="select-job" data-job-id="${escapeHtml(job.id)}" type="button">Logs</button>
                   <button class="compact-button" data-action="open-result" data-job-id="${escapeHtml(job.id)}" type="button">Results</button>
+                  ${renderResultDownloadButton(job, true)}
                   <button class="compact-button" data-action="rerun-job" data-job-id="${escapeHtml(job.id)}" type="button">Rerun</button>
                   ${isTerminal(job.status)
                     ? `<button class="danger compact-button" data-action="delete-job" data-job-id="${escapeHtml(job.id)}" type="button">Remove</button>`
@@ -1367,6 +1452,7 @@ function renderLogPanel() {
           <h3>Logs and Metrics</h3>
           <p class="panel-copy">${escapeHtml(job.id)} · ${escapeHtml(job.status || "-")}</p>
           ${job.safe_to_close_web && !isTerminal(job.status) ? `<p class="status-dot ok">Safe to close page · remote training keeps running.</p>` : ""}
+          ${renderRemoteDownloadStatus(job, { paths: true })}
           ${job.monitor_state === "needs_remote_config" ? `<p class="status-dot warn">Remote tmux monitor needs reattach with the saved remote config.</p>` : ""}
         </div>
         <div class="button-row">
@@ -1552,6 +1638,7 @@ function renderResultPage() {
   const job = getJob(jobId);
   const plyAsset = job ? getRenderablePlyAsset(job) : null;
   const imageAsset = job ? getRenderableImageAsset(job) : null;
+  const downloadPending = job ? isRemoteDownloadPending(job) : false;
   const preferredMode = state.renderMode || "ply";
   const mode = preferredMode === "image" && imageAsset ? "image" : plyAsset ? "ply" : imageAsset ? "image" : preferredMode;
   const imageFields = { result_url: imageAsset?.imageUrl || "", result_urls: imageAsset?.imageUrls || [], render_images: job?.render_images || [] };
@@ -1568,12 +1655,19 @@ function renderResultPage() {
         <div class="button-row">
           <button data-bind-render="ply" class="${mode === "ply" ? "primary" : ""}" data-action="set-render-mode" data-mode="ply" type="button" ${plyAsset ? "" : "disabled"}>PLY</button>
           <button data-bind-render="image" class="${mode === "image" ? "primary" : ""}" data-action="set-render-mode" data-mode="image" type="button" ${imageAsset ? "" : "disabled"}>Image</button>
+          ${job ? renderResultDownloadButton(job) : ""}
           <button data-page="algorithm" type="button">Back to Jobs</button>
         </div>
       </div>
       <div class="card grid">
-        ${job ? renderResultSurface(surfaceAsset, { tall: true }) : `<p class="panel-copy">No renderable job yet. Finish training first or open a result from the Browser page.</p>`}
-        ${job && !plyAsset && !imageAsset ? `<div class="error-box"><p>No supported result file was found. Supported model files use .ply, while image results use .png, .jpg, .jpeg, .bmp, .gif, .webp, .tif, or .tiff.</p></div>` : ""}
+        ${job ? renderRemoteDownloadStatus(job, { paths: true }) : ""}
+        ${job ? renderResultSurface(surfaceAsset, {
+          tall: true,
+          emptyText: downloadPending
+            ? "Remote training has finished. Result files are still downloading to the local output folder."
+            : undefined,
+        }) : `<p class="panel-copy">No renderable job yet. Finish training first or open a result from the Browser page.</p>`}
+        ${job && !downloadPending && !plyAsset && !imageAsset ? `<div class="error-box"><p>No supported result file was found. Supported model files use .ply, while image results use .png, .jpg, .jpeg, .bmp, .gif, .webp, .tif, or .tiff.</p></div>` : ""}
       </div>
     </section>
   `;
@@ -1641,6 +1735,7 @@ async function handleClick(event) {
   if (action === "delete-job") await guarded(() => deleteJobRecord(jobId), "Failed to remove job", actionKey);
   if (action === "load-log-reset") await guarded(() => loadLog(true), "Failed to load logs", actionKey);
   if (action === "cancel-job") await guarded(() => cancelSelectedJob(jobId), "Failed to cancel job", actionKey);
+  if (action === "check-result-download") await guarded(() => checkAndDownloadResult(jobId), "Failed to check result download", actionKey);
   if (action === "open-result") openResult(jobId);
   if (action === "open-selected-result") openResult(state.selectedJobId);
   if (action === "rerun-job") rerunJob(jobId);
@@ -2384,6 +2479,57 @@ async function cancelSelectedJob(jobId) {
   showToast("Cancel requested. Logs and generated outputs will be retained.");
 }
 
+function upsertJob(updated) {
+  if (!updated?.id) return;
+  const existing = jobs.some((job) => job.id === updated.id);
+  jobs = existing
+    ? jobs.map((job) => job.id === updated.id ? updated : job)
+    : [updated, ...jobs];
+}
+
+async function checkAndDownloadResult(jobId) {
+  const id = jobId || state.selectedJobId;
+  const job = getJob(id);
+  if (!job) throw new Error("Select a completed remote job first.");
+  if (!canDownloadCompletedResult(job)) throw new Error("Only completed jobs can download results.");
+  if (!remoteConfigReadyForReattach()) {
+    throw new Error("Remote credentials are required. Fill the Remote Config fields before downloading results.");
+  }
+
+  const checkData = await checkJobResultDownload(state.apiBaseUrl, id, state.remoteConfig);
+  upsertJob(checkData.job);
+  const check = checkData.check || {};
+  if (check.complete) {
+    persistState();
+    render();
+    afterRender();
+    showToast("Local result is already complete. No duplicate download needed.");
+    return;
+  }
+
+  const confirmed = await openResultDownloadConfirmModal(check);
+  if (!confirmed) {
+    await refreshJobs();
+    render();
+    afterRender();
+    return;
+  }
+
+  const downloadData = await downloadJobResult(state.apiBaseUrl, id, state.remoteConfig);
+  upsertJob(downloadData.job);
+  await refreshJobs();
+  persistState();
+  render();
+  afterRender();
+  if (downloadData.already_running) {
+    showToast("Result download is already running.");
+  } else if (downloadData.complete) {
+    showToast("Local result is already complete. No duplicate download needed.");
+  } else {
+    showToast("Result download started.");
+  }
+}
+
 function openResult(jobId) {
   if (!jobId) return;
   state.selectedJobId = jobId;
@@ -2571,6 +2717,41 @@ function openConfirmModal(preview) {
       <div class="modal-footer">
         <button data-modal-cancel type="button">Cancel</button>
         <button class="primary" data-modal-ok type="button">Confirm and Submit</button>
+      </div>
+    </div>
+  `;
+  return new Promise((resolve) => {
+    layer.querySelector("[data-modal-cancel]").addEventListener("click", () => {
+      layer.hidden = true;
+      resolve(false);
+    });
+    layer.querySelector("[data-modal-ok]").addEventListener("click", () => {
+      layer.hidden = true;
+      resolve(true);
+    });
+  });
+}
+
+function openResultDownloadConfirmModal(check = {}) {
+  const layer = document.getElementById("modal-layer");
+  const sampleFiles = Array.isArray(check.sample_files) ? check.sample_files.slice(0, 8) : [];
+  layer.hidden = false;
+  layer.innerHTML = `
+    <div class="modal">
+      <div class="panel-head"><h2>Download Result Files</h2><span class="badge warn">Incomplete local result</span></div>
+      <div class="modal-body grid">
+        <p>Local result files are incomplete. Confirming will download only missing or size-mismatched files from the remote output directory.</p>
+        <div class="command-box grid">
+          <p class="panel-copy">Remote Output: ${escapeHtml(check.remote_output_dir || "-")}</p>
+          <p class="panel-copy">Local Output: ${escapeHtml(check.local_output_dir || "-")}</p>
+          <p class="panel-copy">To download: ${escapeHtml(check.total_files || 0)} file(s), ${escapeHtml(formatBytes(check.total_bytes || 0))}</p>
+          <p class="panel-copy">Missing: ${escapeHtml(check.missing_files || 0)} · Size mismatch: ${escapeHtml(check.mismatched_files || 0)} · Skipped: ${escapeHtml(check.skipped_files || 0)}</p>
+          ${sampleFiles.length ? `<pre>${escapeHtml(sampleFiles.join("\n"))}</pre>` : ""}
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button data-modal-cancel type="button">Cancel</button>
+        <button class="primary" data-modal-ok type="button">Download Missing Files</button>
       </div>
     </div>
   `;

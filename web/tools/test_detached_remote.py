@@ -11,14 +11,16 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT_DIR))
 
-from web.server import api_server
+from web.server import api_server, remote_executor
 from web.server.remote_executor import (
+  RemoteExecutionError,
   _build_remote_cancel_script,
   _build_remote_detached_run_script,
   _build_remote_tmux_start_command,
   _download_directory,
   _remote_job_paths,
   _tmux_install_candidates,
+  _verify_remote_result_marker,
   build_remote_tmux_attach_command,
   build_remote_tmux_session_name,
 )
@@ -215,10 +217,29 @@ def test_apply_remote_poll_statuses() -> None:
 
 
 class FakeSftpAttr:
-  def __init__(self, filename: str, *, is_dir: bool = False, size: int = 0):
+  def __init__(self, filename: str, *, is_dir: bool = False, is_special: bool = False, size: int = 0):
     self.filename = filename
     self.st_size = size
-    self.st_mode = stat.S_IFDIR if is_dir else stat.S_IFREG
+    if is_dir:
+      self.st_mode = stat.S_IFDIR
+    elif is_special:
+      self.st_mode = stat.S_IFLNK
+    else:
+      self.st_mode = stat.S_IFREG
+
+
+class FakeRemoteFile:
+  def __init__(self, payload: bytes):
+    self.payload = payload
+
+  def __enter__(self):
+    return self
+
+  def __exit__(self, exc_type, exc, traceback):
+    return False
+
+  def read(self):
+    return self.payload
 
 
 class FakeSftp:
@@ -227,6 +248,10 @@ class FakeSftp:
       "/remote/point_cloud.ply": b"new-point-cloud",
       "/remote/nested/meta.json": b"{\"ok\": true}",
     }
+    self.marker_payload = json.dumps({
+      "job_id": "job-1",
+      "remote_output_dir": "/remote",
+    }).encode("utf-8")
     self.get_calls: list[str] = []
 
   def listdir_attr(self, remote_path: str):
@@ -234,6 +259,7 @@ class FakeSftp:
       return [
         FakeSftpAttr("point_cloud.ply", size=len(self.files["/remote/point_cloud.ply"])),
         FakeSftpAttr("nested", is_dir=True),
+        FakeSftpAttr("latest", is_special=True),
       ]
     if remote_path == "/remote/nested":
       return [FakeSftpAttr("meta.json", size=len(self.files["/remote/nested/meta.json"]))]
@@ -246,6 +272,11 @@ class FakeSftp:
     target.write_bytes(payload)
     if callback:
       callback(len(payload), len(payload))
+
+  def open(self, remote_path: str, mode: str = "r"):
+    if remote_path == "/remote/.wgsc_job/status.json":
+      return FakeRemoteFile(self.marker_payload)
+    raise FileNotFoundError(remote_path)
 
 
 def test_remote_download_uses_temp_file_and_reports_progress() -> None:
@@ -262,6 +293,7 @@ def test_remote_download_uses_temp_file_and_reports_progress() -> None:
     assert result["files"] == 2
     assert result["total_files"] == 2
     assert result["skipped_files"] == 0
+    assert result["skipped_special_files"] == 1
     assert stale_file.read_bytes() == b"new-point-cloud"
     assert (target_dir / "nested" / "meta.json").read_bytes() == b"{\"ok\": true}"
     assert not list(target_dir.glob("*.wgsc-download"))
@@ -287,6 +319,7 @@ def test_remote_download_skips_complete_local_files() -> None:
     assert result["files"] == 0
     assert result["bytes"] == 0
     assert result["skipped_files"] == 2
+    assert result["skipped_special_files"] == 1
     assert fake.get_calls == []
   finally:
     if target_dir.exists():
@@ -319,6 +352,178 @@ def test_result_download_validation_allows_completed_only() -> None:
     assert "Only completed remote jobs" in str(exc)
   else:
     raise AssertionError("local completed job should be rejected")
+
+
+def remote_config(**overrides):
+  base = {
+    "host": "server.example.com",
+    "port": 2222,
+    "username": "root",
+    "password": "secret",
+    "repo_path": "/repo",
+    "workspace_root": "/workspace",
+    "output_root": "/outputs",
+    "python": "python3",
+    "activate_cmd": "",
+  }
+  base.update(overrides)
+  return base
+
+
+def result_download_job(**overrides):
+  base = {
+    "id": "job-1",
+    "status": "completed",
+    "remote_detached": True,
+    "remote_output_dir": "/outputs/session/family/job-1/output",
+    "output_dir": "/local/output",
+    "remote": {
+      "host": "server.example.com",
+      "port": 2222,
+      "username": "root",
+      "repo_path": "/repo",
+      "workspace_root": "/workspace",
+      "output_root": "/outputs",
+      "python": "python3",
+      "activate_cmd": "",
+      "has_password": True,
+    },
+  }
+  base.update(overrides)
+  return base
+
+
+def test_result_download_remote_identity_requires_original_server() -> None:
+  matched = api_server.result_download_remote_config(result_download_job(), {"remote": remote_config()})
+  assert matched["host"] == "server.example.com"
+  assert matched["output_root"] == "/outputs"
+
+  for field, value in (
+    ("host", "other.example.com"),
+    ("port", 2223),
+    ("username", "ubuntu"),
+    ("output_root", "/other-outputs"),
+  ):
+    try:
+      api_server.result_download_remote_config(result_download_job(), {"remote": remote_config(**{field: value})})
+    except RemoteExecutionError as exc:
+      assert exc.code_hint == "WGSC-JOB-RESULTS-REMOTE-MISMATCH"
+      assert field in exc.details["mismatch_fields"]
+    else:
+      raise AssertionError(f"remote identity mismatch should be rejected: {field}")
+
+  try:
+    api_server.result_download_remote_config(result_download_job(remote={}), {"remote": remote_config()})
+  except RemoteExecutionError as exc:
+    assert exc.code_hint == "WGSC-JOB-RESULTS-REMOTE-MISSING"
+    assert "host" in exc.details["missing_fields"]
+  else:
+    raise AssertionError("missing saved remote identity should be rejected")
+
+
+def test_remote_result_marker_must_match_job_and_output() -> None:
+  marker = _verify_remote_result_marker(
+    FakeSftp(),
+    remote_output_dir="/remote",
+    expected_job_id="job-1",
+    expected_remote_output_dir="/remote",
+  )
+  assert marker["verified"] is True
+  assert marker["job_id"] == "job-1"
+
+  wrong_job = FakeSftp()
+  wrong_job.marker_payload = json.dumps({"job_id": "other-job", "remote_output_dir": "/remote"}).encode("utf-8")
+  try:
+    _verify_remote_result_marker(
+      wrong_job,
+      remote_output_dir="/remote",
+      expected_job_id="job-1",
+      expected_remote_output_dir="/remote",
+    )
+  except RemoteExecutionError as exc:
+    assert exc.code_hint == "WGSC-JOB-RESULTS-MARKER-MISMATCH"
+    assert exc.details["actual_job_id"] == "other-job"
+  else:
+    raise AssertionError("wrong marker job_id should be rejected")
+
+  wrong_output = FakeSftp()
+  wrong_output.marker_payload = json.dumps({"job_id": "job-1", "remote_output_dir": "/other"}).encode("utf-8")
+  try:
+    _verify_remote_result_marker(
+      wrong_output,
+      remote_output_dir="/remote",
+      expected_job_id="job-1",
+      expected_remote_output_dir="/remote",
+    )
+  except RemoteExecutionError as exc:
+    assert exc.code_hint == "WGSC-JOB-RESULTS-MARKER-MISMATCH"
+    assert exc.details["actual_remote_output_dir"] == "/other"
+  else:
+    raise AssertionError("wrong marker output dir should be rejected")
+
+  missing = FakeSftp()
+  try:
+    _verify_remote_result_marker(
+      missing,
+      remote_output_dir="/remote",
+      remote_status_path="/remote/missing-status.json",
+      expected_job_id="job-1",
+      expected_remote_output_dir="/remote",
+    )
+  except RemoteExecutionError as exc:
+    assert exc.code_hint == "WGSC-JOB-RESULTS-MARKER-MISSING"
+  else:
+    raise AssertionError("missing marker should be rejected")
+
+
+class ShortWriteSftp(FakeSftp):
+  def get(self, remote_item: str, local_item: str, callback=None):
+    self.get_calls.append(remote_item)
+    payload = b"short"
+    Path(local_item).write_bytes(payload)
+    if callback:
+      callback(len(payload), len(self.files[remote_item]))
+
+
+def test_remote_download_checks_disk_space_and_downloaded_size() -> None:
+  target_dir = Path(api_server.WEB_DIR) / "generated" / "download_tests" / f"hardening-{uuid.uuid4().hex[:8]}"
+  original_disk_usage = remote_executor.shutil.disk_usage
+
+  class TinyDisk:
+    free = 1
+
+  try:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    remote_executor.shutil.disk_usage = lambda _: TinyDisk()
+    try:
+      _download_directory(FakeSftp(), "/remote", target_dir)
+    except RemoteExecutionError as exc:
+      assert exc.code_hint == "WGSC-JOB-RESULTS-DISK-SPACE"
+      assert exc.details["required_bytes"] > exc.details["available_bytes"]
+    else:
+      raise AssertionError("insufficient disk space should be rejected")
+  finally:
+    remote_executor.shutil.disk_usage = original_disk_usage
+    if target_dir.exists():
+      shutil.rmtree(target_dir)
+
+  target_dir = Path(api_server.WEB_DIR) / "generated" / "download_tests" / f"size-{uuid.uuid4().hex[:8]}"
+  try:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    stale_file = target_dir / "point_cloud.ply"
+    stale_file.write_bytes(b"old")
+    try:
+      _download_directory(ShortWriteSftp(), "/remote", target_dir)
+    except RemoteExecutionError as exc:
+      assert exc.code_hint == "WGSC-JOB-RESULTS-FILE-SIZE"
+      assert exc.details["relative_path"] == "point_cloud.ply"
+    else:
+      raise AssertionError("downloaded size mismatch should be rejected")
+    assert stale_file.read_bytes() == b"old"
+    assert not list(target_dir.glob("*.wgsc-download"))
+  finally:
+    if target_dir.exists():
+      shutil.rmtree(target_dir)
 
 
 class AliveDownloadThread:
@@ -378,6 +583,9 @@ def main() -> None:
   test_remote_download_uses_temp_file_and_reports_progress()
   test_remote_download_skips_complete_local_files()
   test_result_download_validation_allows_completed_only()
+  test_result_download_remote_identity_requires_original_server()
+  test_remote_result_marker_must_match_job_and_output()
+  test_remote_download_checks_disk_space_and_downloaded_size()
   test_result_download_repeated_request_returns_already_running()
   test_pending_remote_download_hides_partial_artifacts()
   print("detached remote tests passed")

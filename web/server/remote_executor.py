@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import shlex
 import stat
 import threading
@@ -12,10 +13,11 @@ from typing import Any, Callable, Dict
 
 
 class RemoteExecutionError(RuntimeError):
-  def __init__(self, message: str, *, code_hint: str = "", stage: str = ""):
+  def __init__(self, message: str, *, code_hint: str = "", stage: str = "", details: Dict[str, Any] | None = None):
     super().__init__(message)
     self.code_hint = code_hint
     self.stage = stage
+    self.details = details or {}
 
 
 def _load_paramiko():
@@ -647,18 +649,23 @@ def _upload_directory(sftp, local_dir: Path, remote_dir: str) -> Dict[str, Any]:
   }
 
 
-def _collect_remote_download_files(sftp, remote_dir: str, local_dir: Path) -> list[Dict[str, Any]]:
+def _collect_remote_download_files(sftp, remote_dir: str, local_dir: Path) -> tuple[list[Dict[str, Any]], int]:
   remote_root = PurePosixPath(remote_dir)
   local_root = Path(local_dir)
   files: list[Dict[str, Any]] = []
+  skipped_special_files = 0
 
   def walk(remote_path: PurePosixPath, relative_parts: tuple[str, ...]) -> None:
+    nonlocal skipped_special_files
     entries = sftp.listdir_attr(str(remote_path))
     for entry in entries:
       remote_item = remote_path / entry.filename
       child_parts = (*relative_parts, entry.filename)
       if stat.S_ISDIR(entry.st_mode):
         walk(remote_item, child_parts)
+        continue
+      if not stat.S_ISREG(entry.st_mode):
+        skipped_special_files += 1
         continue
       size = int(getattr(entry, "st_size", 0) or 0)
       files.append({
@@ -669,12 +676,12 @@ def _collect_remote_download_files(sftp, remote_dir: str, local_dir: Path) -> li
       })
 
   walk(remote_root, ())
-  return files
+  return files, skipped_special_files
 
 
 def _build_remote_download_plan(sftp, remote_dir: str, local_dir: Path) -> Dict[str, Any]:
   local_root = Path(local_dir).expanduser().resolve()
-  remote_files = _collect_remote_download_files(sftp, remote_dir, local_root)
+  remote_files, skipped_special_files = _collect_remote_download_files(sftp, remote_dir, local_root)
   files_to_download: list[Dict[str, Any]] = []
   skipped_files = 0
   skipped_bytes = 0
@@ -724,6 +731,7 @@ def _build_remote_download_plan(sftp, remote_dir: str, local_dir: Path) -> Dict[
     "mismatched_files": mismatched_files,
     "skipped_files": skipped_files,
     "skipped_bytes": skipped_bytes,
+    "skipped_special_files": skipped_special_files,
     "sample_files": [item["relative_path"] for item in files_to_download[:20]],
   }
 
@@ -744,7 +752,93 @@ def _public_download_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
     "mismatched_files": int(plan.get("mismatched_files", 0) or 0),
     "skipped_files": int(plan.get("skipped_files", 0) or 0),
     "skipped_bytes": int(plan.get("skipped_bytes", 0) or 0),
+    "skipped_special_files": int(plan.get("skipped_special_files", 0) or 0),
     "sample_files": plan.get("sample_files", []),
+  }
+
+
+def _remote_result_marker_path(remote_output_dir: str, remote_status_path: str = "") -> str:
+  raw_status_path = str(remote_status_path or "").strip()
+  if raw_status_path:
+    return str(PurePosixPath(raw_status_path))
+  return str(PurePosixPath(remote_output_dir) / ".wgsc_job" / "status.json")
+
+
+def _read_remote_json_file(sftp, remote_path: str) -> Dict[str, Any]:
+  try:
+    with sftp.open(remote_path, "r") as handle:
+      raw = handle.read()
+  except Exception as exc:
+    raise RemoteExecutionError(
+      f"Remote result marker not found: {remote_path}",
+      code_hint="WGSC-JOB-RESULTS-MARKER-MISSING",
+      stage="result_marker",
+      details={"remote_status_path": remote_path},
+    ) from exc
+  if isinstance(raw, bytes):
+    raw_text = raw.decode("utf-8", errors="replace")
+  else:
+    raw_text = str(raw)
+  try:
+    payload = json.loads(raw_text or "{}")
+  except Exception as exc:
+    raise RemoteExecutionError(
+      f"Remote result marker is invalid JSON: {remote_path}",
+      code_hint="WGSC-JOB-RESULTS-MARKER-INVALID",
+      stage="result_marker",
+      details={"remote_status_path": remote_path},
+    ) from exc
+  if not isinstance(payload, dict):
+    raise RemoteExecutionError(
+      f"Remote result marker is not an object: {remote_path}",
+      code_hint="WGSC-JOB-RESULTS-MARKER-INVALID",
+      stage="result_marker",
+      details={"remote_status_path": remote_path},
+    )
+  return payload
+
+
+def _verify_remote_result_marker(
+  sftp,
+  *,
+  remote_output_dir: str,
+  remote_status_path: str = "",
+  expected_job_id: str = "",
+  expected_remote_output_dir: str = "",
+) -> Dict[str, Any]:
+  marker_path = _remote_result_marker_path(remote_output_dir, remote_status_path)
+  payload = _read_remote_json_file(sftp, marker_path)
+  marker_job_id = str(payload.get("job_id", "")).strip()
+  expected_job_id = str(expected_job_id or "").strip()
+  if expected_job_id and marker_job_id != expected_job_id:
+    raise RemoteExecutionError(
+      "Remote result marker belongs to a different job.",
+      code_hint="WGSC-JOB-RESULTS-MARKER-MISMATCH",
+      stage="result_marker",
+      details={
+        "remote_status_path": marker_path,
+        "expected_job_id": expected_job_id,
+        "actual_job_id": marker_job_id,
+      },
+    )
+  marker_output_dir = str(PurePosixPath(str(payload.get("remote_output_dir", "") or "")))
+  expected_output_dir = str(PurePosixPath(str(expected_remote_output_dir or remote_output_dir)))
+  if marker_output_dir != expected_output_dir:
+    raise RemoteExecutionError(
+      "Remote result marker points to a different output directory.",
+      code_hint="WGSC-JOB-RESULTS-MARKER-MISMATCH",
+      stage="result_marker",
+      details={
+        "remote_status_path": marker_path,
+        "expected_remote_output_dir": expected_output_dir,
+        "actual_remote_output_dir": marker_output_dir,
+      },
+    )
+  return {
+    "verified": True,
+    "remote_status_path": marker_path,
+    "job_id": marker_job_id,
+    "remote_output_dir": marker_output_dir,
   }
 
 
@@ -775,6 +869,7 @@ def _download_directory(
       "remote_total_bytes": plan["total_bytes"],
       "skipped_files": plan["skipped_files"],
       "skipped_bytes": plan["skipped_bytes"],
+      "skipped_special_files": plan["skipped_special_files"],
       "missing_files": plan["missing_files"],
       "mismatched_files": plan["mismatched_files"],
       "complete": plan["complete"],
@@ -801,6 +896,22 @@ def _download_directory(
       "pending": False,
       "phase": "complete",
     }
+
+  try:
+    available_bytes = int(shutil.disk_usage(local_root).free)
+  except OSError:
+    available_bytes = -1
+  if available_bytes >= 0 and available_bytes < total_bytes:
+    raise RemoteExecutionError(
+      "Not enough local disk space to download completed job results.",
+      code_hint="WGSC-JOB-RESULTS-DISK-SPACE",
+      stage="download",
+      details={
+        "local_output_dir": str(local_root),
+        "required_bytes": total_bytes,
+        "available_bytes": available_bytes,
+      },
+    )
 
   emit_progress({"current_file": ""})
 
@@ -833,6 +944,26 @@ def _download_directory(
 
     try:
       sftp.get(remote_item, str(temp_item), callback=on_file_progress)
+      try:
+        temp_size = temp_item.stat().st_size
+      except OSError as exc:
+        raise RemoteExecutionError(
+          f"Downloaded file is not readable: {file_item['relative_path']}",
+          code_hint="WGSC-JOB-RESULTS-FILE-SIZE",
+          stage="download",
+          details={"relative_path": file_item["relative_path"]},
+        ) from exc
+      if temp_size != remote_size:
+        raise RemoteExecutionError(
+          f"Downloaded file size mismatch: {file_item['relative_path']}",
+          code_hint="WGSC-JOB-RESULTS-FILE-SIZE",
+          stage="download",
+          details={
+            "relative_path": file_item["relative_path"],
+            "expected_bytes": remote_size,
+            "actual_bytes": temp_size,
+          },
+        )
       temp_item.replace(local_item)
     except Exception:
       try:
@@ -869,6 +1000,9 @@ def check_remote_output_download(
   remote_config: Dict[str, Any],
   remote_output_dir: str,
   local_output_dir: str,
+  remote_status_path: str = "",
+  expected_job_id: str = "",
+  expected_remote_output_dir: str = "",
 ) -> Dict[str, Any]:
   validated = validate_remote_config(remote_config)
   paramiko = _load_paramiko()
@@ -886,8 +1020,15 @@ def check_remote_output_download(
       allow_agent=False,
     )
     sftp = client.open_sftp()
+    marker = _verify_remote_result_marker(
+      sftp,
+      remote_output_dir=remote_output_dir,
+      remote_status_path=remote_status_path,
+      expected_job_id=expected_job_id,
+      expected_remote_output_dir=expected_remote_output_dir,
+    )
     plan = _build_remote_download_plan(sftp, remote_output_dir, Path(local_output_dir))
-    return _public_download_plan(plan)
+    return {**_public_download_plan(plan), "remote_marker": marker}
   finally:
     try:
       if sftp is not None:
@@ -905,6 +1046,9 @@ def download_remote_output_directory(
   remote_config: Dict[str, Any],
   remote_output_dir: str,
   local_output_dir: str,
+  remote_status_path: str = "",
+  expected_job_id: str = "",
+  expected_remote_output_dir: str = "",
   progress_callback: Callable[[Dict[str, Any]], None] | None = None,
 ) -> Dict[str, Any]:
   validated = validate_remote_config(remote_config)
@@ -923,12 +1067,20 @@ def download_remote_output_directory(
       allow_agent=False,
     )
     sftp = client.open_sftp()
-    return _download_directory(
+    marker = _verify_remote_result_marker(
+      sftp,
+      remote_output_dir=remote_output_dir,
+      remote_status_path=remote_status_path,
+      expected_job_id=expected_job_id,
+      expected_remote_output_dir=expected_remote_output_dir,
+    )
+    result = _download_directory(
       sftp,
       remote_output_dir,
       Path(local_output_dir),
       progress_callback=progress_callback,
     )
+    return {**result, "remote_marker": marker}
   finally:
     try:
       if sftp is not None:

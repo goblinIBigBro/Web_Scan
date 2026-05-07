@@ -73,6 +73,7 @@ ARTIFACT_RESULT_FIELDS = (
   "render_images",
   "render_image_count",
 )
+REMOTE_RESULT_IDENTITY_FIELDS = ("host", "port", "username", "output_root")
 
 MANUAL_ZH_URL = "/web/WEB_TRAINING_MANUAL_ZH.md"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"}
@@ -2682,6 +2683,70 @@ def completed_remote_result_paths(job: Dict[str, Any]) -> tuple[str, str]:
   return remote_output_dir, local_output_dir
 
 
+def normalize_remote_identity(config: Dict[str, Any]) -> Dict[str, Any]:
+  if not isinstance(config, dict):
+    return {}
+  raw_output_root = str(config.get("output_root", "") or "").strip().replace("\\", "/")
+  output_root = str(PurePosixPath(raw_output_root)) if raw_output_root else ""
+  try:
+    port_value = int(config.get("port", 22))
+  except Exception:
+    port_value = 0
+  return {
+    "host": str(config.get("host", "") or "").strip(),
+    "port": port_value,
+    "username": str(config.get("username", "") or "").strip(),
+    "output_root": output_root,
+  }
+
+
+def remote_identity_missing_fields(identity: Dict[str, Any]) -> list[str]:
+  missing: list[str] = []
+  for field in REMOTE_RESULT_IDENTITY_FIELDS:
+    value = identity.get(field)
+    if field == "port":
+      if not isinstance(value, int) or value <= 0:
+        missing.append(field)
+    elif not str(value or "").strip():
+      missing.append(field)
+  return missing
+
+
+def assert_result_download_remote_identity(job: Dict[str, Any], remote_config: Dict[str, Any]) -> None:
+  expected = normalize_remote_identity(job.get("remote") if isinstance(job.get("remote"), dict) else {})
+  current = normalize_remote_identity(remote_config)
+  missing_fields = remote_identity_missing_fields(expected)
+  if missing_fields:
+    raise RemoteExecutionError(
+      "Cannot verify this job's original remote server. Refusing to download results.",
+      code_hint="WGSC-JOB-RESULTS-REMOTE-MISSING",
+      stage="config",
+      details={
+        "job_id": job.get("id", ""),
+        "expected": expected,
+        "current": current,
+        "missing_fields": missing_fields,
+      },
+    )
+
+  mismatch_fields = [
+    field for field in REMOTE_RESULT_IDENTITY_FIELDS
+    if expected.get(field) != current.get(field)
+  ]
+  if mismatch_fields:
+    raise RemoteExecutionError(
+      "Remote config does not match this job's server.",
+      code_hint="WGSC-JOB-RESULTS-REMOTE-MISMATCH",
+      stage="config",
+      details={
+        "job_id": job.get("id", ""),
+        "expected": expected,
+        "current": current,
+        "mismatch_fields": mismatch_fields,
+      },
+    )
+
+
 def result_download_remote_config(job: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
   remote_config = payload.get("remote") if isinstance(payload.get("remote"), dict) else job.get("_remote_config")
   if not isinstance(remote_config, dict) or not str(remote_config.get("password", "")).strip():
@@ -2690,8 +2755,9 @@ def result_download_remote_config(job: Dict[str, Any], payload: Dict[str, Any]) 
       code_hint="WGSC-JOB-RESULTS-REMOTE-CONFIG",
       stage="config",
     )
-  validate_remote_config(remote_config)
-  return remote_config
+  validated = validate_remote_config(remote_config)
+  assert_result_download_remote_identity(job, validated)
+  return validated
 
 
 def validate_completed_result_download_job(job: Dict[str, Any]) -> tuple[str, str]:
@@ -2706,6 +2772,13 @@ def validate_completed_result_download_job(job: Dict[str, Any]) -> tuple[str, st
   if not local_output_dir:
     raise ValueError("Completed remote job has no local output_dir to download into.")
   return remote_output_dir, local_output_dir
+
+
+def completed_remote_status_path(job: Dict[str, Any], remote_output_dir: str) -> str:
+  remote_status_path = str(job.get("remote_status_path") or "").strip()
+  if remote_status_path:
+    return remote_status_path
+  return str(PurePosixPath(remote_output_dir) / ".wgsc_job" / "status.json")
 
 
 def set_remote_download_progress(job: Dict[str, Any], progress: Dict[str, Any]) -> None:
@@ -2739,10 +2812,14 @@ def apply_completed_result_check(job: Dict[str, Any], check: Dict[str, Any]) -> 
 
 def check_completed_result_download(job: Dict[str, Any], remote_config: Dict[str, Any]) -> Dict[str, Any]:
   remote_output_dir, local_output_dir = validate_completed_result_download_job(job)
+  assert_result_download_remote_identity(job, remote_config)
   check = check_remote_output_download(
     remote_config=remote_config,
     remote_output_dir=remote_output_dir,
     local_output_dir=local_output_dir,
+    remote_status_path=completed_remote_status_path(job, remote_output_dir),
+    expected_job_id=str(job.get("id", "")),
+    expected_remote_output_dir=remote_output_dir,
   )
   apply_completed_result_check(job, check)
   persist_job_state(job)
@@ -2754,6 +2831,7 @@ def start_completed_result_download(job: Dict[str, Any], remote_config: Dict[str
     if is_remote_download_active(job) or is_remote_download_starting(job):
       return {"ok": True, "started": False, "already_running": True, "job": enrich_job(job)}
     remote_output_dir, local_output_dir = validate_completed_result_download_job(job)
+    assert_result_download_remote_identity(job, remote_config)
     job["_result_download_starting"] = True
 
   try:
@@ -2761,6 +2839,9 @@ def start_completed_result_download(job: Dict[str, Any], remote_config: Dict[str
       remote_config=remote_config,
       remote_output_dir=remote_output_dir,
       local_output_dir=local_output_dir,
+      remote_status_path=completed_remote_status_path(job, remote_output_dir),
+      expected_job_id=str(job.get("id", "")),
+      expected_remote_output_dir=remote_output_dir,
     )
   except Exception:
     with RESULT_DOWNLOAD_LOCK:
@@ -2794,6 +2875,9 @@ def start_completed_result_download(job: Dict[str, Any], remote_config: Dict[str
         remote_config=remote_config,
         remote_output_dir=remote_output_dir,
         local_output_dir=local_output_dir,
+        remote_status_path=completed_remote_status_path(job, remote_output_dir),
+        expected_job_id=str(job.get("id", "")),
+        expected_remote_output_dir=remote_output_dir,
         progress_callback=record_download_progress,
       )
       set_remote_download_progress(job, {
@@ -3619,7 +3703,11 @@ class ApiHandler(SimpleHTTPRequestHandler):
           step="job",
           message=str(exc),
           status=400,
-          details={"job_id": job_id, "stage": exc.stage},
+          details={
+            "job_id": job_id,
+            "stage": exc.stage,
+            **(exc.details if isinstance(getattr(exc, "details", None), dict) else {}),
+          },
         )
         return
       except Exception as exc:

@@ -331,6 +331,77 @@ function canDownloadCompletedResult(job = {}) {
   return String(job.status || "").toLowerCase() === "completed" && Boolean(job.remote_detached);
 }
 
+function normalizeRemotePath(value = "") {
+  const raw = String(value || "").trim().replaceAll("\\", "/");
+  if (!raw) return "";
+  const normalized = raw.replace(/\/+/g, "/").replace(/\/+$/, "");
+  return normalized || "/";
+}
+
+function remoteIdentity(config = {}) {
+  const port = Number(config.port || 22);
+  return {
+    host: String(config.host || "").trim(),
+    port: Number.isFinite(port) ? port : 0,
+    username: String(config.username || "").trim(),
+    output_root: normalizeRemotePath(config.output_root || ""),
+  };
+}
+
+function remoteIdentityMissingFields(identity = {}) {
+  return ["host", "port", "username", "output_root"].filter((field) => {
+    if (field === "port") return !Number(identity.port || 0);
+    return !String(identity[field] || "").trim();
+  });
+}
+
+function formatRemoteIdentity(identity = {}) {
+  return `${identity.username || "-"}@${identity.host || "-"}:${identity.port || "-"} · ${identity.output_root || "-"}`;
+}
+
+function resultDownloadServerMatch(job = {}) {
+  const expected = remoteIdentity(job.remote || {});
+  const current = remoteIdentity(state.remoteConfig || {});
+  const missingExpected = remoteIdentityMissingFields(expected);
+  if (missingExpected.length) {
+    return {
+      ok: false,
+      message: "Cannot verify this job's original remote server.",
+      expected,
+      current,
+      fields: missingExpected,
+    };
+  }
+  const mismatchFields = ["host", "port", "username", "output_root"].filter((field) => expected[field] !== current[field]);
+  if (mismatchFields.length) {
+    return {
+      ok: false,
+      message: "Remote config does not match this job's server.",
+      expected,
+      current,
+      fields: mismatchFields,
+    };
+  }
+  return { ok: true, expected, current, fields: [] };
+}
+
+function renderRemoteServerMatchWarning(job = {}, options = {}) {
+  if (!canDownloadCompletedResult(job)) return "";
+  const match = resultDownloadServerMatch(job);
+  const ready = remoteConfigReadyForReattach();
+  if (match.ok && ready) return "";
+  const message = match.ok ? "Remote credentials are incomplete." : match.message;
+  const fields = match.fields?.length ? ` · ${match.fields.join(", ")}` : "";
+  const details = options.details === false ? "" : `
+    <p class="panel-copy">Expected: ${escapeHtml(formatRemoteIdentity(match.expected))}</p>
+    <p class="panel-copy">Current: ${escapeHtml(formatRemoteIdentity(match.current))}</p>
+  `;
+  return `
+    <div class="status-dot bad">${escapeHtml(message)}${escapeHtml(fields)}</div>
+    ${details}
+  `;
+}
+
 function formatDownloadProgress(info = {}) {
   const bytes = Number(info.bytes || 0);
   const totalBytes = Number(info.total_bytes || 0);
@@ -395,8 +466,16 @@ function renderRemoteDownloadStatus(job = {}, options = {}) {
 function renderResultDownloadButton(job = {}, compact = false) {
   if (!canDownloadCompletedResult(job)) return "";
   const pending = isRemoteDownloadPending(job);
+  const match = resultDownloadServerMatch(job);
+  const ready = remoteConfigReadyForReattach();
   const label = pending ? "Downloading" : "Check Result";
-  return `<button class="${compact ? "compact-button" : ""}" data-action="check-result-download" data-job-id="${escapeHtml(job.id || "")}" type="button" ${pending ? "disabled" : ""}>${label}</button>`;
+  const disabled = pending || !match.ok || !ready;
+  const title = !match.ok
+    ? `${match.message} Expected ${formatRemoteIdentity(match.expected)}; current ${formatRemoteIdentity(match.current)}.`
+    : !ready
+      ? "Remote credentials are incomplete."
+      : "";
+  return `<button class="${compact ? "compact-button" : ""}" data-action="check-result-download" data-job-id="${escapeHtml(job.id || "")}" type="button" ${disabled ? "disabled" : ""} title="${escapeHtml(title)}">${label}</button>`;
 }
 
 function statusClass(status) {
@@ -1416,6 +1495,7 @@ function renderJobsTable(items) {
                 ${job.safe_to_close_web && !isTerminal(job.status) ? `<span class="badge ok">Safe to close page</span>` : ""}
                 <p class="panel-copy">${escapeHtml(job.remote_stage || job.operation || "-")}</p>
                 ${renderRemoteDownloadStatus(job)}
+                ${renderRemoteServerMatchWarning(job, { details: false })}
                 ${job.monitor_state === "needs_remote_config" ? `<p class="panel-copy">Waiting for remote reattach.</p>` : ""}
               </td>
               <td>FPS ${escapeHtml(job.metrics?.fps || "-")}<br />PSNR ${escapeHtml(job.metrics?.psnr || "-")}<br />Loss ${escapeHtml(job.metrics?.loss || "-")}</td>
@@ -1660,6 +1740,7 @@ function renderResultPage() {
         </div>
       </div>
       <div class="card grid">
+        ${job ? renderRemoteServerMatchWarning(job) : ""}
         ${job ? renderRemoteDownloadStatus(job, { paths: true }) : ""}
         ${job ? renderResultSurface(surfaceAsset, {
           tall: true,
@@ -2492,6 +2573,10 @@ async function checkAndDownloadResult(jobId) {
   const job = getJob(id);
   if (!job) throw new Error("Select a completed remote job first.");
   if (!canDownloadCompletedResult(job)) throw new Error("Only completed jobs can download results.");
+  const match = resultDownloadServerMatch(job);
+  if (!match.ok) {
+    throw new Error(`${match.message} Expected ${formatRemoteIdentity(match.expected)}; current ${formatRemoteIdentity(match.current)}.`);
+  }
   if (!remoteConfigReadyForReattach()) {
     throw new Error("Remote credentials are required. Fill the Remote Config fields before downloading results.");
   }

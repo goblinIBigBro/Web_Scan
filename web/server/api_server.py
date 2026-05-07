@@ -934,6 +934,21 @@ ALGORITHM_CUDA_CHECK_SPECS: Dict[str, Dict[str, Any]] = {
       ("cv2", "opencv-python"),
     ],
   },
+  "megs2": {
+    "label": "MEGS2",
+    "root": ROOT_DIR / "MEGS-2-main",
+    "env_name": "MEGS2",
+    "required_modules": [
+      ("torchvision", "torchvision"),
+      ("diff_gaussian_rasterization", "diff_gaussian_rasterization"),
+      ("diff_gaussian_rasterization_ms", "diff_gaussian_rasterization_ms"),
+      ("diff_gaussian_rasterization_ms_light", "diff_gaussian_rasterization_ms_light"),
+      ("simple_knn", "simple_knn"),
+      ("plyfile", "plyfile"),
+      ("PIL", "pillow"),
+      ("tqdm", "tqdm"),
+    ],
+  },
   "reduced-3dgs": {
     "label": "Reduced-3DGS",
     "root": ROOT_DIR / "reduced-3dgs-main",

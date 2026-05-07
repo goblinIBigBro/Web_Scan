@@ -1,8 +1,8 @@
 # 远程 SSH 环境配置指南 — 旧版算法组
 
-> **适用项目**：CompGS、MEGS-2、Scaffold-GS  
+> **适用项目**：CompGS、Scaffold-GS  
 > **环境**：Python 3.7.13 + PyTorch 1.12.1 + CUDA 11.6  
-> **说明**：ContextGS 和 reduced-3dgs 已升级到 Python 3.10 + PyTorch 2.2 + CUDA 12.1，请使用 [REMOTE_SETUP_GUIDE_NEW.md](REMOTE_SETUP_GUIDE_NEW.md)。
+> **说明**：ContextGS、reduced-3dgs 和 MEGS-2 已升级到 Python 3.10 + PyTorch 2.2 + CUDA 12.1，请使用 [REMOTE_SETUP_GUIDE_NEW.md](REMOTE_SETUP_GUIDE_NEW.md)。
 > **更新日期**：2026 年 4 月  
 > **作者**：Web_Scan 文档
 
@@ -48,11 +48,6 @@ conda install pytorch=1.12.1 torchvision=0.13.1 torchaudio=0.12.1 pytorch-cuda=1
 # 安装其他依赖
 pip install -r requirements.txt
 
-# MEGS-2
-cd ~/Web_Scan/MEGS-2-main
-conda env create --file environment.yml
-conda activate MEGS2
-
 # Scaffold-GS
 cd ~/Web_Scan/Scaffold-GS-main
 conda env create --file environment.yml
@@ -94,8 +89,8 @@ pip install compressai pytorch_msssim torchac
 ### 第二步：准备项目代码
 
 ```bash
-# 以 MEGS-2 为例（其他算法类似）
-cd ~/Web_Scan/MEGS-2-main
+# 以 Scaffold-GS 为例
+cd ~/Web_Scan/Scaffold-GS-main
 
 # 初始化子模块（非常重要）
 git submodule update --init --recursive
@@ -175,9 +170,6 @@ if failed:
 ```bash
 # CompGS
 source ~/.bashrc && conda activate CompGS_env
-
-# MEGS-2
-source ~/.bashrc && conda activate MEGS2
 
 # Scaffold-GS
 source ~/.bashrc && conda activate scaffold_gs
@@ -300,7 +292,7 @@ conda activate contextgs
 bash ../web/tools/remote_verify_setup.sh contextgs
 ```
 
-### 旧版命令行算法（MEGS-2 / Scaffold-GS）
+### 旧版命令行算法（Scaffold-GS）
 
 #### 参数配置方式
 
@@ -345,31 +337,15 @@ python train.py \
 
 ---
 
-### MEGS-2（命令行参数方式）
+### MEGS-2（已迁移到新版环境）
 
-#### 参数配置方式
-
-**MEGS-2 使用命令行参数**。
-
-#### 快速启动示例
+MEGS-2 当前使用 Python 3.10 + PyTorch 2.2 + CUDA 12.1，并针对 RTX 4090 检查 CUDA capability 8.9。请参考 [REMOTE_SETUP_GUIDE_NEW.md](REMOTE_SETUP_GUIDE_NEW.md)，并使用：
 
 ```bash
-# 查看所有参数
-python train.py -h
-
-# 基础训练
-python train.py \
-  -s /workspace/data/scene \
-  -m /output/megs2_result \
-  --eval
-
-# 完整训练
-python train.py \
-  -s /workspace/data/scene \
-  -m /output/megs2_full \
-  --iterations 30000 \
-  --eval \
-  --test_iterations 7000
+cd ~/Web_Scan/MEGS-2-main
+conda env create --file environment.yml
+conda activate MEGS2
+bash ../web/tools/remote_verify_setup.sh megs2
 ```
 
 ---
@@ -653,8 +629,8 @@ colmap -h
 - [ ] Python 版本 3.7.13：`python3 --version`
 
 ### ✅ 环境检查
-- [ ] Conda 环境已创建：`conda env list` 显示 MEGS2、scaffold_gs 等
-- [ ] 环境激活命令可用：`source ~/.bashrc && conda activate MEGS2`
+- [ ] Conda 环境已创建：`conda env list` 显示 scaffold_gs、CompGS_env 等
+- [ ] 环境激活命令可用：`source ~/.bashrc && conda activate scaffold_gs`
 
 ### ✅ 项目检查
 - [ ] 项目代码已克隆到远程主机
@@ -672,7 +648,7 @@ colmap -h
 |------|-------------|---------|---------|---------|------|
 | CompGS | CompGS_env | `conda activate CompGS_env` | Train.py | YAML 配置 | ✓ |
 | ContextGS | contextgs | `conda activate contextgs` | train.py | 命令行参数 | 已迁移到新版 |
-| MEGS-2 | MEGS2 | `conda activate MEGS2` | train.py | 命令行参数 | ✓ |
+| MEGS-2 | MEGS2 | `conda activate MEGS2` | train.py | 命令行参数 | 已迁移到新版 |
 | reduced-3dgs | gaussian_splatting | `conda activate gaussian_splatting` | train.py | 命令行参数 | 已迁移到新版 |
 | Scaffold-GS | scaffold_gs | `conda activate scaffold_gs` | train.py | 命令行参数 | ✓ |
 

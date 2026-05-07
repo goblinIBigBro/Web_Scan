@@ -13,8 +13,8 @@ This folder provides a standalone web platform that serves as a unified visualiz
 #### 🚀 Setup and Configuration
 - **Remote SSH Environment Setup** (Recommended for remote training)
   - Quick Navigator: [`project_md/REMOTE_SETUP_INDEX.md`](project_md/REMOTE_SETUP_INDEX.md)
-  - New Algorithms (HAC-plus, FCGS, ContextGS, reduced-3dgs): [`project_md/REMOTE_SETUP_GUIDE_NEW.md`](project_md/REMOTE_SETUP_GUIDE_NEW.md)
-  - Legacy Algorithms (CompGS, MEGS-2, Scaffold-GS): [`project_md/REMOTE_SETUP_GUIDE_OLD.md`](project_md/REMOTE_SETUP_GUIDE_OLD.md)
+  - New Algorithms (HAC-plus, FCGS, ContextGS, reduced-3dgs, MEGS-2): [`project_md/REMOTE_SETUP_GUIDE_NEW.md`](project_md/REMOTE_SETUP_GUIDE_NEW.md)
+  - Legacy Algorithms (CompGS, Scaffold-GS): [`project_md/REMOTE_SETUP_GUIDE_OLD.md`](project_md/REMOTE_SETUP_GUIDE_OLD.md)
   - Verification Script: [`tools/remote_verify_setup.sh`](tools/remote_verify_setup.sh)
 
 #### 🎯 Web Application Training

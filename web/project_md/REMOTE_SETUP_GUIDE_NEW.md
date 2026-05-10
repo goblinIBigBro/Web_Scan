@@ -1,6 +1,6 @@
 # 远程 SSH 环境配置指南 — 新版算法组
 
-> **适用项目**：Gaussian Splatting Lightning、HAC-plus、FCGS、ContextGS、reduced-3dgs、MEGS-2  
+> **适用项目**：Gaussian Splatting Lightning、HAC-plus、FCGS、ContextGS、CompGS、reduced-3dgs、MEGS-2  
 > **环境**：Python 3.10 + PyTorch 2.2.* + CUDA 11.8/12.1  
 > **更新日期**：2026 年 4 月  
 > **作者**：Web_Scan 文档
@@ -55,6 +55,11 @@ cd ~/Web_Scan/ContextGS-main
 conda env create --file environment.yml
 conda activate contextgs
 
+# 或者 CompGS（RTX 4090 推荐 CUDA 12.1，仍使用 YAML 配置）
+cd ~/Web_Scan/CompGS-main
+conda env create --file environment.yml
+conda activate CompGS_env
+
 # 或者 reduced-3dgs（RTX 4090 推荐 CUDA 12.1）
 cd ~/Web_Scan/reduced-3dgs-main
 conda env create --file environment.yml
@@ -105,7 +110,7 @@ pip install torch-scatter -f https://data.pyg.org/whl/torch-2.2.0+cu121.html
 
 ```bash
 # 进入项目目录
-cd ~/Web_Scan/HAC-plus-main  # 或 FCGS-main / ContextGS-main / reduced-3dgs-main / MEGS-2-main / gaussian-splatting-lightning-main
+cd ~/Web_Scan/HAC-plus-main  # 或 FCGS-main / ContextGS-main / CompGS-main / reduced-3dgs-main / MEGS-2-main / gaussian-splatting-lightning-main
 
 # 初始化子模块（非常重要）
 git submodule update --init --recursive
@@ -146,6 +151,9 @@ python FCGS-main/diagnose.py
 
 # 或 ContextGS
 bash ../web/tools/remote_verify_setup.sh contextgs
+
+# 或 CompGS
+bash ../web/tools/remote_verify_setup.sh compgs
 
 # 或 reduced-3dgs
 bash ../web/tools/remote_verify_setup.sh reduced-3dgs
@@ -634,8 +642,8 @@ pip install git+https://github.com/richzhang/PerceptualSimilarity.git
 - [ ] Python 版本 3.10：`python3 --version`
 
 ### ✅ 环境检查
-- [ ] Conda 环境已创建：`conda env list | grep -E "HAC_env|FCGS_env|contextgs|gaussian_splatting|MEGS2|gspl"`
-- [ ] 环境激活命令可用：`source ~/.bashrc && conda activate HAC_env`、`source ~/.bashrc && conda activate contextgs`、`source ~/.bashrc && conda activate gaussian_splatting`、`source ~/.bashrc && conda activate MEGS2` 或 `source ~/.bashrc && conda activate gspl`
+- [ ] Conda 环境已创建：`conda env list | grep -E "HAC_env|FCGS_env|contextgs|CompGS_env|gaussian_splatting|MEGS2|gspl"`
+- [ ] 环境激活命令可用：`source ~/.bashrc && conda activate HAC_env`、`source ~/.bashrc && conda activate contextgs`、`source ~/.bashrc && conda activate CompGS_env`、`source ~/.bashrc && conda activate gaussian_splatting`、`source ~/.bashrc && conda activate MEGS2` 或 `source ~/.bashrc && conda activate gspl`
 
 ### ✅ 项目检查
 - [ ] 项目代码已克隆/复制到远程主机
@@ -650,7 +658,7 @@ pip install git+https://github.com/richzhang/PerceptualSimilarity.git
 ## 📞 联系与支持
 
 - **文档位置**：[web/project_md/REMOTE_SETUP_GUIDE_NEW.md](../REMOTE_SETUP_GUIDE_NEW.md)
-- **诊断工具**：`python diagnose.py` (HAC-plus / FCGS)、`bash web/tools/remote_verify_setup.sh contextgs` (ContextGS)、`bash web/tools/remote_verify_setup.sh reduced-3dgs` (reduced-3dgs)、`bash web/tools/remote_verify_setup.sh megs2` (MEGS-2) 或 `bash web/tools/remote_verify_setup.sh gaussian-splatting-lightning` (GSL)
+- **诊断工具**：`python diagnose.py` (HAC-plus / FCGS)、`bash web/tools/remote_verify_setup.sh contextgs` (ContextGS)、`bash web/tools/remote_verify_setup.sh compgs` (CompGS)、`bash web/tools/remote_verify_setup.sh reduced-3dgs` (reduced-3dgs)、`bash web/tools/remote_verify_setup.sh megs2` (MEGS-2) 或 `bash web/tools/remote_verify_setup.sh gaussian-splatting-lightning` (GSL)
 - **问题报告**：记录 `diagnose.py` 的输出，提交至项目 Issue
 
 ---

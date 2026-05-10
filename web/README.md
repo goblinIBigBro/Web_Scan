@@ -13,8 +13,8 @@ This folder provides a standalone web platform that serves as a unified visualiz
 #### 🚀 Setup and Configuration
 - **Remote SSH Environment Setup** (Recommended for remote training)
   - Quick Navigator: [`project_md/REMOTE_SETUP_INDEX.md`](project_md/REMOTE_SETUP_INDEX.md)
-  - New Algorithms (Gaussian Splatting Lightning, HAC-plus, FCGS, ContextGS, reduced-3dgs, MEGS-2): [`project_md/REMOTE_SETUP_GUIDE_NEW.md`](project_md/REMOTE_SETUP_GUIDE_NEW.md)
-  - Legacy Algorithms (CompGS, Scaffold-GS): [`project_md/REMOTE_SETUP_GUIDE_OLD.md`](project_md/REMOTE_SETUP_GUIDE_OLD.md)
+  - New Algorithms (Gaussian Splatting Lightning, HAC-plus, FCGS, ContextGS, CompGS, reduced-3dgs, MEGS-2): [`project_md/REMOTE_SETUP_GUIDE_NEW.md`](project_md/REMOTE_SETUP_GUIDE_NEW.md)
+  - Legacy Algorithms (Scaffold-GS): [`project_md/REMOTE_SETUP_GUIDE_OLD.md`](project_md/REMOTE_SETUP_GUIDE_OLD.md)
   - Verification Script: [`tools/remote_verify_setup.sh`](tools/remote_verify_setup.sh)
 
 #### 🎯 Web Application Training
@@ -74,8 +74,8 @@ python -m pip install paramiko
 **Important**: Before using remote training features, configure your remote server environment:
 
 1. **Choose your algorithm family**:
-   - HAC-plus or FCGS? → See [`project_md/REMOTE_SETUP_GUIDE_NEW.md`](project_md/REMOTE_SETUP_GUIDE_NEW.md)
-   - Other algorithms? → See [`project_md/REMOTE_SETUP_GUIDE_OLD.md`](project_md/REMOTE_SETUP_GUIDE_OLD.md)
+   - HAC-plus, FCGS, ContextGS, CompGS, reduced-3dgs, MEGS-2, or Gaussian Splatting Lightning? → See [`project_md/REMOTE_SETUP_GUIDE_NEW.md`](project_md/REMOTE_SETUP_GUIDE_NEW.md)
+   - Legacy Scaffold-GS? → See [`project_md/REMOTE_SETUP_GUIDE_OLD.md`](project_md/REMOTE_SETUP_GUIDE_OLD.md)
 
 2. **Verify environment setup**:
    ```bash

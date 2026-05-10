@@ -8,7 +8,7 @@
 
 ## 🎯 快速选择：我应该读哪份文档？
 
-### 情景 1: 使用 Gaussian Splatting Lightning、HAC-plus、FCGS、ContextGS、reduced-3dgs 或 MEGS-2
+### 情景 1: 使用 Gaussian Splatting Lightning、HAC-plus、FCGS、ContextGS、CompGS、reduced-3dgs 或 MEGS-2
 
 👉 **阅读**：[REMOTE_SETUP_GUIDE_NEW.md](REMOTE_SETUP_GUIDE_NEW.md)
 
@@ -34,26 +34,27 @@ python train.py -s /data/scene -m /output/result --iterations 30000 --eval
 # reduced-3dgs 训练示例
 python train.py -s /data/scene -m /output/result --iterations 30000 --eval
 
+# CompGS 训练示例（YAML 配置）
+python Train.py --config Configs/my_training.yaml
+
 # MEGS-2 训练示例
 python train.py -s /data/scene -m /output/result --iterations 30000 --eval --imp_metric indoor
 ```
 
 ---
 
-### 情景 2: 使用 CompGS 或 Scaffold-GS
+### 情景 2: 使用 Scaffold-GS
 
 👉 **阅读**：[REMOTE_SETUP_GUIDE_OLD.md](REMOTE_SETUP_GUIDE_OLD.md)
 
 **特点**：
 - Python 3.7.13 + PyTorch 1.12.1 + CUDA 11.6
-- **CompGS 特殊**：使用 YAML 配置文件（非命令行参数）
-- 其他算法使用命令行参数
+- 使用命令行参数
 
 **快速命令**：
 ```bash
-# CompGS 训练示例（YAML 配置）
-python Train.py --config Configs/my_training.yaml
-
+# Scaffold-GS 训练示例
+python train.py -s /data/scene -m /output/result --iterations 30000 --eval
 ```
 
 ---
@@ -67,7 +68,7 @@ python Train.py --config Configs/my_training.yaml
 | **FCGS** | [NEW](REMOTE_SETUP_GUIDE_NEW.md) | 新版 | 3.10 | 2.2.* | 11.8 | 命令行 |
 | **ContextGS** | [NEW](REMOTE_SETUP_GUIDE_NEW.md) | 新版 | 3.10 | 2.2.* | 12.1 | 命令行 |
 | **reduced-3dgs** | [NEW](REMOTE_SETUP_GUIDE_NEW.md) | 新版 | 3.10 | 2.2.* | 12.1 | 命令行 |
-| **CompGS** | [OLD](REMOTE_SETUP_GUIDE_OLD.md) | 旧版 | 3.7.13 | 1.12.1 | 11.6 | YAML 配置 |
+| **CompGS** | [NEW](REMOTE_SETUP_GUIDE_NEW.md) | 新版 | 3.10 | 2.2.* | 12.1 | YAML 配置 |
 | **MEGS-2** | [NEW](REMOTE_SETUP_GUIDE_NEW.md) | 新版 | 3.10 | 2.2.* | 12.1 | 命令行 |
 | **Scaffold-GS** | [OLD](REMOTE_SETUP_GUIDE_OLD.md) | 旧版 | 3.7.13 | 1.12.1 | 11.6 | 命令行 |
 
@@ -89,6 +90,7 @@ bash remote_verify_setup.sh
 # 或手动指定版本
 bash remote_verify_setup.sh new   # 新版（Python 3.10 + PyTorch 2.2）
 bash remote_verify_setup.sh contextgs   # ContextGS（Python 3.10 + PyTorch 2.2 + CUDA 12.1 + RTX 4090）
+bash remote_verify_setup.sh compgs   # CompGS（Python 3.10 + PyTorch 2.2 + CUDA 12.1 + RTX 4090）
 bash remote_verify_setup.sh reduced-3dgs   # reduced-3dgs（Python 3.10 + PyTorch 2.2 + CUDA 12.1 + RTX 4090）
 bash remote_verify_setup.sh megs2   # MEGS-2（Python 3.10 + PyTorch 2.2 + CUDA 12.1 + RTX 4090）
 bash remote_verify_setup.sh gaussian-splatting-lightning   # GSL（Python 3.10 + PyTorch 2.2 + CUDA 12.1 + RTX 4090）
@@ -108,8 +110,8 @@ bash remote_verify_setup.sh old   # 旧版（Python 3.7 + PyTorch 1.12）
 
 | 文档 | 适用范围 | 内容 |
 |------|---------|------|
-| [REMOTE_SETUP_GUIDE_NEW.md](REMOTE_SETUP_GUIDE_NEW.md) | Gaussian Splatting Lightning、HAC-plus、FCGS、ContextGS、reduced-3dgs、MEGS-2 | 环境部署、参数配置、训练启动、故障排除 |
-| [REMOTE_SETUP_GUIDE_OLD.md](REMOTE_SETUP_GUIDE_OLD.md) | CompGS、Scaffold-GS | 环境部署、参数配置、训练启动、故障排除 |
+| [REMOTE_SETUP_GUIDE_NEW.md](REMOTE_SETUP_GUIDE_NEW.md) | Gaussian Splatting Lightning、HAC-plus、FCGS、ContextGS、CompGS、reduced-3dgs、MEGS-2 | 环境部署、参数配置、训练启动、故障排除 |
+| [REMOTE_SETUP_GUIDE_OLD.md](REMOTE_SETUP_GUIDE_OLD.md) | Scaffold-GS | 环境部署、参数配置、训练启动、故障排除 |
 
 ### 工具和脚本
 
@@ -226,7 +228,7 @@ python encode_single_scene.py --lmd 1e-4 \
 
 ---
 
-### 旧版算法（CompGS - YAML 配置）
+### CompGS（新版环境 + YAML 配置）
 
 ```yaml
 # 编辑 Configs/my_training.yaml
@@ -282,6 +284,7 @@ python train.py -s /workspace/data/scene -m /output/result --iterations 30000 --
 
 **环境检查**：
 - [ ] ContextGS 运行 `bash remote_verify_setup.sh contextgs`
+- [ ] CompGS 运行 `bash remote_verify_setup.sh compgs`
 - [ ] reduced-3dgs 运行 `bash remote_verify_setup.sh reduced-3dgs`
 - [ ] MEGS-2 运行 `bash remote_verify_setup.sh megs2`
 - [ ] Gaussian Splatting Lightning 运行 `bash remote_verify_setup.sh gaussian-splatting-lightning`
@@ -295,7 +298,7 @@ python train.py -s /workspace/data/scene -m /output/result --iterations 30000 --
 
 ### Q: 我不确定应该使用哪份文档
 
-**A**: 查看 [算法速查表](#-算法速查表)。如果你使用 **Gaussian Splatting Lightning、HAC-plus、FCGS、ContextGS、reduced-3dgs 或 MEGS-2**，选择 **NEW** 文档。其他算法选择 **OLD** 文档。
+**A**: 查看 [算法速查表](#-算法速查表)。如果你使用 **Gaussian Splatting Lightning、HAC-plus、FCGS、ContextGS、CompGS、reduced-3dgs 或 MEGS-2**，选择 **NEW** 文档。Scaffold-GS 选择 **OLD** 文档。
 
 ---
 
@@ -311,13 +314,13 @@ conda activate HAC_env
 
 ---
 
-### Q: CompGS 和其他旧版算法有什么区别？
+### Q: CompGS 和其他算法有什么区别？
 
 **A**: 
-- **CompGS**：参数通过修改 YAML 配置文件传入
-- **其他旧版算法**（Scaffold-GS 等）：参数通过命令行传入
+- **CompGS**：已经迁移到新版 Python 3.10 / CUDA 12.1 环境，但参数仍通过修改 YAML 配置文件传入
+- **多数其他新版算法**：参数通过命令行传入
 
-详见 [REMOTE_SETUP_GUIDE_OLD.md](REMOTE_SETUP_GUIDE_OLD.md) 的"训练启动指南"部分。
+详见 [REMOTE_SETUP_GUIDE_NEW.md](REMOTE_SETUP_GUIDE_NEW.md) 的 CompGS 部分。
 
 ---
 

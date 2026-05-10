@@ -72,12 +72,22 @@ ARTIFACT_RESULT_FIELDS = (
   "result_urls",
   "render_images",
   "render_image_count",
+  "render_format",
+  "render_label",
+  "viewer_renderer",
 )
 REMOTE_RESULT_IDENTITY_FIELDS = ("host", "port", "username", "output_root")
 
 MANUAL_ZH_URL = "/web/WEB_TRAINING_MANUAL_ZH.md"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"}
 PLY_EXTENSIONS = {".ply"}
+PLY_HEADER_READ_BYTES = 256 * 1024
+PLY_RENDER_LABELS = {
+  "gaussian-sh": "Gaussian SH PLY",
+  "gaussian-sg": "Spherical Gaussian PLY",
+  "rgb-point-cloud": "RGB Point Cloud",
+  "unknown-ply": "PLY 3D Model",
+}
 RESULT_SCAN_EXCLUDED_DIRS = {
   ".git",
   "__pycache__",
@@ -957,6 +967,24 @@ ALGORITHM_CUDA_CHECK_SPECS: Dict[str, Dict[str, Any]] = {
       ("cv2", "opencv-python"),
     ],
   },
+  "compgs": {
+    "label": "CompGS",
+    "root": ROOT_DIR / "CompGS-main",
+    "env_name": "CompGS_env",
+    "required_modules": [
+      ("torchvision", "torchvision"),
+      ("diff_gaussian_rasterization", "diff_gaussian_rasterization"),
+      ("knn_dist", "knn_dist"),
+      ("torch_scatter", "torch_scatter"),
+      ("compressai", "compressai"),
+      ("lpips", "lpips"),
+      ("pytorch_msssim", "pytorch-msssim"),
+      ("plyfile", "plyfile"),
+      ("einops", "einops"),
+      ("yaml", "pyyaml"),
+      ("PIL", "pillow"),
+    ],
+  },
   "megs2": {
     "label": "MEGS2",
     "root": ROOT_DIR / "MEGS-2-main",
@@ -1314,8 +1342,17 @@ def build_capture_pipeline(
   }
 
 
-def build_viewer_url(relative_url: str, representation: str | None = None) -> str:
-  renderer = "sg" if (representation or "").lower() == "sg" else "sh"
+def viewer_renderer_for_format(render_format: str | None = None, representation: str | None = None) -> str:
+  normalized_format = str(render_format or "").strip().lower()
+  if normalized_format == "gaussian-sg":
+    return "sg"
+  if normalized_format in {"gaussian-sh", "rgb-point-cloud"}:
+    return "sh"
+  return "sg" if (representation or "").lower() == "sg" else "sh"
+
+
+def build_viewer_url(relative_url: str, representation: str | None = None, render_format: str | None = None) -> str:
+  renderer = viewer_renderer_for_format(render_format, representation)
   return f"/web/viewers/{renderer}.html?url={relative_url}"
 
 
@@ -1600,6 +1637,89 @@ def is_ply_file(path: Path) -> bool:
   return path.is_file() and path.suffix.lower() in PLY_EXTENSIONS
 
 
+def read_ply_header_text(path: Path, max_bytes: int = PLY_HEADER_READ_BYTES) -> str:
+  if not is_ply_file(path):
+    return ""
+  data = b""
+  try:
+    with path.open("rb") as handle:
+      while len(data) < max_bytes:
+        chunk = handle.read(min(8192, max_bytes - len(data)))
+        if not chunk:
+          break
+        data += chunk
+        if b"end_header" in data.lower():
+          break
+  except OSError:
+    return ""
+  marker_index = data.lower().find(b"end_header")
+  if marker_index >= 0:
+    data = data[: marker_index + len(b"end_header")]
+  try:
+    return data.decode("ascii", errors="ignore")
+  except Exception:
+    return ""
+
+
+def ply_header_property_names(path: Path) -> set[str]:
+  properties: set[str] = set()
+  for raw_line in read_ply_header_text(path).splitlines():
+    line = raw_line.strip()
+    if not line.startswith("property "):
+      continue
+    parts = line.split()
+    if len(parts) >= 3:
+      properties.add(parts[-1].lower())
+  return properties
+
+
+def classify_ply_render_format(path: Path) -> str:
+  properties = ply_header_property_names(path)
+  if not properties:
+    return "unknown-ply"
+
+  has_sg = any(
+    name == "sg_axis_count"
+    or name.startswith("sg_")
+    or name.startswith("rgb_base_")
+    for name in properties
+  )
+  if has_sg:
+    return "gaussian-sg"
+
+  has_gaussian_sh = (
+    any(name.startswith("scale_") for name in properties)
+    and any(name.startswith("rot_") for name in properties)
+    and "opacity" in properties
+    and (
+      any(name.startswith("f_dc_") for name in properties)
+      or any(name.startswith("f_rest_") for name in properties)
+    )
+  )
+  if has_gaussian_sh:
+    return "gaussian-sh"
+
+  has_xyz = {"x", "y", "z"}.issubset(properties)
+  has_rgb = {"red", "green", "blue"}.issubset(properties) or {"r", "g", "b"}.issubset(properties)
+  if has_xyz and has_rgb:
+    return "rgb-point-cloud"
+
+  return "unknown-ply"
+
+
+def render_label_for_format(render_format: str | None) -> str:
+  return PLY_RENDER_LABELS.get(str(render_format or "").strip().lower(), PLY_RENDER_LABELS["unknown-ply"])
+
+
+def representation_for_ply_format(render_format: str | None, fallback: str | None = None) -> str:
+  normalized = str(render_format or "").strip().lower()
+  if normalized == "gaussian-sg":
+    return "sg"
+  if normalized in {"gaussian-sh", "rgb-point-cloud"}:
+    return "sh"
+  return str(fallback or "sh")
+
+
 def newest_file(paths: list[Path]) -> Path | None:
   existing = [path for path in paths if path.exists() and path.is_file()]
   if not existing:
@@ -1665,23 +1785,62 @@ def direct_ply_candidates(directory: Path, names: list[str] | None = None) -> li
   return [directory / name for name in target_names]
 
 
-def find_result_ply_in_directory(directory: Path, names: list[str]) -> Path | None:
-  direct = newest_file([path for path in direct_ply_candidates(directory, names) if is_ply_file(path)])
-  if direct:
-    return direct
+def result_ply_candidate_score(path: Path) -> int:
+  render_format = classify_ply_render_format(path)
+  score = 0
+  if render_format in {"gaussian-sh", "gaussian-sg"}:
+    score += 1000
+  elif render_format == "rgb-point-cloud":
+    score += 100
+  else:
+    score += 200
+
+  lower_parts = [part.lower() for part in path.parts]
+  lower_name = path.name.lower()
+  if lower_name in {"point_cloud.ply", "point_cloud_quantised.ply", "point_cloud_quantised_half.ply"}:
+    score += 300
+  if "point_cloud" in lower_parts and any(part.startswith("iteration_") for part in lower_parts):
+    score += 300
+  if "checkpoints" in lower_parts:
+    score -= 200
+  if lower_name.endswith("-xyz_rgb.ply"):
+    score -= 200
+  return score
+
+
+def best_result_ply_candidate(paths: list[Path]) -> Path | None:
+  existing = [path for path in paths if is_ply_file(path)]
+  if not existing:
+    return None
+  existing.sort(key=lambda path: (result_ply_candidate_score(path), path_mtime(path), str(path)), reverse=True)
+  return existing[0]
+
+
+def gslightning_checkpoint_ply_candidates(directory: Path) -> list[Path]:
+  checkpoint_dir = directory / "checkpoints"
+  if not checkpoint_dir.exists() or not checkpoint_dir.is_dir():
+    return []
+  return [path for path in checkpoint_dir.glob("*.ply") if is_ply_file(path)]
+
+
+def find_result_ply_in_directory(directory: Path, names: list[str], family: str | None = None) -> Path | None:
+  candidates: list[Path] = [path for path in direct_ply_candidates(directory, names) if is_ply_file(path)]
 
   iteration_dir = latest_iteration_dir(directory / "point_cloud")
   if iteration_dir:
     for candidate in direct_ply_candidates(iteration_dir, names):
       if is_ply_file(candidate):
-        return candidate
+        candidates.append(candidate)
 
   if directory.name.startswith("iteration_"):
     for candidate in direct_ply_candidates(directory, names):
       if is_ply_file(candidate):
-        return candidate
+        candidates.append(candidate)
 
-  return None
+  if str(family or "").strip() == "gaussian-splatting-lightning":
+    candidates.extend(gslightning_checkpoint_ply_candidates(directory))
+
+  return best_result_ply_candidate(candidates)
 
 
 def find_result_ply(directory: Path, family: str | None = None) -> Path | None:
@@ -1695,7 +1854,7 @@ def find_result_ply(directory: Path, family: str | None = None) -> Path | None:
 
   if directory.is_dir():
     for candidate_dir in compgs_result_candidate_dirs(directory, family):
-      result = find_result_ply_in_directory(candidate_dir, names)
+      result = find_result_ply_in_directory(candidate_dir, names, family)
       if result:
         return result
 
@@ -1824,15 +1983,21 @@ def attach_render_images(payload: Dict[str, Any], image_paths: list[Path]) -> Di
 def result_payload_for_ply(path: Path, *, family: str | None = None, representation: str | None = None) -> Dict[str, Any]:
   resolved = path.resolve()
   resolved_family = infer_family_for_path(resolved, family)
-  resolved_representation = representation_for_family(resolved_family, representation)
+  fallback_representation = representation_for_family(resolved_family, representation)
+  render_format = classify_ply_render_format(resolved)
+  resolved_representation = representation_for_ply_format(render_format, fallback_representation)
+  viewer_renderer = viewer_renderer_for_format(render_format, resolved_representation)
   point_cloud_url = file_url_for_path(resolved, "ply")
   return {
     "ok": True,
     "type": "ply",
     "family": resolved_family,
     "representation": resolved_representation,
+    "render_format": render_format,
+    "render_label": render_label_for_format(render_format),
+    "viewer_renderer": viewer_renderer,
     "point_cloud_url": point_cloud_url,
-    "viewer_url": build_viewer_url(point_cloud_url, resolved_representation),
+    "viewer_url": build_viewer_url(point_cloud_url, resolved_representation, render_format),
     "resolved_path": str(resolved),
     "path": str(resolved),
     "file_size": resolved.stat().st_size,
@@ -2067,7 +2232,7 @@ def newest_render_image(directory: Path) -> Path | None:
   return candidates[0][1]
 
 
-def read_runtime_artifacts(output_dir: str | None, representation: str | None = None) -> Dict[str, Any]:
+def read_runtime_artifacts(output_dir: str | None, representation: str | None = None, family: str | None = None) -> Dict[str, Any]:
   if not output_dir:
     return {}
   directory = Path(output_dir).resolve()
@@ -2078,7 +2243,7 @@ def read_runtime_artifacts(output_dir: str | None, representation: str | None = 
       payload["metrics"] = json.loads(metrics_path.read_text(encoding="utf-8"))
     except Exception:
       pass
-  artifact = load_result_path(str(directory), representation=representation)
+  artifact = load_result_path(str(directory), family=family, representation=representation)
   if artifact.get("ok"):
     for key in ("type", "family", "representation", "resolved_path", *ARTIFACT_RESULT_FIELDS):
       if artifact.get(key):
@@ -2415,9 +2580,11 @@ def file_download_response(
 
 def enrich_job(job: Dict[str, Any]) -> Dict[str, Any]:
   ensure_job_logging(job)
+  if mark_stale_remote_download_if_needed(job):
+    persist_job_state(job)
   enriched = dict(job)
   if not is_remote_download_pending(enriched):
-    artifacts = read_runtime_artifacts(enriched.get("output_dir"), enriched.get("representation"))
+    artifacts = read_runtime_artifacts(enriched.get("output_dir"), enriched.get("representation"), enriched.get("algorithm_family"))
     if artifacts.get("metrics"):
       enriched["metrics"] = {
         **enriched.get("metrics", {}),
@@ -2437,7 +2604,8 @@ def enrich_job(job: Dict[str, Any]) -> Dict[str, Any]:
   if isinstance(enriched.get("metrics_history"), list):
     enriched["metrics_history_count"] = len(enriched["metrics_history"])
     enriched.pop("metrics_history", None)
-  for private_field in ("log_dir", "log_file", "metrics_csv_file", "_process"):
+  private_fields = [key for key in enriched if key.startswith("_")]
+  for private_field in ("log_dir", "log_file", "metrics_csv_file", *private_fields):
     enriched.pop(private_field, None)
   return enriched
 
@@ -2712,6 +2880,22 @@ def is_remote_download_active(job: Dict[str, Any]) -> bool:
 
 def is_remote_download_starting(job: Dict[str, Any]) -> bool:
   return bool(job.get("_result_download_starting"))
+
+
+def mark_stale_remote_download_if_needed(job: Dict[str, Any]) -> bool:
+  if not is_remote_download_pending(job):
+    return False
+  if is_remote_download_active(job) or is_remote_download_starting(job):
+    return False
+  set_remote_download_progress(job, {
+    "pending": False,
+    "phase": "error",
+    "error": "Result download was interrupted before completion. Click Retry Download to check and resume missing files.",
+    "interrupted": True,
+  })
+  job["remote_stage"] = "result_download_failed"
+  job["monitor_state"] = "completed"
+  return True
 
 
 def completed_remote_result_paths(job: Dict[str, Any]) -> tuple[str, str]:
@@ -3063,7 +3247,7 @@ def clear_job_records(statuses_value: Any = None) -> Dict[str, Any]:
 def update_job_artifacts(job: Dict[str, Any]) -> None:
   if is_remote_download_pending(job):
     return
-  artifacts = read_runtime_artifacts(job.get("output_dir"), job.get("representation"))
+  artifacts = read_runtime_artifacts(job.get("output_dir"), job.get("representation"), job.get("algorithm_family"))
   if artifacts.get("metrics"):
     job["metrics"] = {
       **job.get("metrics", {}),
@@ -3325,7 +3509,7 @@ def start_job_thread(job: Dict[str, Any], command: str, cwd: str | None = None) 
         append_job_log_line(job, channel, line)
         combined_log.append(line)
         job["metrics"] = extract_job_metrics("".join(combined_log[-2000:]))
-        artifacts = read_runtime_artifacts(job.get("output_dir"), job.get("representation"))
+        artifacts = read_runtime_artifacts(job.get("output_dir"), job.get("representation"), job.get("algorithm_family"))
         if artifacts.get("metrics"):
           job["metrics"] = {
             **job.get("metrics", {}),
@@ -3379,7 +3563,7 @@ def start_job_thread(job: Dict[str, Any], command: str, cwd: str | None = None) 
       return_code = process.wait()
       stdout_thread.join(timeout=1)
       stderr_thread.join(timeout=1)
-      artifacts = read_runtime_artifacts(job.get("output_dir"), job.get("representation"))
+      artifacts = read_runtime_artifacts(job.get("output_dir"), job.get("representation"), job.get("algorithm_family"))
       if artifacts.get("metrics"):
         job["metrics"] = {
           **job.get("metrics", {}),
@@ -3452,7 +3636,7 @@ def start_remote_job_thread(
     combined_log: list[str] = []
 
     def update_artifacts() -> None:
-      artifacts = read_runtime_artifacts(job.get("output_dir"), job.get("representation"))
+      artifacts = read_runtime_artifacts(job.get("output_dir"), job.get("representation"), job.get("algorithm_family"))
       if artifacts.get("metrics"):
         job["metrics"] = {
           **job.get("metrics", {}),
@@ -4656,7 +4840,11 @@ class ApiHandler(SimpleHTTPRequestHandler):
           prune_job_history()
           start_job_thread(job, command=command, cwd=job["cwd"])
 
-      stream_artifacts = read_runtime_artifacts(str((STREAM_DIR / session_id / "output").resolve()), adapter.get("representation") if adapter else None)
+      stream_artifacts = read_runtime_artifacts(
+        str((STREAM_DIR / session_id / "output").resolve()),
+        adapter.get("representation") if adapter else None,
+        family,
+      )
 
       json_response(self, {
         "ok": True,

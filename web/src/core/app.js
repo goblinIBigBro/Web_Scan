@@ -35,6 +35,12 @@ const REMOTE_KEY = "gaussvision-remote-config-v1";
 const MAX_LOG_CHARS = 180_000;
 const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"]);
 const MODEL_EXTENSIONS = new Set([".ply"]);
+const RENDER_FORMAT_LABELS = {
+  "gaussian-sh": "Gaussian SH PLY",
+  "gaussian-sg": "Spherical Gaussian PLY",
+  "rgb-point-cloud": "RGB Point Cloud",
+  "unknown-ply": "PLY 3D Model",
+};
 
 const NAV_ITEMS = [
   { id: "overview", label: "Overview" },
@@ -256,8 +262,12 @@ function getRenderablePlyAsset(asset = {}) {
     || asset.type === "ply"
     || asset.type === "manifest";
   if (!isModelAsset) return null;
+  const renderFormat = asset.render_format || (asset.type === "manifest" ? "manifest" : "unknown-ply");
+  const renderLabel = asset.render_label || RENDER_FORMAT_LABELS[renderFormat] || RENDER_FORMAT_LABELS["unknown-ply"];
   return {
     type: asset.type === "manifest" ? "manifest" : "ply",
+    renderFormat,
+    renderLabel,
     sourceUrl,
     viewerUrl: asset.viewer_url || "",
   };
@@ -305,7 +315,7 @@ function classifyResultAsset(asset = {}) {
 function resultTypeLabel(asset = {}) {
   const plyAsset = getRenderablePlyAsset(asset);
   if (plyAsset?.type === "manifest") return "Scene Manifest";
-  if (plyAsset) return "PLY 3D Model";
+  if (plyAsset) return plyAsset.renderLabel || "PLY 3D Model";
   if (getRenderableImageAsset(asset)) return "Image";
   return "Unknown";
 }
@@ -325,6 +335,10 @@ function downloadInfo(job = {}) {
 
 function isRemoteDownloadPending(job = {}) {
   return Boolean(job.remote_detached && downloadInfo(job).pending);
+}
+
+function isRemoteDownloadFailed(job = {}) {
+  return String(downloadInfo(job).phase || "") === "error";
 }
 
 function canDownloadCompletedResult(job = {}) {
@@ -433,6 +447,7 @@ function renderRemoteDownloadStatus(job = {}, options = {}) {
   const complete = Boolean(info.complete);
   const failed = String(info.phase || "") === "error";
   const currentFile = String(info.current_file || "").trim();
+  const errorText = String(info.error || "").trim();
   const label = failed
     ? "Result download failed"
     : pending
@@ -440,7 +455,7 @@ function renderRemoteDownloadStatus(job = {}, options = {}) {
       : complete
         ? "Result files complete"
         : "Result files incomplete";
-  const detail = `${formatDownloadProgress(info)}${currentFile ? ` · ${currentFile}` : ""}`;
+  const detail = `${formatDownloadProgress(info)}${currentFile ? ` · ${currentFile}` : ""}${failed && errorText ? ` · ${errorText}` : ""}`;
   const statusClassName = failed ? "bad" : pending ? "warn" : complete ? "ok" : "warn";
   const progress = pending ? `
     <div class="download-progress" aria-label="Result download progress">
@@ -466,9 +481,10 @@ function renderRemoteDownloadStatus(job = {}, options = {}) {
 function renderResultDownloadButton(job = {}, compact = false) {
   if (!canDownloadCompletedResult(job)) return "";
   const pending = isRemoteDownloadPending(job);
+  const failed = isRemoteDownloadFailed(job);
   const match = resultDownloadServerMatch(job);
   const ready = remoteConfigReadyForReattach();
-  const label = pending ? "Downloading" : "Check Result";
+  const label = pending ? "Downloading" : failed ? "Retry Download" : "Check Result";
   const disabled = pending || !match.ok || !ready;
   const title = !match.ok
     ? `${match.message} Expected ${formatRemoteIdentity(match.expected)}; current ${formatRemoteIdentity(match.current)}.`
@@ -1610,11 +1626,15 @@ function renderResultSurface(asset, options = {}) {
   const imageUrls = imageAsset?.imageUrls || [];
   const frameClass = `viewer-frame${options.tall === false ? "" : " tall"}`;
   if (classified.type === "ply" || classified.type === "manifest") {
+    const modelLabel = classified.type === "manifest" ? "Scene Manifest" : classified.renderLabel || "PLY 3D Model";
+    const modelHint = classified.renderFormat === "rgb-point-cloud"
+      ? "Displayed as an RGB point cloud."
+      : "Use the 3D viewer controls to rotate and zoom.";
     if (!classified.viewerUrl) {
       return `
         <div class="${frameClass} result-placeholder">
           <div>
-            <h3>PLY 3D Model Detected</h3>
+            <h3>${escapeHtml(modelLabel)} Detected</h3>
             <p class="panel-copy">${escapeHtml(classified.sourceUrl)}</p>
             <p class="panel-copy">A PLY file must be opened through the 3D viewer. No viewer URL was returned for this model.</p>
           </div>
@@ -1624,8 +1644,8 @@ function renderResultSurface(asset, options = {}) {
     return `
       <section class="result-surface">
         <div class="result-toolbar">
-          <span class="badge ok">${classified.type === "manifest" ? "Scene Manifest" : "PLY 3D Model"}</span>
-          <span class="panel-copy">Use the 3D viewer controls to rotate and zoom.</span>
+          <span class="badge ok">${escapeHtml(modelLabel)}</span>
+          <span class="panel-copy">${escapeHtml(modelHint)}</span>
         </div>
         <iframe class="${frameClass}" src="${escapeHtml(classified.viewerUrl)}" title="PLY 3D model viewer"></iframe>
         ${renderImageGallery(imageUrls)}
@@ -1724,7 +1744,13 @@ function renderResultPage() {
   const imageFields = { result_url: imageAsset?.imageUrl || "", result_urls: imageAsset?.imageUrls || [], render_images: job?.render_images || [] };
   const surfaceAsset = mode === "image"
     ? imageFields
-    : { ...imageFields, viewer_url: plyAsset?.viewerUrl || "", point_cloud_url: plyAsset?.sourceUrl || "" };
+    : {
+        ...imageFields,
+        viewer_url: plyAsset?.viewerUrl || "",
+        point_cloud_url: plyAsset?.sourceUrl || "",
+        render_format: plyAsset?.renderFormat || "",
+        render_label: plyAsset?.renderLabel || "",
+      };
   return `
     <section class="panel">
       <div class="panel-head">
@@ -2820,18 +2846,23 @@ function openConfirmModal(preview) {
 function openResultDownloadConfirmModal(check = {}) {
   const layer = document.getElementById("modal-layer");
   const sampleFiles = Array.isArray(check.sample_files) ? check.sample_files.slice(0, 8) : [];
+  const skippedCheckpointSamples = Array.isArray(check.skipped_checkpoint_samples)
+    ? check.skipped_checkpoint_samples.slice(0, 8)
+    : [];
   layer.hidden = false;
   layer.innerHTML = `
     <div class="modal">
       <div class="panel-head"><h2>Download Result Files</h2><span class="badge warn">Incomplete local result</span></div>
       <div class="modal-body grid">
-        <p>Local result files are incomplete. Confirming will download only missing or size-mismatched files from the remote output directory.</p>
+        <p>Local result files are incomplete. Confirming will download only missing or size-mismatched result files from the remote output directory. Checkpoints and intermediate training artifacts are skipped.</p>
         <div class="command-box grid">
           <p class="panel-copy">Remote Output: ${escapeHtml(check.remote_output_dir || "-")}</p>
           <p class="panel-copy">Local Output: ${escapeHtml(check.local_output_dir || "-")}</p>
           <p class="panel-copy">To download: ${escapeHtml(check.total_files || 0)} file(s), ${escapeHtml(formatBytes(check.total_bytes || 0))}</p>
           <p class="panel-copy">Missing: ${escapeHtml(check.missing_files || 0)} · Size mismatch: ${escapeHtml(check.mismatched_files || 0)} · Skipped: ${escapeHtml(check.skipped_files || 0)}</p>
+          <p class="panel-copy">Skipped checkpoints: ${escapeHtml(check.skipped_checkpoint_files || 0)} · ${escapeHtml(formatBytes(check.skipped_checkpoint_bytes || 0))}</p>
           ${sampleFiles.length ? `<pre>${escapeHtml(sampleFiles.join("\n"))}</pre>` : ""}
+          ${skippedCheckpointSamples.length ? `<pre>${escapeHtml(`Skipped checkpoints:\n${skippedCheckpointSamples.join("\n")}`)}</pre>` : ""}
         </div>
       </div>
       <div class="modal-footer">

@@ -36,7 +36,7 @@
       "operations": {
         "train": {
           "enabled": true,
-          "template": "python main.py fit --data.path {workspace} --output {output_dir}"
+          "template": "python main.py fit --data.path {workspace} --output {output_dir} --model.save_ply true"
         },
         "render": {
           "enabled": true,
@@ -459,6 +459,31 @@
       "repo_path": "../CompGS-main",
       "repo_url": "https://github.com/LiuXiangrui/CompGS",
       "default_cwd": "../CompGS-main",
+      "requirements": {
+        "python_modules": [
+          "torch",
+          "torchvision",
+          "diff_gaussian_rasterization",
+          "knn_dist",
+          "torch_scatter",
+          "compressai",
+          "lpips",
+          "pytorch_msssim",
+          "plyfile",
+          "einops",
+          "yaml"
+        ],
+        "install_commands": {
+          "cuda121": [
+            "conda create -y -n CompGS_env python=3.10 pip",
+            "conda activate CompGS_env",
+            "conda install -y -c pytorch -c nvidia -c conda-forge pytorch==2.2.2 torchvision==0.17.2 torchaudio==2.2.2 pytorch-cuda=12.1 numpy=1.26.* pillow=10.* plyfile=1.1.* pyyaml tqdm tensorboard prettytable",
+            "python -m pip install compressai==1.2.8 einops lpips pytorch-msssim",
+            "python -m pip install torch-scatter -f https://data.pyg.org/whl/torch-2.2.0+cu121.html",
+            "TORCH_CUDA_ARCH_LIST=8.9 CUDA_HOME=/usr/local/cuda-12.1 python -m pip install --no-build-isolation submodules/diff-gaussian-rasterization submodules/knn_dist"
+          ]
+        }
+      },
       "operations": {
         "train": {
           "enabled": true,

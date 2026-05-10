@@ -8,10 +8,11 @@
 #   bash remote_verify_setup.sh              # 自动检测
 #   bash remote_verify_setup.sh new          # 新版（HAC-plus/FCGS）
 #   bash remote_verify_setup.sh contextgs    # ContextGS Python 3.10 + CUDA 12.1
+#   bash remote_verify_setup.sh compgs       # CompGS Python 3.10 + CUDA 12.1
 #   bash remote_verify_setup.sh reduced-3dgs # Reduced-3DGS Python 3.10 + CUDA 12.1
 #   bash remote_verify_setup.sh megs2        # MEGS2 Python 3.10 + CUDA 12.1
 #   bash remote_verify_setup.sh gaussian-splatting-lightning # GSL Python 3.10 + CUDA 12.1
-#   bash remote_verify_setup.sh old          # 旧版（CompGS/Scaffold-GS 等）
+#   bash remote_verify_setup.sh old          # 旧版（Scaffold-GS 等）
 #
 
 set -e
@@ -67,6 +68,8 @@ detect_version() {
   
   if [[ "$python_ver" == 3.10* ]] && python3 -c 'import compressai, torchac' >/dev/null 2>&1; then
     echo "contextgs"
+  elif [[ "$python_ver" == 3.10* ]] && python3 -c 'import compressai, torch_scatter, knn_dist, diff_gaussian_rasterization' >/dev/null 2>&1; then
+    echo "compgs"
   elif [[ "$python_ver" == 3.10* ]] && python3 -c 'import lightning, diff_gaussian_rasterization, simple_knn, gsplat' >/dev/null 2>&1; then
     echo "gaussian-splatting-lightning"
   elif [[ "$python_ver" == 3.10* ]] && python3 -c 'import diff_gaussian_rasterization, diff_gaussian_rasterization_ms, diff_gaussian_rasterization_ms_light, simple_knn' >/dev/null 2>&1; then
@@ -188,6 +191,65 @@ check_contextgs_version() {
   if command -v conda &> /dev/null; then
     check_item "Conda 命令" "conda --version"
     check_item "contextgs 环境存在" "conda env list | grep -E '^contextgs[[:space:]]|[[:space:]]contextgs$|/contextgs$'" true
+  else
+    echo -e "${YELLOW}⚠ Conda 不在 PATH 中（可能使用绝对路径激活）${NC}"
+  fi
+}
+
+# CompGS 检查（Python 3.10 + PyTorch 2.2 + CUDA 12.1 + RTX 4090）
+check_compgs_version() {
+  echo -e "\n${BLUE}=== CompGS 检查 (Python 3.10 + PyTorch 2.2 + CUDA 12.1 + RTX 4090) ===${NC}"
+  echo ""
+
+  # 系统检查
+  echo "--- 系统信息 ---"
+  check_item "Linux 系统" "uname -a | grep -i linux"
+  check_item "磁盘空间 (≥100GB)" "[ \$(df / 2>/dev/null | awk 'NR==2 {print \$4}') -gt 100000000 ]"
+  check_item "GPU 驱动" "nvidia-smi > /dev/null"
+  check_item "CUDA Toolkit / nvcc" "command -v nvcc >/dev/null 2>&1"
+
+  # Python 检查
+  echo ""
+  echo "--- Python 环境 ---"
+  check_item "Python 3.10" "python3 --version | grep '3.10'"
+  check_item "PyTorch 2.2" "python3 -c 'import torch; assert torch.__version__.startswith(\"2.2\")'"
+  check_item "CUDA 可用" "python3 -c 'import torch; assert torch.cuda.is_available()'"
+  check_item "GPU 可见" "python3 -c 'import torch; assert torch.cuda.device_count() > 0'"
+  check_item "RTX 4090" "python3 -c 'import torch; assert torch.cuda.is_available() and \"4090\" in torch.cuda.get_device_name(0)'"
+
+  # CUDA 版本检查
+  echo ""
+  echo "--- CUDA 版本 ---"
+  check_item "PyTorch CUDA 12.1" "python3 -c 'import torch; v=torch.version.cuda; assert v and v.startswith(\"12.1\")'"
+  check_item "CUDA 架构 sm_89" "python3 -c 'import torch; assert torch.cuda.is_available() and torch.cuda.get_device_capability(0) == (8, 9)'"
+
+  # 依赖包检查
+  echo ""
+  echo "--- 依赖包 ---"
+  check_item "torchvision" "python3 -c 'import torchvision'"
+  check_item "compressai" "python3 -c 'import compressai'"
+  check_item "torch-scatter" "python3 -c 'import torch_scatter'"
+  check_item "lpips" "python3 -c 'import lpips'"
+  check_item "pytorch-msssim" "python3 -c 'import pytorch_msssim'"
+  check_item "plyfile" "python3 -c 'import plyfile'"
+  check_item "einops" "python3 -c 'import einops'"
+  check_item "PyYAML" "python3 -c 'import yaml'"
+  check_item "Pillow" "python3 -c 'import PIL'"
+  check_item "numpy" "python3 -c 'import numpy'"
+  check_item "tqdm" "python3 -c 'import tqdm'"
+
+  # CUDA 扩展检查
+  echo ""
+  echo "--- CompGS CUDA 扩展 ---"
+  check_item "diff-gaussian-rasterization" "python3 -c 'import diff_gaussian_rasterization'"
+  check_item "knn_dist" "python3 -c 'import knn_dist'"
+
+  # 环境激活检查
+  echo ""
+  echo "--- 环境激活 ---"
+  if command -v conda &> /dev/null; then
+    check_item "Conda 命令" "conda --version"
+    check_item "CompGS_env 环境存在" "conda env list | grep -E '^CompGS_env[[:space:]]|[[:space:]]CompGS_env$|/CompGS_env$'" true
   else
     echo -e "${YELLOW}⚠ Conda 不在 PATH 中（可能使用绝对路径激活）${NC}"
   fi
@@ -409,7 +471,7 @@ check_old_version() {
   echo "--- 环境激活 ---"
   if command -v conda &> /dev/null; then
     check_item "Conda 命令" "conda --version"
-    check_item "scaffold_gs/CompGS_env 环境存在" "conda env list | grep -E 'scaffold_gs|CompGS_env'" true
+    check_item "scaffold_gs 环境存在" "conda env list | grep -E 'scaffold_gs'" true
   else
     echo -e "${YELLOW}⚠ Conda 不在 PATH 中（可能使用绝对路径激活）${NC}"
   fi
@@ -456,6 +518,7 @@ main() {
       echo "请手动指定:"
       echo "  bash remote_verify_setup.sh new   (新版: Python 3.10 + PyTorch 2.2)"
       echo "  bash remote_verify_setup.sh contextgs   (ContextGS: Python 3.10 + PyTorch 2.2 + CUDA 12.1)"
+      echo "  bash remote_verify_setup.sh compgs   (CompGS: Python 3.10 + PyTorch 2.2 + CUDA 12.1)"
       echo "  bash remote_verify_setup.sh reduced-3dgs   (Reduced-3DGS: Python 3.10 + PyTorch 2.2 + CUDA 12.1)"
       echo "  bash remote_verify_setup.sh megs2   (MEGS2: Python 3.10 + PyTorch 2.2 + CUDA 12.1)"
       echo "  bash remote_verify_setup.sh gaussian-splatting-lightning   (GSL: Python 3.10 + PyTorch 2.2 + CUDA 12.1)"
@@ -474,6 +537,9 @@ main() {
     contextgs)
       check_contextgs_version
       ;;
+    compgs)
+      check_compgs_version
+      ;;
     reduced-3dgs)
       check_reduced_3dgs_version
       ;;
@@ -488,7 +554,7 @@ main() {
       ;;
     *)
       echo -e "${RED}未知的版本: $version${NC}"
-      echo "请使用 'new'、'contextgs'、'reduced-3dgs'、'megs2'、'gaussian-splatting-lightning'、'gs-lightning' 或 'old'"
+      echo "请使用 'new'、'contextgs'、'compgs'、'reduced-3dgs'、'megs2'、'gaussian-splatting-lightning'、'gs-lightning' 或 'old'"
       return 1
       ;;
   esac

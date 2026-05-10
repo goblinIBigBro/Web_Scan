@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT_DIR))
 from web.server import api_server, remote_executor
 from web.server.remote_executor import (
   RemoteExecutionError,
+  _build_remote_download_plan,
   _build_remote_cancel_script,
   _build_remote_detached_run_script,
   _build_remote_tmux_start_command,
@@ -279,6 +280,97 @@ class FakeSftp:
     raise FileNotFoundError(remote_path)
 
 
+class FakeTreeSftp:
+  def __init__(self, files: dict[str, bytes]) -> None:
+    self.files = files
+    self.get_calls: list[str] = []
+
+  def listdir_attr(self, remote_path: str):
+    base = str(remote_path or "/").rstrip("/") or "/"
+    prefix = "" if base == "/" else base + "/"
+    children: dict[str, FakeSftpAttr] = {}
+    for file_path, payload in self.files.items():
+      if not file_path.startswith(prefix):
+        continue
+      rest = file_path[len(prefix):]
+      if not rest:
+        continue
+      child_name, _, remainder = rest.partition("/")
+      if remainder:
+        children[child_name] = FakeSftpAttr(child_name, is_dir=True)
+      elif child_name not in children:
+        children[child_name] = FakeSftpAttr(child_name, size=len(payload))
+    return [children[name] for name in sorted(children)]
+
+  def get(self, remote_item: str, local_item: str, callback=None):
+    self.get_calls.append(remote_item)
+    payload = self.files[remote_item]
+    target = Path(local_item)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(payload)
+    if callback:
+      callback(len(payload), len(payload))
+
+
+def write_ply(path: Path, properties: list[tuple[str, str]]) -> None:
+  path.parent.mkdir(parents=True, exist_ok=True)
+  lines = [
+    "ply",
+    "format ascii 1.0",
+    "element vertex 1",
+    *(f"property {kind} {name}" for kind, name in properties),
+    "end_header",
+    " ".join("0" for _ in properties),
+    "",
+  ]
+  path.write_text("\n".join(lines), encoding="ascii")
+
+
+def write_gaussian_sh_ply(path: Path) -> None:
+  write_ply(path, [
+    ("float", "x"),
+    ("float", "y"),
+    ("float", "z"),
+    ("float", "f_dc_0"),
+    ("float", "f_dc_1"),
+    ("float", "f_dc_2"),
+    ("float", "f_rest_0"),
+    ("float", "opacity"),
+    ("float", "scale_0"),
+    ("float", "scale_1"),
+    ("float", "scale_2"),
+    ("float", "rot_0"),
+    ("float", "rot_1"),
+    ("float", "rot_2"),
+    ("float", "rot_3"),
+  ])
+
+
+def write_sg_ply(path: Path) -> None:
+  write_ply(path, [
+    ("float", "x"),
+    ("float", "y"),
+    ("float", "z"),
+    ("float", "rgb_base_0"),
+    ("float", "rgb_base_1"),
+    ("float", "rgb_base_2"),
+    ("float", "sg_dir_0"),
+    ("float", "sg_sharp_0"),
+    ("float", "sg_rgb_0"),
+  ])
+
+
+def write_rgb_point_cloud_ply(path: Path) -> None:
+  write_ply(path, [
+    ("float", "x"),
+    ("float", "y"),
+    ("float", "z"),
+    ("uchar", "red"),
+    ("uchar", "green"),
+    ("uchar", "blue"),
+  ])
+
+
 def test_remote_download_uses_temp_file_and_reports_progress() -> None:
   target_dir = Path(api_server.WEB_DIR) / "generated" / "download_tests" / f"download-{uuid.uuid4().hex[:8]}"
   try:
@@ -321,6 +413,168 @@ def test_remote_download_skips_complete_local_files() -> None:
     assert result["skipped_files"] == 2
     assert result["skipped_special_files"] == 1
     assert fake.get_calls == []
+  finally:
+    if target_dir.exists():
+      shutil.rmtree(target_dir)
+
+
+def test_remote_download_skips_project_checkpoint_artifacts() -> None:
+  files = {
+    "/remote/point_cloud/iteration_30000/point_cloud.ply": b"ply",
+    "/remote/point_cloud/iteration_30000/color_mlp.pt": b"mlp",
+    "/remote/chkpnt30000.pth": b"checkpoint",
+    "/remote/checkpoint_foo.pkl": b"checkpoint-pkl",
+    "/remote/checkpoints/epoch=300-step=30000.ckpt": b"lightning",
+    "/remote/checkpoints/epoch=300-step=30000-xyz_rgb.ply": b"lightning-ply",
+    "/remote/ckpts/model.pt": b"ckpt",
+    "/remote/nested/model_30000.pth": b"model",
+    "/remote/compgs_pretrain/point_cloud/iteration_30000/point_cloud.ply": b"intermediate-ply",
+    "/remote/compgs_pretrain/config/webscan_compgs.yaml": b"generated-config",
+    "/remote/compgs_point_cloud.ply": b"compgs-ply",
+    "/remote/point_cloud.ply": b"viewer-ply",
+    "/remote/fcgs_bitstreams/chunk_0.b": b"bits",
+    "/remote/eval/results.json": b"{}",
+    "/remote/test/ours_30000/renders/000.png": b"png",
+    "/remote/output.log": b"log",
+  }
+  target_dir = Path(api_server.WEB_DIR) / "generated" / "download_tests" / f"checkpoint-filter-{uuid.uuid4().hex[:8]}"
+  try:
+    plan = _build_remote_download_plan(FakeTreeSftp(files), "/remote", target_dir)
+    download_paths = {item["relative_path"] for item in plan["files_to_download"]}
+
+    assert download_paths == {
+      "point_cloud/iteration_30000/point_cloud.ply",
+      "checkpoints/epoch=300-step=30000-xyz_rgb.ply",
+      "compgs_point_cloud.ply",
+      "point_cloud.ply",
+      "fcgs_bitstreams/chunk_0.b",
+      "eval/results.json",
+      "test/ours_30000/renders/000.png",
+      "output.log",
+    }
+    assert plan["skipped_checkpoint_files"] == 8
+    assert plan["skipped_checkpoint_bytes"] > 0
+    assert "compgs_pretrain/" in plan["skipped_checkpoint_samples"]
+    assert "checkpoints/epoch=300-step=30000.ckpt" in plan["skipped_checkpoint_samples"]
+    assert all(not item.startswith("compgs_pretrain/") for item in download_paths)
+    assert all(not item.endswith((".pth", ".pt", ".ckpt", ".pkl")) for item in download_paths)
+  finally:
+    if target_dir.exists():
+      shutil.rmtree(target_dir)
+
+
+def test_gaussian_splatting_lightning_train_exports_ply() -> None:
+  config_path = Path(api_server.WEB_DIR) / "config" / "algorithm_adapters.json"
+  config = json.loads(config_path.read_text(encoding="utf-8"))
+  adapter = next(item for item in config["adapters"] if item["family"] == "gaussian-splatting-lightning")
+  template = adapter["operations"]["train"]["template"]
+
+  assert "--model.save_ply true" in template
+
+  validated = {
+    "python": "python3",
+    "repo_path": "/remote/gaussian-splatting-lightning",
+    "activate_cmd": "source /opt/env/bin/activate",
+  }
+  remote_paths = {
+    "workspace_dir": "/remote/workspace",
+    "output_dir": "/remote/output",
+  }
+  script = _build_remote_detached_run_script(
+    validated=validated,
+    job_id="job-gspl",
+    family="gaussian-splatting-lightning",
+    remote_paths=remote_paths,
+    remote_job_paths=_remote_job_paths(remote_paths["output_dir"]),
+    remote_workspace_for_command="/remote/dataset",
+    remote_command="python3 main.py fit --data.path /remote/dataset --output /remote/output --model.save_ply true",
+    auto_colmap=False,
+    resolved_dataset_id="dataset",
+    resolved_dataset_name="Dataset",
+    use_existing_remote_dataset=True,
+  )
+
+  assert 'write_status "running" "exporting_gaussian_ply"' in script
+  assert "if ! test -f utils/ckpt2ply.py; then" in script
+  assert 'python utils/ckpt2ply.py \\"$OUTPUT_DIR\\" --override' in script
+  assert '"$PYTHON_BIN" utils/ckpt2ply.py "$OUTPUT_DIR" --override' in script
+  assert "--colored" not in script
+  assert "--drop-shs-rest" not in script
+
+
+def test_ply_header_classifier_selects_viewer_format() -> None:
+  target_dir = Path(api_server.WEB_DIR) / "generated" / "download_tests" / f"ply-format-{uuid.uuid4().hex[:8]}"
+  try:
+    sh_path = target_dir / "sh.ply"
+    sg_path = target_dir / "sg.ply"
+    rgb_path = target_dir / "rgb.ply"
+    write_gaussian_sh_ply(sh_path)
+    write_sg_ply(sg_path)
+    write_rgb_point_cloud_ply(rgb_path)
+
+    assert api_server.classify_ply_render_format(sh_path) == "gaussian-sh"
+    assert api_server.classify_ply_render_format(sg_path) == "gaussian-sg"
+    assert api_server.classify_ply_render_format(rgb_path) == "rgb-point-cloud"
+
+    sh_payload = api_server.result_payload_for_ply(sh_path, family="gaussian-splatting-lightning", representation="sg")
+    sg_payload = api_server.result_payload_for_ply(sg_path, family="megs2", representation="sh")
+    rgb_payload = api_server.result_payload_for_ply(rgb_path, family="gaussian-splatting-lightning", representation="sg")
+
+    assert sh_payload["render_format"] == "gaussian-sh"
+    assert sh_payload["representation"] == "sh"
+    assert "/web/viewers/sh.html" in sh_payload["viewer_url"]
+    assert sg_payload["render_format"] == "gaussian-sg"
+    assert sg_payload["representation"] == "sg"
+    assert "/web/viewers/sg.html" in sg_payload["viewer_url"]
+    assert rgb_payload["render_format"] == "rgb-point-cloud"
+    assert rgb_payload["render_label"] == "RGB Point Cloud"
+    assert "/web/viewers/sh.html" in rgb_payload["viewer_url"]
+  finally:
+    if target_dir.exists():
+      shutil.rmtree(target_dir)
+
+
+def test_gaussian_splatting_lightning_prefers_exported_gaussian_ply() -> None:
+  target_dir = Path(api_server.WEB_DIR) / "generated" / "download_tests" / f"gspl-artifacts-{uuid.uuid4().hex[:8]}"
+  try:
+    rgb_checkpoint_ply = target_dir / "checkpoints" / "epoch=429-step=30000-xyz_rgb.ply"
+    exported_ply = target_dir / "point_cloud" / "iteration_30000" / "point_cloud.ply"
+    write_rgb_point_cloud_ply(rgb_checkpoint_ply)
+    write_gaussian_sh_ply(exported_ply)
+
+    selected = api_server.find_result_ply(target_dir, "gaussian-splatting-lightning")
+    assert selected == exported_ply
+
+    payload = api_server.load_result_path(
+      str(target_dir),
+      family="gaussian-splatting-lightning",
+      representation="sh",
+    )
+    assert payload["ok"] is True
+    assert payload["resolved_path"] == str(exported_ply.resolve())
+    assert payload["render_format"] == "gaussian-sh"
+    assert payload["render_label"] == "Gaussian SH PLY"
+    assert "/web/viewers/sh.html" in payload["viewer_url"]
+  finally:
+    if target_dir.exists():
+      shutil.rmtree(target_dir)
+
+
+def test_gaussian_splatting_lightning_uses_rgb_checkpoint_ply_as_fallback() -> None:
+  target_dir = Path(api_server.WEB_DIR) / "generated" / "download_tests" / f"gspl-rgb-fallback-{uuid.uuid4().hex[:8]}"
+  try:
+    rgb_checkpoint_ply = target_dir / "checkpoints" / "epoch=429-step=30000-xyz_rgb.ply"
+    write_rgb_point_cloud_ply(rgb_checkpoint_ply)
+
+    payload = api_server.load_result_path(
+      str(target_dir),
+      family="gaussian-splatting-lightning",
+      representation="sh",
+    )
+    assert payload["ok"] is True
+    assert payload["resolved_path"] == str(rgb_checkpoint_ply.resolve())
+    assert payload["render_format"] == "rgb-point-cloud"
+    assert payload["render_label"] == "RGB Point Cloud"
   finally:
     if target_dir.exists():
       shutil.rmtree(target_dir)
@@ -545,6 +799,8 @@ def test_result_download_repeated_request_returns_already_running() -> None:
 
   assert active["started"] is False
   assert active["already_running"] is True
+  assert "_result_download_thread" not in active["job"]
+  json.dumps(active["job"])
   assert starting["started"] is False
   assert starting["already_running"] is True
 
@@ -561,6 +817,7 @@ def test_pending_remote_download_hides_partial_artifacts() -> None:
       "remote_result": {"download": {"pending": True, "files": 0, "bytes": 0}},
       "output_dir": str(target_dir),
       "representation": "sh",
+      "_result_download_thread": AliveDownloadThread(),
     }
 
     enriched = api_server.enrich_job(job)
@@ -570,6 +827,29 @@ def test_pending_remote_download_hides_partial_artifacts() -> None:
   finally:
     if target_dir.exists():
       shutil.rmtree(target_dir)
+
+
+def test_stale_pending_remote_download_becomes_retryable() -> None:
+  job = {
+    "id": f"stale-pending-{uuid.uuid4().hex[:8]}",
+    "status": "completed",
+    "remote_detached": True,
+    "remote_result": {"download": {"pending": True, "files": 1, "bytes": 10, "total_files": 2, "total_bytes": 20}},
+    "output_dir": str(Path(api_server.WEB_DIR) / "generated" / "download_tests" / "stale-pending"),
+    "representation": "sh",
+  }
+
+  changed = api_server.mark_stale_remote_download_if_needed(job)
+  download = job["remote_result"]["download"]
+
+  assert changed is True
+  assert download["pending"] is False
+  assert download["phase"] == "error"
+  assert download["interrupted"] is True
+  assert "Retry Download" in download["error"]
+  assert job["remote_stage"] == "result_download_failed"
+  assert job["monitor_state"] == "completed"
+  assert api_server.is_remote_download_pending(job) is False
 
 
 def main() -> None:
@@ -582,12 +862,18 @@ def main() -> None:
   test_apply_remote_poll_statuses()
   test_remote_download_uses_temp_file_and_reports_progress()
   test_remote_download_skips_complete_local_files()
+  test_remote_download_skips_project_checkpoint_artifacts()
+  test_gaussian_splatting_lightning_train_exports_ply()
+  test_ply_header_classifier_selects_viewer_format()
+  test_gaussian_splatting_lightning_prefers_exported_gaussian_ply()
+  test_gaussian_splatting_lightning_uses_rgb_checkpoint_ply_as_fallback()
   test_result_download_validation_allows_completed_only()
   test_result_download_remote_identity_requires_original_server()
   test_remote_result_marker_must_match_job_and_output()
   test_remote_download_checks_disk_space_and_downloaded_size()
   test_result_download_repeated_request_returns_already_running()
   test_pending_remote_download_hides_partial_artifacts()
+  test_stale_pending_remote_download_becomes_retryable()
   print("detached remote tests passed")
 
 

@@ -8,6 +8,7 @@ import threading
 import os
 import re
 import time
+from fnmatch import fnmatch
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Dict
 
@@ -649,39 +650,96 @@ def _upload_directory(sftp, local_dir: Path, remote_dir: str) -> Dict[str, Any]:
   }
 
 
-def _collect_remote_download_files(sftp, remote_dir: str, local_dir: Path) -> tuple[list[Dict[str, Any]], int]:
+CHECKPOINT_DOWNLOAD_TREE_SKIP_DIR_NAMES = {"compgs_pretrain"}
+CHECKPOINT_DOWNLOAD_FILE_PATTERNS = (
+  "*.ckpt",
+  "*.pth",
+  "*.pt",
+  "checkpoint_*.pkl",
+  "chkpnt*.pth",
+  "model_*.pth",
+)
+
+
+def _is_checkpoint_download_path(relative_path: str) -> bool:
+  normalized = str(relative_path or "").replace("\\", "/").strip("/")
+  if not normalized:
+    return False
+  filename = PurePosixPath(normalized).name.lower()
+  return any(fnmatch(filename, pattern) for pattern in CHECKPOINT_DOWNLOAD_FILE_PATTERNS)
+
+
+def _count_remote_regular_files(sftp, remote_path: PurePosixPath) -> tuple[int, int]:
+  files = 0
+  bytes_total = 0
+  for entry in sftp.listdir_attr(str(remote_path)):
+    child = remote_path / entry.filename
+    if stat.S_ISDIR(entry.st_mode):
+      child_files, child_bytes = _count_remote_regular_files(sftp, child)
+      files += child_files
+      bytes_total += child_bytes
+    elif stat.S_ISREG(entry.st_mode):
+      files += 1
+      bytes_total += int(getattr(entry, "st_size", 0) or 0)
+  return files, bytes_total
+
+
+def _collect_remote_download_files(sftp, remote_dir: str, local_dir: Path) -> tuple[list[Dict[str, Any]], int, int, int, list[str]]:
   remote_root = PurePosixPath(remote_dir)
   local_root = Path(local_dir)
   files: list[Dict[str, Any]] = []
   skipped_special_files = 0
+  skipped_checkpoint_files = 0
+  skipped_checkpoint_bytes = 0
+  skipped_checkpoint_samples: list[str] = []
 
   def walk(remote_path: PurePosixPath, relative_parts: tuple[str, ...]) -> None:
-    nonlocal skipped_special_files
+    nonlocal skipped_special_files, skipped_checkpoint_files, skipped_checkpoint_bytes
     entries = sftp.listdir_attr(str(remote_path))
     for entry in entries:
       remote_item = remote_path / entry.filename
       child_parts = (*relative_parts, entry.filename)
+      relative_path = PurePosixPath(*child_parts).as_posix()
       if stat.S_ISDIR(entry.st_mode):
+        if entry.filename.lower() in CHECKPOINT_DOWNLOAD_TREE_SKIP_DIR_NAMES:
+          child_files, child_bytes = _count_remote_regular_files(sftp, remote_item)
+          skipped_checkpoint_files += child_files
+          skipped_checkpoint_bytes += child_bytes
+          if len(skipped_checkpoint_samples) < 20:
+            skipped_checkpoint_samples.append(relative_path + "/")
+          continue
         walk(remote_item, child_parts)
         continue
       if not stat.S_ISREG(entry.st_mode):
         skipped_special_files += 1
         continue
       size = int(getattr(entry, "st_size", 0) or 0)
+      if _is_checkpoint_download_path(relative_path):
+        skipped_checkpoint_files += 1
+        skipped_checkpoint_bytes += size
+        if len(skipped_checkpoint_samples) < 20:
+          skipped_checkpoint_samples.append(relative_path)
+        continue
       files.append({
         "remote_path": str(remote_item),
         "local_path": str(local_root.joinpath(*child_parts)),
-        "relative_path": PurePosixPath(*child_parts).as_posix(),
+        "relative_path": relative_path,
         "size": size,
       })
 
   walk(remote_root, ())
-  return files, skipped_special_files
+  return files, skipped_special_files, skipped_checkpoint_files, skipped_checkpoint_bytes, skipped_checkpoint_samples
 
 
 def _build_remote_download_plan(sftp, remote_dir: str, local_dir: Path) -> Dict[str, Any]:
   local_root = Path(local_dir).expanduser().resolve()
-  remote_files, skipped_special_files = _collect_remote_download_files(sftp, remote_dir, local_root)
+  (
+    remote_files,
+    skipped_special_files,
+    skipped_checkpoint_files,
+    skipped_checkpoint_bytes,
+    skipped_checkpoint_samples,
+  ) = _collect_remote_download_files(sftp, remote_dir, local_root)
   files_to_download: list[Dict[str, Any]] = []
   skipped_files = 0
   skipped_bytes = 0
@@ -732,6 +790,9 @@ def _build_remote_download_plan(sftp, remote_dir: str, local_dir: Path) -> Dict[
     "skipped_files": skipped_files,
     "skipped_bytes": skipped_bytes,
     "skipped_special_files": skipped_special_files,
+    "skipped_checkpoint_files": skipped_checkpoint_files,
+    "skipped_checkpoint_bytes": skipped_checkpoint_bytes,
+    "skipped_checkpoint_samples": skipped_checkpoint_samples,
     "sample_files": [item["relative_path"] for item in files_to_download[:20]],
   }
 
@@ -753,6 +814,9 @@ def _public_download_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
     "skipped_files": int(plan.get("skipped_files", 0) or 0),
     "skipped_bytes": int(plan.get("skipped_bytes", 0) or 0),
     "skipped_special_files": int(plan.get("skipped_special_files", 0) or 0),
+    "skipped_checkpoint_files": int(plan.get("skipped_checkpoint_files", 0) or 0),
+    "skipped_checkpoint_bytes": int(plan.get("skipped_checkpoint_bytes", 0) or 0),
+    "skipped_checkpoint_samples": plan.get("skipped_checkpoint_samples", []),
     "sample_files": plan.get("sample_files", []),
   }
 
@@ -870,6 +934,9 @@ def _download_directory(
       "skipped_files": plan["skipped_files"],
       "skipped_bytes": plan["skipped_bytes"],
       "skipped_special_files": plan["skipped_special_files"],
+      "skipped_checkpoint_files": plan["skipped_checkpoint_files"],
+      "skipped_checkpoint_bytes": plan["skipped_checkpoint_bytes"],
+      "skipped_checkpoint_samples": plan["skipped_checkpoint_samples"],
       "missing_files": plan["missing_files"],
       "mismatched_files": plan["mismatched_files"],
       "complete": plan["complete"],
@@ -1387,13 +1454,13 @@ fi"""
     colmap_block = 'echo "[Dataset] Reusing existing remote dataset: $REMOTE_DATASET_ID"'
 
   activate_cmd = str(validated.get("activate_cmd", "")).strip()
-  training_lines = [
+  environment_lines = [
     f"cd {_quote(validated['repo_path'])}",
   ]
   if activate_cmd:
-    training_lines.append("[ -f ~/.bash_profile ] && source ~/.bash_profile 2>/dev/null || true")
-    training_lines.append("[ -f ~/.bashrc ] && source ~/.bashrc 2>/dev/null || true")
-    training_lines.append(
+    environment_lines.append("[ -f ~/.bash_profile ] && source ~/.bash_profile 2>/dev/null || true")
+    environment_lines.append("[ -f ~/.bashrc ] && source ~/.bashrc 2>/dev/null || true")
+    environment_lines.append(
       '{ if command -v conda >/dev/null 2>&1; then '
       'eval "$(conda shell.bash hook)" || true; '
       'elif [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then '
@@ -1404,9 +1471,31 @@ fi"""
       'source "/opt/conda/etc/profile.d/conda.sh" || true; '
       'fi; }'
     )
-    training_lines.append(activate_cmd)
-  training_lines.append(remote_command)
+    environment_lines.append(activate_cmd)
+  training_lines = [*environment_lines, remote_command]
   training_body = "\n".join(training_lines)
+
+  post_train_export_block = ""
+  if str(family or "").strip().lower() == "gaussian-splatting-lightning":
+    export_lines = [
+      *environment_lines,
+      'if ! test -f utils/ckpt2ply.py; then',
+      '  echo "[GSLightning] Missing utils/ckpt2ply.py in remote repo: $(pwd)" >&2',
+      '  exit 66',
+      'fi',
+      'echo "[GSLightning] Running python utils/ckpt2ply.py \\"$OUTPUT_DIR\\" --override"',
+      '"$PYTHON_BIN" utils/ckpt2ply.py "$OUTPUT_DIR" --override',
+    ]
+    export_body = "\n".join(export_lines)
+    post_train_export_block = f"""
+  write_status "running" "exporting_gaussian_ply" "" "Exporting complete Gaussian PLY from GSLightning checkpoint."
+  (
+{export_body}
+  )
+  export_rc=$?
+  if [ "$export_rc" -ne 0 ]; then
+    finish_with "failed" "exporting_gaussian_ply" "$export_rc" "GSLightning checkpoint to PLY export failed."
+  fi"""
 
   return f"""#!/usr/bin/env bash
 set +e
@@ -1503,6 +1592,7 @@ write_status "running" "executing_remote_command" "" "Running remote training co
 )
 train_rc=$?
 if [ "$train_rc" -eq 0 ]; then
+{post_train_export_block}
   finish_with "completed" "completed" "$train_rc" "Remote training completed."
 fi
 finish_with "failed" "failed" "$train_rc" "Remote training failed."

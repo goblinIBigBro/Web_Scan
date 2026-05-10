@@ -255,6 +255,17 @@ function classifyAssetUrl(url) {
   return "";
 }
 
+function sameResolvedUrl(left, right) {
+  const leftText = String(left || "").trim();
+  const rightText = String(right || "").trim();
+  if (!leftText || !rightText) return false;
+  try {
+    return new URL(leftText, window.location.href).href === new URL(rightText, window.location.href).href;
+  } catch {
+    return leftText === rightText;
+  }
+}
+
 function getRenderablePlyAsset(asset = {}) {
   const sourceUrl = asset.point_cloud_url || asset.ply_url || asset.ply_path || asset.manifest_url || "";
   const isModelAsset = classifyAssetUrl(sourceUrl) === "ply"
@@ -310,6 +321,24 @@ function classifyResultAsset(asset = {}) {
     type: "",
     sourceUrl: asset.point_cloud_url || asset.result_url || asset.viewer_url || asset.output_url || "",
   };
+}
+
+function activeResultViewerIsStable() {
+  if (state.activePage !== "result") return false;
+  const params = new URLSearchParams(window.location.search);
+  const jobId = params.get("job") || state.selectedJobId;
+  const job = getJob(jobId);
+  const plyAsset = job ? getRenderablePlyAsset(job) : null;
+  if (!plyAsset?.viewerUrl) return false;
+  if (state.renderMode === "image") return false;
+  const frame = document.querySelector(".result-surface iframe.viewer-frame");
+  return Boolean(frame && sameResolvedUrl(frame.getAttribute("src"), plyAsset.viewerUrl));
+}
+
+function shouldPausePollingForResultViewer() {
+  if (state.activePage !== "result") return false;
+  if (state.renderMode === "image") return false;
+  return Boolean(document.querySelector(".result-surface iframe.viewer-frame"));
 }
 
 function resultTypeLabel(asset = {}) {
@@ -2991,12 +3020,14 @@ function openJobCleanupConfirmModal({ mode, statuses = [], job = null }) {
 
 async function poll() {
   try {
+    if (shouldPausePollingForResultViewer()) return;
     await refreshJobs();
     if (state.selectedJobId) {
       await loadLog(false);
     }
     const editing = document.activeElement?.matches?.("input, textarea, select");
     if (!editing && ["overview", "algorithm", "result", "analysis"].includes(state.activePage)) {
+      if (activeResultViewerIsStable()) return;
       const scrollY = window.scrollY;
       const workspaceFrame = document.querySelector('.workspace-frame');
       const frameScrollY = workspaceFrame ? workspaceFrame.scrollTop : 0;

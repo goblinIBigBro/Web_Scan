@@ -1743,17 +1743,26 @@ def path_mtime(path: Path) -> float:
     return 0.0
 
 
-def compgs_result_candidate_dirs(directory: Path, family: str | None = None) -> list[Path]:
+def result_candidate_dirs(directory: Path, family: str | None = None) -> list[Path]:
   family = str(family or "").strip()
-  if family != "compgs" or not directory.is_dir():
+  if not directory.is_dir():
+    return [directory]
+
+  if family not in {"compgs", "gaussian-splatting-lightning"}:
     return [directory]
 
   nested: list[Path] = []
-  result_markers = ("point_cloud", "eval", "eval_training", "Log")
+  if family == "compgs":
+    result_markers = ("point_cloud", "eval", "eval_training", "Log")
+    excluded = {"config"}
+  else:
+    result_markers = ("point_cloud", "checkpoints", "test", "train")
+    excluded = set()
+
   for child in directory.iterdir():
     if not child.is_dir() or child.name.startswith("."):
       continue
-    if child.name in RESULT_SCAN_EXCLUDED_DIRS or child.name == "config":
+    if child.name in RESULT_SCAN_EXCLUDED_DIRS or child.name in excluded:
       continue
     if any((child / marker).exists() for marker in result_markers):
       nested.append(child)
@@ -1853,7 +1862,7 @@ def find_result_ply(directory: Path, family: str | None = None) -> Path | None:
     names = ["point_cloud_quantised_half.ply", "point_cloud_quantised.ply", "point_cloud.ply", "latest.ply", "scene.ply"]
 
   if directory.is_dir():
-    for candidate_dir in compgs_result_candidate_dirs(directory, family):
+    for candidate_dir in result_candidate_dirs(directory, family):
       result = find_result_ply_in_directory(candidate_dir, names, family)
       if result:
         return result
@@ -1913,7 +1922,7 @@ def find_result_images(directory: Path, family: str | None = None) -> list[Path]
   patterns = result_image_patterns_for_family(family)
   candidates: list[Path] = []
 
-  for candidate_dir in compgs_result_candidate_dirs(directory, family):
+  for candidate_dir in result_candidate_dirs(directory, family):
     candidates.extend(candidate_dir / f"latest{suffix}" for suffix in IMAGE_EXTENSIONS)
     for pattern in patterns:
       candidates.extend(path for path in candidate_dir.glob(pattern) if is_image_file(path))

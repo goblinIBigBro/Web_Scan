@@ -560,6 +560,29 @@ def test_gaussian_splatting_lightning_prefers_exported_gaussian_ply() -> None:
       shutil.rmtree(target_dir)
 
 
+def test_gaussian_splatting_lightning_finds_nested_existing_dataset_output() -> None:
+  target_dir = Path(api_server.WEB_DIR) / "generated" / "download_tests" / f"gspl-nested-{uuid.uuid4().hex[:8]}"
+  try:
+    nested_dir = target_dir / "contextgs_test1_dataset-preview-preview-_workspace"
+    exported_ply = nested_dir / "point_cloud" / "iteration_30000" / "point_cloud.ply"
+    write_gaussian_sh_ply(exported_ply)
+
+    payload = api_server.load_result_path(
+      str(target_dir),
+      family="gaussian-splatting-lightning",
+      representation="sh",
+    )
+    assert payload["ok"] is True
+    assert payload["resolved_path"] == str(exported_ply.resolve())
+    assert payload["render_format"] == "gaussian-sh"
+    assert payload["point_cloud_url"].endswith(
+      "/contextgs_test1_dataset-preview-preview-_workspace/point_cloud/iteration_30000/point_cloud.ply"
+    )
+  finally:
+    if target_dir.exists():
+      shutil.rmtree(target_dir)
+
+
 def test_gaussian_splatting_lightning_uses_rgb_checkpoint_ply_as_fallback() -> None:
   target_dir = Path(api_server.WEB_DIR) / "generated" / "download_tests" / f"gspl-rgb-fallback-{uuid.uuid4().hex[:8]}"
   try:
@@ -866,6 +889,7 @@ def main() -> None:
   test_gaussian_splatting_lightning_train_exports_ply()
   test_ply_header_classifier_selects_viewer_format()
   test_gaussian_splatting_lightning_prefers_exported_gaussian_ply()
+  test_gaussian_splatting_lightning_finds_nested_existing_dataset_output()
   test_gaussian_splatting_lightning_uses_rgb_checkpoint_ply_as_fallback()
   test_result_download_validation_allows_completed_only()
   test_result_download_remote_identity_requires_original_server()

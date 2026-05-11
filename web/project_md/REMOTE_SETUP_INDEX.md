@@ -89,6 +89,7 @@ bash remote_verify_setup.sh
 
 # 或手动指定版本
 bash remote_verify_setup.sh new   # 新版（Python 3.10 + PyTorch 2.2）
+bash remote_verify_setup.sh hac-plus-plus   # HAC++（Python 3.10 + PyTorch 2.2 + CUDA 12.1 + RTX 4090）
 bash remote_verify_setup.sh contextgs   # ContextGS（Python 3.10 + PyTorch 2.2 + CUDA 12.1 + RTX 4090）
 bash remote_verify_setup.sh compgs   # CompGS（Python 3.10 + PyTorch 2.2 + CUDA 12.1 + RTX 4090）
 bash remote_verify_setup.sh reduced-3dgs   # reduced-3dgs（Python 3.10 + PyTorch 2.2 + CUDA 12.1 + RTX 4090）
@@ -288,7 +289,8 @@ python train.py -s /workspace/data/scene -m /output/result --iterations 30000 --
 - [ ] reduced-3dgs 运行 `bash remote_verify_setup.sh reduced-3dgs`
 - [ ] MEGS-2 运行 `bash remote_verify_setup.sh megs2`
 - [ ] Gaussian Splatting Lightning 运行 `bash remote_verify_setup.sh gaussian-splatting-lightning`
-- [ ] HAC-plus/FCGS 运行 `bash remote_verify_setup.sh new`
+- [ ] HAC-plus 运行 `bash remote_verify_setup.sh hac-plus-plus`
+- [ ] FCGS 运行 `bash remote_verify_setup.sh new`
 - [ ] 旧版算法运行 `bash remote_verify_setup.sh old`
 - [ ] 所有检查项显示 ✓ PASS
 

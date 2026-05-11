@@ -321,6 +321,31 @@
       "repo_path": "../HAC-plus-main",
       "repo_url": "https://github.com/YihangChen-ee/HAC-plus",
       "default_cwd": "../HAC-plus-main",
+      "requirements": {
+        "python_modules": [
+          "torch",
+          "torchvision",
+          "diff_gaussian_rasterization",
+          "simple_knn",
+          "_gridencoder",
+          "arithmetic",
+          "torch_scatter",
+          "lpips",
+          "plyfile",
+          "einops",
+          "cv2"
+        ],
+        "install_commands": {
+          "cuda121": [
+            "conda create -y -n HAC_env python=3.10 pip",
+            "conda activate HAC_env",
+            "conda install -y -c pytorch -c nvidia -c conda-forge pytorch==2.2.2 torchvision==0.17.2 torchaudio==2.2.2 pytorch-cuda=12.1 numpy=1.26.* scipy pillow=10.* plyfile=1.1.* tqdm",
+            "python -m pip install einops wandb==0.16.4 lpips colorama opencv-python imageio matplotlib",
+            "python -m pip install torch-scatter -f https://data.pyg.org/whl/torch-2.2.0+cu121.html",
+            "TORCH_CUDA_ARCH_LIST=8.9 CUDA_HOME=/usr/local/cuda-12.1 python -m pip install --no-build-isolation submodules/arithmetic submodules/diff-gaussian-rasterization submodules/simple-knn submodules/gridencoder"
+          ]
+        }
+      },
       "operations": {
         "train": {
           "enabled": true,
@@ -328,7 +353,7 @@
         },
         "render": {
           "enabled": true,
-          "template": "python render.py -m {output_dir}"
+          "template": "python render.py -s {workspace} -m {output_dir}"
         },
         "process_frame": {
           "enabled": true,

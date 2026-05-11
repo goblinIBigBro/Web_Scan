@@ -560,6 +560,13 @@ function createWorker(self) {
                 },
             },
         );
+        const getOptional = (name, fallback = 0) => {
+            if (!types[name]) return fallback;
+            return dataView[types[name]](
+                row * row_offset + offsets[name],
+                true,
+            );
+        };
 
         console.time("calculate importance");
         let sizeList = new Float32Array(vertexCount);
@@ -650,9 +657,9 @@ function createWorker(self) {
                 rgba[1] = (0.5 + SH_C0 * attrs.f_dc_1) * 255;
                 rgba[2] = (0.5 + SH_C0 * attrs.f_dc_2) * 255;
             } else {
-                rgba[0] = attrs.red || 255;
-                rgba[1] = attrs.green || 255;
-                rgba[2] = attrs.blue || 255;
+                rgba[0] = getOptional("red", getOptional("r", 220));
+                rgba[1] = getOptional("green", getOptional("g", 220));
+                rgba[2] = getOptional("blue", getOptional("b", 220));
             }
 
             // Set opacity in alpha channel

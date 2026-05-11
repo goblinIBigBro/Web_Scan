@@ -38,6 +38,7 @@ const MODEL_EXTENSIONS = new Set([".ply"]);
 const RENDER_FORMAT_LABELS = {
   "gaussian-sh": "Gaussian SH PLY",
   "gaussian-sg": "Spherical Gaussian PLY",
+  "anchor-gaussian": "Anchor Gaussian PLY",
   "rgb-point-cloud": "RGB Point Cloud",
   "unknown-ply": "PLY 3D Model",
 };
@@ -1658,6 +1659,8 @@ function renderResultSurface(asset, options = {}) {
     const modelLabel = classified.type === "manifest" ? "Scene Manifest" : classified.renderLabel || "PLY 3D Model";
     const modelHint = classified.renderFormat === "rgb-point-cloud"
       ? "Displayed as an RGB point cloud."
+      : classified.renderFormat === "anchor-gaussian"
+        ? "Displayed as anchor Gaussian geometry."
       : "Use the 3D viewer controls to rotate and zoom.";
     if (!classified.viewerUrl) {
       return `

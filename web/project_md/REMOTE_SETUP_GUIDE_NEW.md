@@ -37,7 +37,7 @@ python3 -c "import plyfile, lpips, einops, numpy, tqdm; print('✓ All deps foun
 ```bash
 # HAC-plus
 cd ~/Web_Scan/HAC-plus-main
-conda env create --file environment.yml
+bash setup_env.sh
 conda activate HAC_env
 
 # Gaussian Splatting Lightning（RTX 4090 推荐 CUDA 12.1）
@@ -134,7 +134,9 @@ cd ..
 
 **Gaussian Splatting Lightning 注意**：基础链路需要 `diff-gaussian-rasterization`、`simple-knn` 和 `gsplat`。`setup_env.sh` 会优先使用本地 `submodules` 源码，缺失时从 pinned git URL 拉取并用 `CUDA_HOME=/usr/local/cuda-12.1 TORCH_CUDA_ARCH_LIST=8.9` 编译。SAM、2DGS、Taming 3DGS、PyTorch3D、tiny-cuda-nn 仍是可选功能，不纳入基础验证。
 
-**常见问题**：如果子模块中的 `simple-knn` 或 `diff-gaussian-rasterization` 编译失败，参考 [故障排除](#️-故障排除) 章节。
+**HAC-plus 注意**：`setup_env.sh` 会解压并编译 `arithmetic`、`diff-gaussian-rasterization`、`simple-knn` 和 `gridencoder`。HAC++ 的 Web 3D 查看使用 `point_cloud/iteration_<max>/point_cloud.ply`；压缩大小优先参考 `bitstreams/`；`checkpoint.pth` 默认不需要回传。
+
+**常见问题**：如果子模块中的 `simple-knn`、`diff-gaussian-rasterization`、`arithmetic` 或 `gridencoder` 编译失败，参考 [故障排除](#️-故障排除) 章节。
 
 ---
 
@@ -144,7 +146,7 @@ cd ..
 
 ```bash
 # HAC-plus
-python diagnose.py
+bash ../web/tools/remote_verify_setup.sh hac-plus-plus
 
 # 或 FCGS
 python FCGS-main/diagnose.py
@@ -658,7 +660,7 @@ pip install git+https://github.com/richzhang/PerceptualSimilarity.git
 ## 📞 联系与支持
 
 - **文档位置**：[web/project_md/REMOTE_SETUP_GUIDE_NEW.md](../REMOTE_SETUP_GUIDE_NEW.md)
-- **诊断工具**：`python diagnose.py` (HAC-plus / FCGS)、`bash web/tools/remote_verify_setup.sh contextgs` (ContextGS)、`bash web/tools/remote_verify_setup.sh compgs` (CompGS)、`bash web/tools/remote_verify_setup.sh reduced-3dgs` (reduced-3dgs)、`bash web/tools/remote_verify_setup.sh megs2` (MEGS-2) 或 `bash web/tools/remote_verify_setup.sh gaussian-splatting-lightning` (GSL)
+- **诊断工具**：`bash web/tools/remote_verify_setup.sh hac-plus-plus` (HAC++)、`python diagnose.py` (FCGS)、`bash web/tools/remote_verify_setup.sh contextgs` (ContextGS)、`bash web/tools/remote_verify_setup.sh compgs` (CompGS)、`bash web/tools/remote_verify_setup.sh reduced-3dgs` (reduced-3dgs)、`bash web/tools/remote_verify_setup.sh megs2` (MEGS-2) 或 `bash web/tools/remote_verify_setup.sh gaussian-splatting-lightning` (GSL)
 - **问题报告**：记录 `diagnose.py` 的输出，提交至项目 Issue
 
 ---

@@ -371,6 +371,28 @@ def write_rgb_point_cloud_ply(path: Path) -> None:
   ])
 
 
+def write_anchor_gaussian_ply(path: Path) -> None:
+  write_ply(path, [
+    ("float", "x"),
+    ("float", "y"),
+    ("float", "z"),
+    ("float", "nx"),
+    ("float", "ny"),
+    ("float", "nz"),
+    ("float", "f_offset_0"),
+    ("float", "f_mask_0"),
+    ("float", "f_anchor_feat_0"),
+    ("float", "opacity"),
+    ("float", "scale_0"),
+    ("float", "scale_1"),
+    ("float", "scale_2"),
+    ("float", "rot_0"),
+    ("float", "rot_1"),
+    ("float", "rot_2"),
+    ("float", "rot_3"),
+  ])
+
+
 def test_remote_download_uses_temp_file_and_reports_progress() -> None:
   target_dir = Path(api_server.WEB_DIR) / "generated" / "download_tests" / f"download-{uuid.uuid4().hex[:8]}"
   try:
@@ -508,17 +530,21 @@ def test_ply_header_classifier_selects_viewer_format() -> None:
     sh_path = target_dir / "sh.ply"
     sg_path = target_dir / "sg.ply"
     rgb_path = target_dir / "rgb.ply"
+    anchor_path = target_dir / "anchor.ply"
     write_gaussian_sh_ply(sh_path)
     write_sg_ply(sg_path)
     write_rgb_point_cloud_ply(rgb_path)
+    write_anchor_gaussian_ply(anchor_path)
 
     assert api_server.classify_ply_render_format(sh_path) == "gaussian-sh"
     assert api_server.classify_ply_render_format(sg_path) == "gaussian-sg"
     assert api_server.classify_ply_render_format(rgb_path) == "rgb-point-cloud"
+    assert api_server.classify_ply_render_format(anchor_path) == "anchor-gaussian"
 
     sh_payload = api_server.result_payload_for_ply(sh_path, family="gaussian-splatting-lightning", representation="sg")
     sg_payload = api_server.result_payload_for_ply(sg_path, family="megs2", representation="sh")
     rgb_payload = api_server.result_payload_for_ply(rgb_path, family="gaussian-splatting-lightning", representation="sg")
+    anchor_payload = api_server.result_payload_for_ply(anchor_path, family="contextgs", representation="sh")
 
     assert sh_payload["render_format"] == "gaussian-sh"
     assert sh_payload["representation"] == "sh"
@@ -529,6 +555,9 @@ def test_ply_header_classifier_selects_viewer_format() -> None:
     assert rgb_payload["render_format"] == "rgb-point-cloud"
     assert rgb_payload["render_label"] == "RGB Point Cloud"
     assert "/web/viewers/sh.html" in rgb_payload["viewer_url"]
+    assert anchor_payload["render_format"] == "anchor-gaussian"
+    assert anchor_payload["render_label"] == "Anchor Gaussian PLY"
+    assert "/web/viewers/sh.html" in anchor_payload["viewer_url"]
   finally:
     if target_dir.exists():
       shutil.rmtree(target_dir)

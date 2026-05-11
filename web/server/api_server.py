@@ -75,6 +75,7 @@ ARTIFACT_RESULT_FIELDS = (
   "render_format",
   "render_label",
   "viewer_renderer",
+  "hac_plus",
 )
 REMOTE_RESULT_IDENTITY_FIELDS = ("host", "port", "username", "output_root")
 
@@ -85,6 +86,7 @@ PLY_HEADER_READ_BYTES = 256 * 1024
 PLY_RENDER_LABELS = {
   "gaussian-sh": "Gaussian SH PLY",
   "gaussian-sg": "Spherical Gaussian PLY",
+  "anchor-gaussian": "Anchor Gaussian PLY",
   "rgb-point-cloud": "RGB Point Cloud",
   "unknown-ply": "PLY 3D Model",
 }
@@ -967,6 +969,23 @@ ALGORITHM_CUDA_CHECK_SPECS: Dict[str, Dict[str, Any]] = {
       ("cv2", "opencv-python"),
     ],
   },
+  "hac-plus-plus": {
+    "label": "HAC++",
+    "root": ROOT_DIR / "HAC-plus-main",
+    "env_name": "HAC_env",
+    "required_modules": [
+      ("torchvision", "torchvision"),
+      ("diff_gaussian_rasterization", "diff_gaussian_rasterization"),
+      ("simple_knn", "simple_knn"),
+      ("_gridencoder", "gridencoder"),
+      ("arithmetic", "arithmetic"),
+      ("torch_scatter", "torch_scatter"),
+      ("lpips", "lpips"),
+      ("plyfile", "plyfile"),
+      ("einops", "einops"),
+      ("cv2", "opencv-python"),
+    ],
+  },
   "compgs": {
     "label": "CompGS",
     "root": ROOT_DIR / "CompGS-main",
@@ -1346,7 +1365,7 @@ def viewer_renderer_for_format(render_format: str | None = None, representation:
   normalized_format = str(render_format or "").strip().lower()
   if normalized_format == "gaussian-sg":
     return "sg"
-  if normalized_format in {"gaussian-sh", "rgb-point-cloud"}:
+  if normalized_format in {"gaussian-sh", "anchor-gaussian", "rgb-point-cloud"}:
     return "sh"
   return "sg" if (representation or "").lower() == "sg" else "sh"
 
@@ -1699,6 +1718,19 @@ def classify_ply_render_format(path: Path) -> str:
   if has_gaussian_sh:
     return "gaussian-sh"
 
+  has_anchor_gaussian = (
+    {"x", "y", "z", "opacity"}.issubset(properties)
+    and any(name.startswith("scale_") for name in properties)
+    and any(name.startswith("rot_") for name in properties)
+    and (
+      any(name.startswith("f_anchor_feat_") for name in properties)
+      or any(name.startswith("f_offset_") for name in properties)
+      or any(name.startswith("f_mask_") for name in properties)
+    )
+  )
+  if has_anchor_gaussian:
+    return "anchor-gaussian"
+
   has_xyz = {"x", "y", "z"}.issubset(properties)
   has_rgb = {"red", "green", "blue"}.issubset(properties) or {"r", "g", "b"}.issubset(properties)
   if has_xyz and has_rgb:
@@ -1715,7 +1747,7 @@ def representation_for_ply_format(render_format: str | None, fallback: str | Non
   normalized = str(render_format or "").strip().lower()
   if normalized == "gaussian-sg":
     return "sg"
-  if normalized in {"gaussian-sh", "rgb-point-cloud"}:
+  if normalized in {"gaussian-sh", "anchor-gaussian", "rgb-point-cloud"}:
     return "sh"
   return str(fallback or "sh")
 
@@ -1748,16 +1780,19 @@ def result_candidate_dirs(directory: Path, family: str | None = None) -> list[Pa
   if not directory.is_dir():
     return [directory]
 
-  if family not in {"compgs", "gaussian-splatting-lightning"}:
+  if family not in {"compgs", "gaussian-splatting-lightning", "hac-plus-plus"}:
     return [directory]
 
   nested: list[Path] = []
   if family == "compgs":
     result_markers = ("point_cloud", "eval", "eval_training", "Log")
     excluded = {"config"}
-  else:
+  elif family == "gaussian-splatting-lightning":
     result_markers = ("point_cloud", "checkpoints", "test", "train")
     excluded = set()
+  else:
+    result_markers = ("point_cloud", "bitstreams", "test", "train", "results.json", "per_view.json", "outputs.log")
+    excluded = {"config"}
 
   for child in directory.iterdir():
     if not child.is_dir() or child.name.startswith("."):
@@ -1797,7 +1832,7 @@ def direct_ply_candidates(directory: Path, names: list[str] | None = None) -> li
 def result_ply_candidate_score(path: Path) -> int:
   render_format = classify_ply_render_format(path)
   score = 0
-  if render_format in {"gaussian-sh", "gaussian-sg"}:
+  if render_format in {"gaussian-sh", "gaussian-sg", "anchor-gaussian"}:
     score += 1000
   elif render_format == "rgb-point-cloud":
     score += 100
@@ -1877,6 +1912,78 @@ def find_result_manifest(directory: Path) -> Path | None:
     return None
   candidate = directory / "scene_manifest.json"
   return candidate if candidate.exists() and candidate.is_file() else None
+
+
+def directory_size_bytes(directory: Path) -> int:
+  if not directory.exists() or not directory.is_dir():
+    return 0
+  total = 0
+  for path in directory.rglob("*"):
+    if not path.is_file():
+      continue
+    try:
+      total += path.stat().st_size
+    except OSError:
+      continue
+  return total
+
+
+def hac_plus_output_metadata(directory: Path, family: str | None = None) -> Dict[str, Any]:
+  if str(family or "").strip() != "hac-plus-plus" or not directory.is_dir():
+    return {}
+
+  candidate_dirs = result_candidate_dirs(directory, family)
+  bitstream_dir = next((candidate / "bitstreams" for candidate in candidate_dirs if (candidate / "bitstreams").is_dir()), None)
+  latest_ply = find_result_ply(directory, family)
+  render_images = find_result_images(directory, family)
+
+  metrics_files: Dict[str, str] = {}
+  for name in ("results.json", "per_view.json", "outputs.log"):
+    match = next((candidate / name for candidate in candidate_dirs if (candidate / name).is_file()), None)
+    if match:
+      metrics_files[name] = str(match.resolve())
+
+  metadata: Dict[str, Any] = {
+    "viewer_source": "point_cloud_ply" if latest_ply else ("render_images" if render_images else ""),
+    "has_point_cloud_ply": bool(latest_ply),
+    "point_cloud_ply": str(latest_ply.resolve()) if latest_ply else "",
+    "has_bitstreams": bool(bitstream_dir),
+    "bitstreams_dir": str(bitstream_dir.resolve()) if bitstream_dir else "",
+    "bitstreams_size_bytes": directory_size_bytes(bitstream_dir) if bitstream_dir else 0,
+    "render_image_count": len(render_images),
+    "metrics_files": metrics_files,
+  }
+  return metadata
+
+
+def attach_hac_plus_metadata(payload: Dict[str, Any], directory: Path, family: str | None = None) -> Dict[str, Any]:
+  metadata = hac_plus_output_metadata(directory, family)
+  if metadata:
+    payload["hac_plus"] = metadata
+  return payload
+
+
+def hac_plus_failure_reason(directory: Path, family: str | None = None) -> str:
+  if str(family or "").strip() != "hac-plus-plus" or not directory.is_dir():
+    return ""
+  log_candidates = [
+    directory / "outputs.log",
+    directory / "output.log",
+    directory / ".wgsc_job" / "runtime.log",
+  ]
+  for path in log_candidates:
+    if not path.is_file():
+      continue
+    try:
+      text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+      continue
+    if "only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported" in text:
+      return (
+        "HAC++ requires an undistorted COLMAP dataset using PINHOLE or SIMPLE_PINHOLE cameras. "
+        "This run did not produce a loadable PLY because the source camera model is unsupported."
+      )
+  return ""
 
 
 def result_image_patterns_for_family(family: str | None = None) -> list[str]:
@@ -2106,25 +2213,33 @@ def load_result_path(path_value: str, family: str | None = None, representation:
 
   ply_path = find_result_ply(resolved, resolved_family)
   if ply_path:
-    return attach_render_images(
+    payload = attach_render_images(
       result_payload_for_ply(ply_path, family=resolved_family, representation=resolved_representation),
       render_image_paths,
     )
+    return attach_hac_plus_metadata(payload, resolved, resolved_family)
 
   manifest_path = find_result_manifest(resolved)
   if manifest_path:
-    return attach_render_images(
+    payload = attach_render_images(
       result_payload_for_manifest(manifest_path, family=resolved_family, representation=resolved_representation),
       render_image_paths,
     )
+    return attach_hac_plus_metadata(payload, resolved, resolved_family)
 
   if render_image_paths:
-    return attach_render_images(
+    payload = attach_render_images(
       result_payload_for_image(render_image_paths[0], family=resolved_family),
       render_image_paths,
     )
+    return attach_hac_plus_metadata(payload, resolved, resolved_family)
 
   reason = "No supported PLY, scene manifest, or rendered image was found in this result directory."
+  hac_failure_reason = hac_plus_failure_reason(resolved, resolved_family)
+  if hac_failure_reason:
+    reason = hac_failure_reason
+  elif resolved_family == "hac-plus-plus" and hac_plus_output_metadata(resolved, resolved_family).get("has_bitstreams"):
+    reason = "HAC++ bitstreams were found, but no point_cloud/iteration_*/point_cloud.ply or rendered images were found for Web preview."
   if resolved_family == "fcgs" and looks_like_fcgs_bitstream_dir(resolved):
     reason = "FCGS bitstreams were found, but no decoded PLY exists yet. Decode to point_cloud.ply, latest.ply, or scene.ply first."
   return {

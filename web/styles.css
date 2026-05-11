@@ -472,16 +472,33 @@ pre {
 }
 
 .metric {
+  min-width: 0;
   padding: 16px;
   border: 1px solid rgba(112, 155, 255, 0.14);
   border-radius: 16px;
   background: rgba(7, 19, 38, 0.7);
+  overflow: hidden;
 }
 
 .metric strong {
   display: block;
   margin-top: 8px;
   font-size: 28px;
+  line-height: 1.1;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  font-variant-numeric: tabular-nums;
+}
+
+.analysis-metric strong {
+  font-size: 24px;
+}
+
+.analysis-metric .panel-copy {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .status-dot {
@@ -909,11 +926,28 @@ td {
   color: var(--soft);
   font-size: 13px;
   vertical-align: middle;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 th {
   color: var(--muted);
   font-weight: 600;
+}
+
+.analysis-table {
+  min-width: 640px;
+}
+
+.analysis-table td:not(:first-child) {
+  font-variant-numeric: tabular-nums;
+  max-width: 140px;
+}
+
+.analysis-summary-row td {
+  color: #f2f7ff;
+  font-weight: 800;
+  background: rgba(47, 125, 255, 0.08);
 }
 
 .job-table .panel-copy {

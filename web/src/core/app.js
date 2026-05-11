@@ -42,6 +42,12 @@ const RENDER_FORMAT_LABELS = {
   "rgb-point-cloud": "RGB Point Cloud",
   "unknown-ply": "PLY 3D Model",
 };
+const ANALYSIS_METRICS = [
+  { key: "psnr", field: "psnr", label: "PSNR(dB)" },
+  { key: "ssim", field: "ssim", label: "SSIM" },
+  { key: "sizeMb", field: "size_mb", label: "Size(MB)", staticSummary: true },
+  { key: "renderFps", field: "render_fps", label: "Render(FPS)", staticSummary: true },
+];
 
 const NAV_ITEMS = [
   { id: "overview", label: "Overview" },
@@ -357,6 +363,183 @@ function formatBytes(bytes) {
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
   if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
   return `${(value / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+function metricPathId(path) {
+  return String(path || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function metricHasToken(path, token) {
+  return new RegExp(`(^|[^a-z0-9])${token}([^a-z0-9]|$)`, "i").test(String(path || ""));
+}
+
+function flattenMetricEntries(source, prefix = "", entries = [], depth = 0) {
+  if (source == null || depth > 6) return entries;
+  if (Array.isArray(source)) {
+    source.forEach((item) => flattenMetricEntries(item, prefix, entries, depth + 1));
+    return entries;
+  }
+  if (typeof source === "object") {
+    Object.entries(source).forEach(([key, value]) => {
+      const path = prefix ? `${prefix}.${key}` : key;
+      flattenMetricEntries(value, path, entries, depth + 1);
+    });
+    return entries;
+  }
+  entries.push({ path: prefix, value: source });
+  return entries;
+}
+
+function parseMetricNumber(value) {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  const text = String(value ?? "").replace(/,/g, "").trim();
+  if (!text) return null;
+  const match = text.match(/[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[-+]?\d+)?/i);
+  if (!match) return null;
+  const number = Number(match[0]);
+  return Number.isFinite(number) ? number : null;
+}
+
+function parseSizeMb(value, path = "") {
+  const text = String(value ?? "").replace(/,/g, "").trim();
+  const unitMatch = text.match(/([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[-+]?\d+)?)\s*(b|bytes?|kb|kib|mb|mib|gb|gib)\b/i);
+  if (unitMatch) {
+    const number = Number(unitMatch[1]);
+    const unit = unitMatch[2].toLowerCase();
+    if (!Number.isFinite(number)) return null;
+    if (unit === "b" || unit.startsWith("byte")) return number / 1024 / 1024;
+    if (unit === "kb" || unit === "kib") return number / 1024;
+    if (unit === "gb" || unit === "gib") return number * 1024;
+    return number;
+  }
+
+  const number = parseMetricNumber(value);
+  if (number == null) return null;
+  const id = metricPathId(path);
+  if (id.includes("bytes") || id.endsWith("byte") || id.includes("filesize")) return number / 1024 / 1024;
+  if (id.includes("gb") || id.includes("gib")) return number * 1024;
+  if (id.includes("kb") || id.includes("kib")) return number / 1024;
+  if (number > 1024 * 1024 && (id.includes("size") || id.includes("file") || id.includes("byte"))) {
+    return number / 1024 / 1024;
+  }
+  return number;
+}
+
+function analysisMetricScore(path, key) {
+  const id = metricPathId(path);
+  if (!id) return 0;
+  if (key === "psnr") return metricHasToken(path, "psnr") || id.includes("psnrdb") ? 100 : 0;
+  if (key === "ssim") {
+    if (metricHasToken(path, "ssim")) return 100;
+    if (id.endsWith("ssim") && !id.includes("msssim")) return 70;
+    return 0;
+  }
+  if (key === "sizeMb") {
+    const isComponentSize = /(feat|feature|offset|opacity|scaling|rotation|mask|anchor)/.test(id);
+    if (["ttlsizemb", "totalsizemb", "totalmodelsize", "totalmodelsizeinmb"].includes(id)) return 140;
+    if ((id.includes("totalsize") || id.includes("ttlsize")) && id.includes("mb") && !isComponentSize) return 135;
+    if (["sizemb", "sizeinmb", "modelmb", "modelsizeinmb"].includes(id)) return 120;
+    if (id.includes("sizemb") || id.includes("modelsize") || id.includes("compressedsize")) return 110;
+    if (id.includes("bitstream") && id.includes("size")) return 105;
+    if ((id.includes("filesize") || id.includes("storagesize") || id.includes("disksize")) && !id.includes("image")) return 95;
+    if (isComponentSize && id.includes("size")) return 50;
+    if (id.includes("size") && /(mb|mib|byte|bytes|gb|gib|kb|kib|ply|checkpoint|ckpt|model|storage|disk|result|pointcloud)/.test(id)) return 75;
+    return 0;
+  }
+  if (key === "renderFps") {
+    if (id.includes("renderfps") || id.includes("renderingfps") || id.includes("viewerfps") || id.includes("fpsrender")) return 120;
+    if (id.includes("fps") && /(render|viewer|display|raster|frame)/.test(id)) return 95;
+    if (id === "fps") return 45;
+    if (id.endsWith("fps") && !/(algo|train|training)/.test(id)) return 35;
+    return 0;
+  }
+  return 0;
+}
+
+function extractAnalysisMetric(source, key) {
+  const entries = flattenMetricEntries(source).filter((entry) => {
+    const text = String(entry.value ?? "").trim();
+    return text && text !== "-";
+  });
+  let bestScore = 0;
+  let bestEntries = [];
+  entries.forEach((entry) => {
+    const score = analysisMetricScore(entry.path, key);
+    if (!score) return;
+    if (score > bestScore) {
+      bestScore = score;
+      bestEntries = [entry];
+    } else if (score === bestScore) {
+      bestEntries.push(entry);
+    }
+  });
+  if (!bestEntries.length) return { value: "", raw: "", source: "" };
+
+  const numbers = bestEntries
+    .map((entry) => key === "sizeMb" ? parseSizeMb(entry.value, entry.path) : parseMetricNumber(entry.value))
+    .filter((value) => Number.isFinite(value));
+  if (numbers.length) {
+    return {
+      value: numbers.reduce((total, value) => total + value, 0) / numbers.length,
+      raw: bestEntries.map((entry) => entry.value).join(", "),
+      source: bestEntries[0].path,
+    };
+  }
+  return { value: bestEntries[0].value, raw: bestEntries[0].value, source: bestEntries[0].path };
+}
+
+function formatAnalysisNumber(value, key) {
+  if (value == null || value === "") return "-";
+  const number = Number(value);
+  if (!Number.isFinite(number)) return summarize(value, 32);
+  const digits = key === "ssim" ? 4 : key === "renderFps" ? 1 : number >= 100 ? 1 : 2;
+  return number.toFixed(digits).replace(/\.?0+$/, "");
+}
+
+function latestMetricsRow(rows = []) {
+  if (!rows.length) return {};
+  const firstTime = Date.parse(rows[0]?.timestamp || "");
+  const lastTime = Date.parse(rows[rows.length - 1]?.timestamp || "");
+  const newestFirst = Number.isFinite(firstTime) && Number.isFinite(lastTime) && firstTime > lastTime;
+  const ordered = newestFirst ? rows : [...rows].reverse();
+  return ordered.find((row) => ANALYSIS_METRICS.some((metric) => extractAnalysisMetric(row, metric.key).value !== "")) || {};
+}
+
+function analysisMetricSource(job, rows = []) {
+  const latestRow = latestMetricsRow(rows);
+  const metrics = job?.metrics || {};
+  return {
+    ...job,
+    ...metrics,
+    analysis_metric_sources: job?.analysis_metric_sources || metrics.analysis_metric_sources || {},
+    sizeMb: metrics.size_mb ?? job?.size_mb,
+    renderFps: metrics.render_fps ?? job?.render_fps,
+    ...(latestRow || {}),
+  };
+}
+
+function analysisMetricItems(job, rows = []) {
+  const source = analysisMetricSource(job || {}, rows);
+  return ANALYSIS_METRICS.map((metric) => {
+    const extracted = extractAnalysisMetric(source, metric.key);
+    const sourceMap = source.analysis_metric_sources || {};
+    const mappedSource = sourceMap[metric.field] || sourceMap[metric.key] || extracted.source;
+    return {
+      ...metric,
+      value: formatAnalysisNumber(extracted.value, metric.key),
+      raw: extracted.raw,
+      numeric: Number(extracted.value),
+      source: mappedSource,
+    };
+  });
+}
+
+function hasAnalysisValue(item) {
+  return item.value !== "-";
+}
+
+function analysisSummaryItems(job, rows = []) {
+  return analysisMetricItems(job, rows);
 }
 
 function downloadInfo(job = {}) {
@@ -1708,12 +1891,13 @@ function renderResultSurface(asset, options = {}) {
 
 function renderAnalysisPage() {
   const job = getJob();
+  const metricItems = analysisSummaryItems(job, state.metricsRows);
   return `
     <section class="panel">
       <div class="panel-head">
         <div>
           <h2>Training Metrics Analysis</h2>
-          <p class="panel-copy">Parse metrics.csv and job metrics to show FPS, Loss, PSNR, SSIM, LPIPS, and Iter.</p>
+          <p class="panel-copy">Parse job data into PSNR(dB), SSIM, Size(MB), and Render(FPS).</p>
         </div>
         <button data-action="load-analysis" type="button" ${job ? "" : "disabled"}>Load Metrics</button>
       </div>
@@ -1724,40 +1908,53 @@ function renderAnalysisPage() {
             ${jobs.map((item) => `<option value="${escapeHtml(item.id)}" ${state.selectedJobId === item.id ? "selected" : ""}>${escapeHtml(item.algorithm_family || "-")} · ${escapeHtml(item.status || "-")} · ${escapeHtml(item.id.slice(0, 8))}</option>`).join("")}
           </select>
         </label>
-        <div class="metric-grid">
-          ${jobs.slice(0, 4).map((item) => `
-            <div class="metric">
-              <span class="muted">${escapeHtml(item.algorithm_family || "-")} · ${escapeHtml(item.status || "-")}</span>
-              <strong>${escapeHtml(item.metrics?.psnr || item.metrics?.fps || "-")}</strong>
-              <p class="panel-copy">PSNR/FPS · ${escapeHtml(item.id.slice(0, 8))}</p>
+        <div class="metric-grid analysis-metric-grid">
+          ${metricItems.map((item) => `
+            <div class="metric analysis-metric">
+              <span class="muted">${escapeHtml(item.label)}</span>
+              <strong title="${escapeHtml(item.raw || item.value)}">${escapeHtml(item.value)}</strong>
+              <p class="panel-copy">${escapeHtml(item.source || "No matching data")}</p>
             </div>
           `).join("") || `<p class="panel-copy">No jobs to compare yet.</p>`}
         </div>
         <canvas id="metrics-chart" class="chart"></canvas>
-        ${renderMetricsTable(state.metricsRows)}
+        ${renderMetricsTable(state.metricsRows, job)}
       </div>
     </section>
   `;
 }
 
-function renderMetricsTable(rows) {
-  if (!rows.length) return `<p class="panel-copy">No metrics yet. While running, use the log panel for live tail output; after completion, download metrics.csv.</p>`;
+function renderMetricsTable(rows, job) {
+  const summaryItems = analysisSummaryItems(job, rows);
+  const hasSummary = summaryItems.some(hasAnalysisValue);
+  if (!rows.length && !hasSummary) return `<p class="panel-copy">No metrics yet. While running, use the log panel for live tail output; after completion, download metrics.csv.</p>`;
   return `
     <div class="table-wrap">
-      <table>
-        <thead><tr><th>Time</th><th>Iter</th><th>Loss</th><th>PSNR</th><th>SSIM</th><th>LPIPS</th><th>FPS</th></tr></thead>
+      <table class="analysis-table">
+        <thead><tr><th>Time</th><th>PSNR(dB)</th><th>SSIM</th><th>Size(MB)</th><th>Render(FPS)</th></tr></thead>
         <tbody>
-          ${rows.slice(-80).reverse().map((row) => `
-            <tr>
-              <td>${escapeHtml(row.timestamp || "-")}</td>
-              <td>${escapeHtml(row.iter || "-")}</td>
-              <td>${escapeHtml(row.loss || "-")}</td>
-              <td>${escapeHtml(row.psnr || "-")}</td>
-              <td>${escapeHtml(row.ssim || "-")}</td>
-              <td>${escapeHtml(row.lpips || "-")}</td>
-              <td>${escapeHtml(row.fps || "-")}</td>
+          ${hasSummary ? `
+            <tr class="analysis-summary-row">
+              <td>Result Summary</td>
+              ${summaryItems.map((item) => `<td title="${escapeHtml(item.source || item.raw || item.value)}">${escapeHtml(item.value)}</td>`).join("")}
             </tr>
-          `).join("")}
+          ` : ""}
+          ${rows.slice(-80).reverse().map((row) => {
+            const items = analysisMetricItems(row, []);
+            const filledItems = items.map((item, index) => {
+              if (hasAnalysisValue(item)) return item;
+              const summary = summaryItems[index];
+              return item.staticSummary && summary && hasAnalysisValue(summary)
+                ? { ...summary, source: summary.source || "Result Summary" }
+                : item;
+            });
+            return `
+              <tr>
+                <td>${escapeHtml(row.timestamp || "-")}</td>
+                ${filledItems.map((item) => `<td title="${escapeHtml(item.source || item.raw || item.value)}">${escapeHtml(item.value)}</td>`).join("")}
+              </tr>
+            `;
+          }).join("")}
         </tbody>
       </table>
     </div>
@@ -2726,6 +2923,16 @@ async function loadAnalysisRows() {
   const job = getJob();
   if (!job) throw new Error("Select a job.");
   try {
+    const fresh = await fetchJob(state.apiBaseUrl, job.id);
+    if (fresh?.id) {
+      const index = jobs.findIndex((item) => item.id === fresh.id);
+      if (index >= 0) jobs[index] = fresh;
+      else jobs.unshift(fresh);
+    }
+  } catch {
+    // Metrics CSV can still be loaded when the job detail endpoint is temporarily unavailable.
+  }
+  try {
     const url = buildJobMetricsCsvUrl(state.apiBaseUrl, job.id);
     const response = await fetch(url);
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
@@ -2759,16 +2966,22 @@ function drawMetricsChart() {
   ctx.clearRect(0, 0, rect.width, 260);
   ctx.fillStyle = "#030913";
   ctx.fillRect(0, 0, rect.width, 260);
-  const rows = state.metricsRows.filter((row) => Number(row.psnr || row.loss || row.fps));
+  const rows = state.metricsRows
+    .map((row) => ({
+      row,
+      values: Object.fromEntries(ANALYSIS_METRICS.map((metric) => [metric.key, extractAnalysisMetric(row, metric.key).value])),
+    }))
+    .filter((item) => ANALYSIS_METRICS.some((metric) => Number.isFinite(Number(item.values[metric.key]))));
   if (!rows.length) {
     ctx.fillStyle = "#8ea4c5";
     ctx.fillText("No drawable metrics yet", 24, 38);
     return;
   }
   const series = [
-    { key: "psnr", color: "#2f7dff" },
-    { key: "loss", color: "#ff5570" },
-    { key: "fps", color: "#2be48f" },
+    { key: "psnr", label: "PSNR(dB)", color: "#2f7dff" },
+    { key: "ssim", label: "SSIM", color: "#ffb44c" },
+    { key: "sizeMb", label: "Size(MB)", color: "#ff5570" },
+    { key: "renderFps", label: "Render(FPS)", color: "#2be48f" },
   ];
   ctx.strokeStyle = "rgba(142,164,197,0.2)";
   for (let y = 40; y < 230; y += 38) {
@@ -2778,7 +2991,7 @@ function drawMetricsChart() {
     ctx.stroke();
   }
   series.forEach((serie, serieIndex) => {
-    const values = rows.map((row) => Number(row[serie.key])).filter((value) => Number.isFinite(value));
+    const values = rows.map((item) => Number(item.values[serie.key])).filter((value) => Number.isFinite(value));
     if (!values.length) return;
     const min = Math.min(...values);
     const max = Math.max(...values);
@@ -2786,8 +2999,8 @@ function drawMetricsChart() {
     ctx.strokeStyle = serie.color;
     ctx.lineWidth = 2;
     ctx.beginPath();
-    rows.forEach((row, index) => {
-      const value = Number(row[serie.key]);
+    rows.forEach((item, index) => {
+      const value = Number(item.values[serie.key]);
       if (!Number.isFinite(value)) return;
       const x = 42 + (index / Math.max(1, rows.length - 1)) * (rect.width - 70);
       const y = 220 - ((value - min) / span) * 170;
@@ -2796,7 +3009,7 @@ function drawMetricsChart() {
     });
     ctx.stroke();
     ctx.fillStyle = serie.color;
-    ctx.fillText(serie.key.toUpperCase(), 48 + serieIndex * 82, 24);
+    ctx.fillText(serie.label, 48 + serieIndex * 112, 24);
   });
 }
 

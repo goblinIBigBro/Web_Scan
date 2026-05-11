@@ -6,7 +6,9 @@ import base64
 import csv
 import importlib.util
 import json
+import math
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -75,6 +77,7 @@ ARTIFACT_RESULT_FIELDS = (
   "render_format",
   "render_label",
   "viewer_renderer",
+  "file_size",
   "hac_plus",
 )
 REMOTE_RESULT_IDENTITY_FIELDS = ("host", "port", "username", "output_root")
@@ -145,49 +148,313 @@ LOCAL_RESULT_PROJECTS = [
 ]
 
 
-def extract_job_metrics(text: str) -> Dict[str, Any]:
-  import re
+METRIC_NUMBER_PATTERN = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
 
+
+def _metric_number_text(value: float) -> str:
+  if not math.isfinite(value):
+    return ""
+  return f"{value:.12g}"
+
+
+def _coerce_metric_number(value: Any) -> float | None:
+  if isinstance(value, bool) or value is None:
+    return None
+  if isinstance(value, (int, float)):
+    number = float(value)
+    return number if math.isfinite(number) else None
+  match = re.search(METRIC_NUMBER_PATTERN, str(value).replace(",", ""))
+  if not match:
+    return None
+  try:
+    number = float(match.group(0))
+  except ValueError:
+    return None
+  return number if math.isfinite(number) else None
+
+
+def _size_unit_to_mb(number: float, unit: str) -> float:
+  normalized = unit.lower()
+  if normalized in {"b", "byte", "bytes"}:
+    return number / 1024 / 1024
+  if normalized in {"kb", "kib"}:
+    return number / 1024
+  if normalized in {"gb", "gib"}:
+    return number * 1024
+  return number
+
+
+def _coerce_size_mb(value: Any, key_path: str = "") -> float | None:
+  text = str(value or "").replace(",", "")
+  unit_match = re.search(
+    rf"({METRIC_NUMBER_PATTERN})\s*(b|bytes?|kb|kib|mb|mib|gb|gib)\b",
+    text,
+    flags=re.IGNORECASE,
+  )
+  if unit_match:
+    try:
+      return _size_unit_to_mb(float(unit_match.group(1)), unit_match.group(2))
+    except ValueError:
+      return None
+
+  number = _coerce_metric_number(value)
+  if number is None:
+    return None
+  key_id = re.sub(r"[^a-z0-9]+", "", key_path.lower())
+  if "bytes" in key_id or key_id.endswith("byte") or "filesize" in key_id:
+    return number / 1024 / 1024
+  if "gb" in key_id or "gib" in key_id:
+    return number * 1024
+  if "kb" in key_id or "kib" in key_id:
+    return number / 1024
+  if number > 1024 * 1024 and any(token in key_id for token in ("size", "file", "byte")):
+    return number / 1024 / 1024
+  return number
+
+
+def _flatten_metric_entries(payload: Any, prefix: str = "", depth: int = 0) -> list[tuple[str, Any]]:
+  if payload is None or depth > 6:
+    return []
+  if isinstance(payload, dict):
+    entries: list[tuple[str, Any]] = []
+    for key, value in payload.items():
+      path = f"{prefix}.{key}" if prefix else str(key)
+      entries.extend(_flatten_metric_entries(value, path, depth + 1))
+    return entries
+  if isinstance(payload, list):
+    entries: list[tuple[str, Any]] = []
+    for item in payload:
+      entries.extend(_flatten_metric_entries(item, prefix, depth + 1))
+    return entries
+  return [(prefix, payload)]
+
+
+def _metric_path_id(path: str) -> str:
+  return re.sub(r"[^a-z0-9]+", "", path.lower())
+
+
+def _metric_has_token(path: str, token: str) -> bool:
+  return bool(re.search(rf"(^|[^a-z0-9]){re.escape(token)}([^a-z0-9]|$)", path, flags=re.IGNORECASE))
+
+
+def _analysis_metric_score(path: str, key: str) -> int:
+  key_id = _metric_path_id(path)
+  if not key_id:
+    return 0
+  if key == "psnr":
+    return 100 if _metric_has_token(path, "psnr") or "psnrdb" in key_id else 0
+  if key == "ssim":
+    if _metric_has_token(path, "ssim"):
+      return 100
+    if key_id.endswith("ssim") and "msssim" not in key_id:
+      return 70
+    return 0
+  if key == "size_mb":
+    is_component_size = bool(re.search(r"feat|feature|offset|opacity|scaling|rotation|mask|anchor", key_id))
+    if key_id in {"ttlsizemb", "totalsizemb", "totalmodelsize", "totalmodelsizeinmb"}:
+      return 140
+    if ("totalsize" in key_id or "ttlsize" in key_id) and "mb" in key_id and not is_component_size:
+      return 135
+    if key_id in {"sizemb", "sizeinmb", "modelmb", "modelsizeinmb"}:
+      return 120
+    if any(token in key_id for token in ("sizemb", "modelsize", "compressedsize")):
+      return 110
+    if "bitstream" in key_id and "size" in key_id:
+      return 105
+    if any(token in key_id for token in ("filesize", "storagesize", "disksize")) and "image" not in key_id:
+      return 95
+    if is_component_size and "size" in key_id:
+      return 50
+    if "size" in key_id and re.search(r"mb|mib|byte|bytes|gb|gib|kb|kib|ply|checkpoint|ckpt|model|storage|disk|result|pointcloud", key_id):
+      return 75
+    return 0
+  if key == "render_fps":
+    if any(token in key_id for token in ("renderfps", "renderingfps", "viewerfps", "fpsrender")):
+      return 120
+    if "fps" in key_id and re.search(r"render|viewer|display|raster|frame", key_id):
+      return 95
+    if key_id == "fps":
+      return 45
+    if key_id.endswith("fps") and not re.search(r"algo|train|training", key_id):
+      return 35
+    return 0
+  return 0
+
+
+def infer_analysis_metrics(payload: Any) -> Dict[str, Any]:
+  metrics, _ = infer_analysis_metrics_with_sources(payload)
+  return metrics
+
+
+def infer_analysis_metrics_with_sources(payload: Any, source_prefix: str = "") -> tuple[Dict[str, Any], Dict[str, str]]:
+  entries = [
+    (path, value)
+    for path, value in _flatten_metric_entries(payload)
+    if str(value or "").strip() and str(value).strip() != "-"
+  ]
+  inferred: Dict[str, Any] = {}
+  sources: Dict[str, str] = {}
+  for key in ("psnr", "ssim", "size_mb", "render_fps"):
+    scored = [
+      (_analysis_metric_score(path, key), path, value)
+      for path, value in entries
+      if _analysis_metric_score(path, key) > 0
+    ]
+    if not scored:
+      continue
+    best_score = max(score for score, _, _ in scored)
+    best = [(path, value) for score, path, value in scored if score == best_score]
+    numbers = [
+      _coerce_size_mb(value, path) if key == "size_mb" else _coerce_metric_number(value)
+      for path, value in best
+    ]
+    numbers = [value for value in numbers if value is not None and math.isfinite(value)]
+    if numbers:
+      inferred[key] = _metric_number_text(sum(numbers) / len(numbers))
+    else:
+      inferred[key] = best[-1][1]
+    source_path = best[0][0]
+    sources[key] = f"{source_prefix}.{source_path}" if source_prefix and source_path else source_path or source_prefix
+  return inferred, sources
+
+
+def merge_analysis_metric(
+  metrics: Dict[str, Any],
+  sources: Dict[str, str],
+  key: str,
+  value: Any,
+  source: str,
+  *,
+  overwrite: bool = False,
+) -> None:
+  if value is None:
+    return
+  text = str(value).strip()
+  if not text or text == "-":
+    return
+  if key in metrics and str(metrics.get(key, "")).strip() and not overwrite:
+    return
+  number = _coerce_size_mb(value, key) if key == "size_mb" else _coerce_metric_number(value)
+  metrics[key] = _metric_number_text(number) if number is not None else value
+  sources[key] = source
+
+
+def _last_number_match(regexes: list[str], text: str) -> str:
+  for regex in regexes:
+    matches = re.findall(regex, text, flags=re.IGNORECASE)
+    if matches:
+      value = matches[-1]
+      if isinstance(value, tuple):
+        value = next((item for item in value if item), "")
+      return str(value)
+  return ""
+
+
+def extract_job_metrics(text: str) -> Dict[str, Any]:
   metrics: Dict[str, Any] = {}
+  number = METRIC_NUMBER_PATTERN
   patterns = {
     "fps": [
-      r"(?i)\b([0-9]+(?:\.[0-9]+)?)[ \t]*fps\b",
-      r"(?i)\bfps[:=]\s*([0-9]+(?:\.[0-9]+)?)\b",
-      r"(?i)\bfps\s+([0-9]+(?:\.[0-9]+)?)\b",
+      rf"\b({number})[ \t]*fps\b",
+      rf"\bfps[:=]\s*({number})\b",
+      rf"\bfps\s+({number})\b",
     ],
     "iter": [
-      r"(?i)\biter(?:ation)?[:=\s]+([0-9]+)\b",
-      r"(?i)\b([0-9]+)\s*/\s*[0-9]+\b",
+      r"\biter(?:ation)?[:=\s]+([0-9]+)\b",
+      r"\b([0-9]+)\s*/\s*[0-9]+\b",
     ],
     "loss": [
-      r"(?i)\bloss[:=\s]+([0-9]+(?:\.[0-9]+)?)\b",
+      rf"\bloss[:=\s]+({number})\b",
     ],
     "psnr": [
-      r"(?i)\bpsnr[:=\s]+([0-9]+(?:\.[0-9]+)?)\b",
+      rf"\bpsnr(?:\s*\(?\s*db\s*\)?)?[:=\s]+({number})\b",
+      rf"\bpsnr\s*\(\s*db\s*\)\s*[:=]\s*({number})\b",
     ],
     "ssim": [
-      r"(?i)\bssim[:=\s]+([0-9]+(?:\.[0-9]+)?)\b",
+      rf"\bssim[:=\s]+({number})\b",
     ],
     "lpips": [
-      r"(?i)\blpips[:=\s]+([0-9]+(?:\.[0-9]+)?)\b",
+      rf"\blpips[:=\s]+({number})\b",
+    ],
+    "render_fps": [
+      rf"\brender\s*\(?\s*fps\s*\)?\s*[:=]\s*({number})\b",
+      rf"\b(?:render(?:ing)?|viewer|display|raster(?:izer|ize)?|frame)[ _-]*fps[:=\s]+({number})\b",
+      rf"\b(?:render(?:ing)?|viewer|display|raster(?:izer|ize)?|frame)[^\n]{{0,32}}?\b({number})\s*fps\b",
     ],
   }
 
   for key, regexes in patterns.items():
-    for regex in regexes:
-      matches = re.findall(regex, text)
-      if matches:
-        metrics[key] = matches[-1]
-        break
+    value = _last_number_match(regexes, text)
+    if value:
+      metrics[key] = value
+
+  size_patterns = [
+    rf"(?:^|[^a-z0-9])(?:ttl[_ -]*)?size[_ -]*mb\s*[:=]\s*({number})\b",
+    rf"(?:^|[^a-z0-9])(?:total[_ -]*)?size[_ -]*mb\s*[:=]\s*({number})\b",
+    rf"\b(?:size\s*\(?\s*mb\s*\)?|size_mb|sizemb|model_size_mb|model\s+size\s+mb)[:=\s]+({number})\b",
+    rf"(?:^|[^a-z0-9])(?:[a-z0-9]+[_ -]+)*size[_ -]*mb\s*[:=]\s*({number})\b",
+    rf"\b(?:model|checkpoint|ckpt|compressed|compression|file|ply|point[_ -]?cloud|storage|disk|result|bitstreams?)[^\n]{{0,60}}?\b({number})\s*(b|bytes?|kb|kib|mb|mib|gb|gib)\b",
+    rf"\b({number})\s*(b|bytes?|kb|kib|mb|mib|gb|gib)\s+(?:model|checkpoint|ckpt|compressed|file|ply|point[_ -]?cloud|storage|disk|result|bitstreams?|size)\b",
+  ]
+  for regex in size_patterns:
+    matches = re.findall(regex, text, flags=re.IGNORECASE)
+    if not matches:
+      continue
+    match = matches[-1]
+    if isinstance(match, tuple):
+      value = match[0]
+      unit = match[1] if len(match) > 1 and match[1] else "mb"
+    else:
+      value = match
+      unit = "mb"
+    try:
+      metrics["size_mb"] = _metric_number_text(_size_unit_to_mb(float(value), unit))
+    except ValueError:
+      pass
+    break
+
+  if metrics.get("render_fps") and not metrics.get("fps"):
+    metrics["fps"] = metrics["render_fps"]
+  if metrics.get("fps") and not metrics.get("render_fps"):
+    if not re.search(r"\b(?:algo|train(?:ing)?|optimization)\s*fps\b", text, flags=re.IGNORECASE):
+      metrics["render_fps"] = metrics["fps"]
   return metrics
 
 
-METRICS_CSV_COLUMNS = ["timestamp", "channel", "iter", "loss", "psnr", "ssim", "lpips", "fps"]
+METRICS_CSV_COLUMNS = ["timestamp", "channel", "iter", "loss", "psnr", "ssim", "lpips", "fps", "size_mb", "render_fps"]
 
 
 def utc_timestamp_text(now: float | None = None) -> str:
   moment = datetime.fromtimestamp(now or time.time(), tz=timezone.utc)
   return moment.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def ensure_metrics_csv_header(metrics_csv: Path) -> None:
+  if not metrics_csv.exists() or metrics_csv.stat().st_size == 0:
+    with metrics_csv.open("w", newline="", encoding="utf-8") as handle:
+      writer = csv.DictWriter(handle, fieldnames=METRICS_CSV_COLUMNS)
+      writer.writeheader()
+    return
+
+  try:
+    with metrics_csv.open("r", newline="", encoding="utf-8") as handle:
+      reader = csv.DictReader(handle)
+      current = list(reader.fieldnames or [])
+      rows = list(reader)
+  except Exception:
+    return
+
+  if current == METRICS_CSV_COLUMNS:
+    return
+  if all(column in current for column in METRICS_CSV_COLUMNS):
+    return
+
+  with metrics_csv.open("w", newline="", encoding="utf-8") as handle:
+    writer = csv.DictWriter(handle, fieldnames=METRICS_CSV_COLUMNS, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+      row.pop(None, None)
+      writer.writerow(row)
 
 
 def ensure_job_logging(job: Dict[str, Any]) -> None:
@@ -205,10 +472,7 @@ def ensure_job_logging(job: Dict[str, Any]) -> None:
   if not log_file.exists():
     log_file.write_text("", encoding="utf-8")
 
-  if not metrics_csv.exists():
-    with metrics_csv.open("w", newline="", encoding="utf-8") as handle:
-      writer = csv.DictWriter(handle, fieldnames=METRICS_CSV_COLUMNS)
-      writer.writeheader()
+  ensure_metrics_csv_header(metrics_csv)
 
   history = job.get("metrics_history")
   if not isinstance(history, list):
@@ -332,6 +596,8 @@ def append_job_log_line(job: Dict[str, Any], channel: str, line: str) -> None:
     "ssim": metrics_update.get("ssim", ""),
     "lpips": metrics_update.get("lpips", ""),
     "fps": metrics_update.get("fps", ""),
+    "size_mb": metrics_update.get("size_mb", ""),
+    "render_fps": metrics_update.get("render_fps", ""),
   }
   history = job.setdefault("metrics_history", [])
   history.append(entry)
@@ -1806,6 +2072,129 @@ def result_candidate_dirs(directory: Path, family: str | None = None) -> list[Pa
   return [directory, *nested]
 
 
+def result_marker_names_for_family(family: str | None = None) -> tuple[str, ...]:
+  family = str(family or "").strip()
+  if family == "compgs":
+    return ("point_cloud", "eval", "eval_training", "Log")
+  if family == "gaussian-splatting-lightning":
+    return ("point_cloud", "checkpoints", "test", "train", "results.json", "per_view.json")
+  if family == "hac-plus-plus":
+    return ("point_cloud", "bitstreams", "test", "train", "results.json", "per_view.json", "outputs.log")
+  return ("point_cloud", "test", "train", "results.json", "per_view.json", "metrics.json")
+
+
+def path_depth_from(root: Path, path: Path) -> int:
+  try:
+    return len(path.resolve().relative_to(root.resolve()).parts)
+  except Exception:
+    return 999
+
+
+def add_unique_path(paths: list[Path], path: Path) -> None:
+  try:
+    resolved = path.resolve()
+  except OSError:
+    return
+  if resolved not in paths:
+    paths.append(resolved)
+
+
+def analysis_roots_for_job(job: Dict[str, Any] | None, directory: Path, family: str | None = None) -> list[Path]:
+  roots: list[Path] = []
+  if directory.exists():
+    add_unique_path(roots, directory)
+
+  if not job:
+    return roots
+
+  remote_result = job.get("remote_result") if isinstance(job.get("remote_result"), dict) else {}
+  dataset_candidates = [
+    remote_result.get("remote_dataset_id"),
+    job.get("remote_dataset_id"),
+  ]
+  if directory.parent.exists():
+    add_unique_path(roots, directory.parent)
+    for dataset_id in dataset_candidates:
+      dataset_name = Path(str(dataset_id or "").strip()).name
+      if dataset_name:
+        candidate = directory.parent / dataset_name
+        if candidate.exists():
+          add_unique_path(roots, candidate)
+
+  family_text = str(family or job.get("algorithm_family") or "").strip()
+  if family_text:
+    local_root = WEB_DIR / "generated" / "runs" / str(job.get("session_id") or "") / family_text
+    if local_root.exists():
+      add_unique_path(roots, local_root)
+
+  return roots
+
+
+def analysis_result_candidate_dirs(
+  directory: Path,
+  family: str | None = None,
+  *,
+  job: Dict[str, Any] | None = None,
+  max_depth: int = 4,
+  limit: int = 80,
+) -> list[Path]:
+  markers = result_marker_names_for_family(family)
+  candidates: list[Path] = []
+  for root in analysis_roots_for_job(job, directory, family):
+    for candidate in result_candidate_dirs(root, family):
+      if candidate.exists():
+        add_unique_path(candidates, candidate)
+
+    if not root.is_dir():
+      continue
+    scanned = 0
+    for current_root, dirnames, filenames in os.walk(root):
+      current = Path(current_root)
+      depth = path_depth_from(root, current)
+      if depth > max_depth:
+        dirnames[:] = []
+        continue
+      dirnames[:] = [
+        dirname for dirname in dirnames
+        if dirname not in RESULT_SCAN_EXCLUDED_DIRS and not dirname.startswith(".") and dirname != "config"
+      ]
+      marker_found = any((current / marker).exists() for marker in markers) or (
+        "results.json" in filenames or "per_view.json" in filenames or "metrics.json" in filenames
+      )
+      if marker_found:
+        add_unique_path(candidates, current)
+      scanned += 1
+      if scanned >= limit:
+        break
+
+  dataset_names = []
+  if job:
+    remote_result = job.get("remote_result") if isinstance(job.get("remote_result"), dict) else {}
+    for value in (remote_result.get("remote_dataset_id"), job.get("remote_dataset_id")):
+      text = Path(str(value or "").strip()).name
+      if text:
+        dataset_names.append(text)
+
+  def candidate_score(path: Path) -> tuple[int, float, str]:
+    path_text = str(path)
+    dataset_score = 0
+    for dataset_name in dataset_names:
+      if dataset_name and dataset_name in path_text:
+        dataset_score = max(dataset_score, 1000)
+    try:
+      if path.resolve() == directory.resolve():
+        dataset_score = max(dataset_score, 500)
+    except Exception:
+      pass
+    return dataset_score, path_mtime(path), path_text
+
+  candidates.sort(key=candidate_score, reverse=True)
+  if directory.exists():
+    resolved = directory.resolve()
+    candidates = [resolved, *[path for path in candidates if path != resolved]]
+  return candidates[:limit]
+
+
 def latest_iteration_dir(point_cloud_dir: Path) -> Path | None:
   if not point_cloud_dir.exists() or not point_cloud_dir.is_dir():
     return None
@@ -2042,6 +2431,167 @@ def find_result_images(directory: Path, family: str | None = None) -> list[Path]
 def find_result_image(directory: Path, family: str | None = None) -> Path | None:
   images = find_result_images(directory, family)
   return images[0] if images else None
+
+
+def analysis_metric_files(candidate_dirs: list[Path]) -> list[Path]:
+  files: list[Path] = []
+  names = ("metrics.json", "results.json", "per_view.json")
+  for candidate_dir in candidate_dirs:
+    if candidate_dir.is_file() and candidate_dir.name in names:
+      add_unique_path(files, candidate_dir)
+      continue
+    if not candidate_dir.is_dir():
+      continue
+    for name in names:
+      metric_file = candidate_dir / name
+      if metric_file.is_file():
+        add_unique_path(files, metric_file)
+    for eval_dir in candidate_dir.glob("eval*"):
+      if not eval_dir.is_dir():
+        continue
+      for name in names:
+        metric_file = eval_dir / name
+        if metric_file.is_file():
+          add_unique_path(files, metric_file)
+  files.sort(key=lambda path: (path_mtime(path), str(path)), reverse=True)
+  return files
+
+
+def relative_metric_source(root: Path, path: Path, suffix: str = "") -> str:
+  try:
+    label = str(path.resolve().relative_to(root.resolve()))
+  except Exception:
+    label = f"{path.parent.name}/{path.name}" if path.parent.name.startswith("eval") else path.name
+  return f"{label}.{suffix}" if suffix else label
+
+
+def image_pair_dirs(candidate_dirs: list[Path]) -> tuple[Path | None, Path | None]:
+  for candidate_dir in candidate_dirs:
+    if not candidate_dir.is_dir():
+      continue
+    for eval_dir in [candidate_dir, *[path for path in candidate_dir.glob("eval*") if path.is_dir()]]:
+      original = eval_dir / "original"
+      rendered = eval_dir / "rendered"
+      if original.is_dir() and rendered.is_dir():
+        return original, rendered
+  return None, None
+
+
+def paired_image_paths(original_dir: Path, rendered_dir: Path, limit: int = 120) -> list[tuple[Path, Path]]:
+  original_by_name = {
+    path.name: path for path in original_dir.iterdir()
+    if path.is_file() and is_image_file(path)
+  }
+  pairs: list[tuple[Path, Path]] = []
+  for rendered in sorted(rendered_dir.iterdir(), key=lambda path: path.name):
+    if not rendered.is_file() or not is_image_file(rendered):
+      continue
+    original = original_by_name.get(rendered.name)
+    if original:
+      pairs.append((original, rendered))
+    if len(pairs) >= limit:
+      break
+  return pairs
+
+
+def compute_image_pair_metrics(original_dir: Path, rendered_dir: Path) -> Dict[str, float]:
+  try:
+    import numpy as np
+    from PIL import Image
+  except Exception:
+    return {}
+
+  pairs = paired_image_paths(original_dir, rendered_dir)
+  if not pairs:
+    return {}
+
+  psnrs: list[float] = []
+  ssims: list[float] = []
+  c1 = 0.01 ** 2
+  c2 = 0.03 ** 2
+  for original_path, rendered_path in pairs:
+    try:
+      original = np.asarray(Image.open(original_path).convert("RGB"), dtype=np.float64) / 255.0
+      rendered = np.asarray(Image.open(rendered_path).convert("RGB"), dtype=np.float64) / 255.0
+    except Exception:
+      continue
+    if original.shape != rendered.shape:
+      continue
+
+    mse = float(np.mean((original - rendered) ** 2))
+    psnrs.append(100.0 if mse <= 0 else float(10.0 * math.log10(1.0 / mse)))
+
+    channel_ssims: list[float] = []
+    for channel in range(3):
+      left = original[:, :, channel]
+      right = rendered[:, :, channel]
+      left_mean = float(np.mean(left))
+      right_mean = float(np.mean(right))
+      left_var = float(np.mean((left - left_mean) ** 2))
+      right_var = float(np.mean((right - right_mean) ** 2))
+      covariance = float(np.mean((left - left_mean) * (right - right_mean)))
+      denominator = (left_mean ** 2 + right_mean ** 2 + c1) * (left_var + right_var + c2)
+      if denominator <= 0:
+        continue
+      channel_ssims.append(((2 * left_mean * right_mean + c1) * (2 * covariance + c2)) / denominator)
+    if channel_ssims:
+      ssims.append(float(max(-1.0, min(1.0, sum(channel_ssims) / len(channel_ssims)))))
+
+  result: Dict[str, float] = {}
+  if psnrs:
+    result["psnr"] = sum(psnrs) / len(psnrs)
+  if ssims:
+    result["ssim"] = sum(ssims) / len(ssims)
+  return result
+
+
+def rendered_image_count(candidate_dirs: list[Path]) -> int:
+  original_dir, rendered_dir = image_pair_dirs(candidate_dirs)
+  if rendered_dir is None:
+    return 0
+  return len([path for path in rendered_dir.iterdir() if path.is_file() and is_image_file(path)])
+
+
+def render_fps_from_log_text(text: str) -> float | None:
+  best_value: float | None = None
+  fallback_value: float | None = None
+  normalized = text.replace("\r", "\n")
+  for line in normalized.splitlines():
+    lowered = line.lower()
+    matches = re.findall(rf"({METRIC_NUMBER_PATTERN})\s*it/s\b", line)
+    if not matches:
+      continue
+    try:
+      value = float(matches[-1])
+    except ValueError:
+      continue
+    if value <= 0 or value > 10000:
+      continue
+    fallback_value = value
+    if any(token in lowered for token in ("validation", "render", "eval", "dataloader")):
+      best_value = value
+  return best_value if best_value is not None else fallback_value
+
+
+def runtime_log_text_for_job(job: Dict[str, Any] | None) -> str:
+  if not job:
+    return ""
+  candidates: list[Path] = []
+  for key in ("log_file",):
+    value = str(job.get(key) or "").strip()
+    if value:
+      candidates.append(Path(value))
+  log_dir = str(job.get("log_dir") or "").strip()
+  if log_dir:
+    candidates.append(Path(log_dir) / "runtime.log")
+  for path in candidates:
+    if not path.is_file():
+      continue
+    try:
+      return path.read_text(encoding="utf-8", errors="ignore")[-240000:]
+    except Exception:
+      continue
+  return str(job.get("stdout") or "") + "\n" + str(job.get("stderr") or "")
 
 
 def image_search_dirs_for_result_file(path: Path) -> list[Path]:
@@ -2356,22 +2906,140 @@ def newest_render_image(directory: Path) -> Path | None:
   return candidates[0][1]
 
 
-def read_runtime_artifacts(output_dir: str | None, representation: str | None = None, family: str | None = None) -> Dict[str, Any]:
+def compressed_artifact_size_bytes(candidate_dirs: list[Path]) -> tuple[int, str]:
+  for candidate_dir in candidate_dirs:
+    if not candidate_dir.is_dir():
+      continue
+    for bitstream_dir in [candidate_dir / "bitstreams", candidate_dir / "bitstream"]:
+      if bitstream_dir.is_dir():
+        size = directory_size_bytes(bitstream_dir)
+        if size > 0:
+          return size, f"artifact:{bitstream_dir.name}"
+
+  suffixes = {".bin", ".npz"}
+  for candidate_dir in candidate_dirs:
+    if not candidate_dir.is_dir():
+      continue
+    total = 0
+    for current_root, dirnames, filenames in os.walk(candidate_dir):
+      current = Path(current_root)
+      if path_depth_from(candidate_dir, current) > 3:
+        dirnames[:] = []
+        continue
+      dirnames[:] = [
+        dirname for dirname in dirnames
+        if dirname not in RESULT_SCAN_EXCLUDED_DIRS and not dirname.startswith(".")
+      ]
+      for filename in filenames:
+        path = current / filename
+        lowered = filename.lower()
+        if path.suffix.lower() in suffixes or "bitstream" in lowered or "compressed" in lowered:
+          try:
+            total += path.stat().st_size
+          except OSError:
+            continue
+    if total > 0:
+      return total, "artifact:compressed_files"
+  return 0, ""
+
+
+def read_runtime_artifacts(
+  output_dir: str | None,
+  representation: str | None = None,
+  family: str | None = None,
+  job: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
   if not output_dir:
     return {}
   directory = Path(output_dir).resolve()
-  metrics_path = directory / "metrics.json"
   payload: Dict[str, Any] = {}
-  if metrics_path.exists():
+  metrics: Dict[str, Any] = {}
+  sources: Dict[str, str] = {}
+  candidate_dirs = analysis_result_candidate_dirs(directory, family, job=job)
+
+  job_metrics = job.get("metrics") if isinstance(job, dict) and isinstance(job.get("metrics"), dict) else {}
+  for key in ("psnr", "ssim", "size_mb", "render_fps"):
+    merge_analysis_metric(metrics, sources, key, job_metrics.get(key), f"job.metrics.{key}")
+
+  metric_files = analysis_metric_files(candidate_dirs)
+  for metrics_path in metric_files:
     try:
-      payload["metrics"] = json.loads(metrics_path.read_text(encoding="utf-8"))
+      metric_payload = json.loads(metrics_path.read_text(encoding="utf-8"))
     except Exception:
-      pass
-  artifact = load_result_path(str(directory), family=family, representation=representation)
+      continue
+    if metrics_path.name == "metrics.json" and isinstance(metric_payload, dict):
+      for key, value in metric_payload.items():
+        metrics.setdefault(key, value)
+    inferred, inferred_sources = infer_analysis_metrics_with_sources(
+      metric_payload,
+      source_prefix=relative_metric_source(directory, metrics_path),
+    )
+    for key, value in inferred.items():
+      merge_analysis_metric(metrics, sources, key, value, inferred_sources.get(key, metrics_path.name))
+
+    if isinstance(metric_payload, dict):
+      average = metric_payload.get("average")
+      if average is not None and "eval" in str(metrics_path.parent).lower():
+        merge_analysis_metric(
+          metrics,
+          sources,
+          "psnr",
+          average,
+          relative_metric_source(directory, metrics_path, "average"),
+        )
+      test_time = _coerce_metric_number(metric_payload.get("test_time"))
+      if test_time and test_time > 0:
+        count = rendered_image_count([metrics_path.parent, metrics_path.parent.parent])
+        if count > 0:
+          merge_analysis_metric(
+            metrics,
+            sources,
+            "render_fps",
+            count * 1000.0 / test_time,
+            relative_metric_source(directory, metrics_path, "rendered_count/test_time"),
+          )
+
+  original_dir, rendered_dir = image_pair_dirs(candidate_dirs)
+  if original_dir and rendered_dir and ("psnr" not in metrics or "ssim" not in metrics):
+    computed = compute_image_pair_metrics(original_dir, rendered_dir)
+    merge_analysis_metric(metrics, sources, "psnr", computed.get("psnr"), "computed:psnr_from_images")
+    merge_analysis_metric(metrics, sources, "ssim", computed.get("ssim"), "computed:ssim_from_images")
+
+  if "render_fps" not in metrics:
+    log_fps = render_fps_from_log_text(runtime_log_text_for_job(job))
+    merge_analysis_metric(metrics, sources, "render_fps", log_fps, "runtime.log.validation_it_s")
+
+  artifact: Dict[str, Any] = {}
+  for candidate_dir in candidate_dirs:
+    artifact = load_result_path(str(candidate_dir), family=family, representation=representation)
+    if artifact.get("ok"):
+      break
   if artifact.get("ok"):
     for key in ("type", "family", "representation", "resolved_path", *ARTIFACT_RESULT_FIELDS):
       if artifact.get(key):
         payload[key] = artifact[key]
+
+  if "size_mb" not in metrics:
+    compressed_size, compressed_source = compressed_artifact_size_bytes(candidate_dirs)
+    if compressed_size > 0:
+      metrics.setdefault("size_bytes", compressed_size)
+      merge_analysis_metric(metrics, sources, "size_mb", compressed_size / 1024 / 1024, compressed_source)
+
+  if "size_mb" not in metrics and artifact.get("ok"):
+    size_bytes = 0
+    hac_plus = artifact.get("hac_plus") if isinstance(artifact.get("hac_plus"), dict) else {}
+    if hac_plus:
+      size_bytes = int(hac_plus.get("bitstreams_size_bytes") or 0)
+    if not size_bytes:
+      size_bytes = int(artifact.get("file_size") or 0)
+    if size_bytes > 0:
+      metrics.setdefault("size_bytes", size_bytes)
+      merge_analysis_metric(metrics, sources, "size_mb", size_bytes / 1024 / 1024, "artifact:point_cloud.ply")
+
+  if sources:
+    metrics["analysis_metric_sources"] = sources
+  if metrics:
+    payload["metrics"] = metrics
   return payload
 
 
@@ -2708,12 +3376,14 @@ def enrich_job(job: Dict[str, Any]) -> Dict[str, Any]:
     persist_job_state(job)
   enriched = dict(job)
   if not is_remote_download_pending(enriched):
-    artifacts = read_runtime_artifacts(enriched.get("output_dir"), enriched.get("representation"), enriched.get("algorithm_family"))
+    artifacts = read_runtime_artifacts(enriched.get("output_dir"), enriched.get("representation"), enriched.get("algorithm_family"), enriched)
     if artifacts.get("metrics"):
       enriched["metrics"] = {
         **enriched.get("metrics", {}),
         **artifacts["metrics"],
       }
+      if isinstance(artifacts["metrics"].get("analysis_metric_sources"), dict):
+        enriched["analysis_metric_sources"] = artifacts["metrics"]["analysis_metric_sources"]
     for key in ARTIFACT_RESULT_FIELDS:
       if artifacts.get(key):
         enriched[key] = artifacts[key]
@@ -3371,12 +4041,14 @@ def clear_job_records(statuses_value: Any = None) -> Dict[str, Any]:
 def update_job_artifacts(job: Dict[str, Any]) -> None:
   if is_remote_download_pending(job):
     return
-  artifacts = read_runtime_artifacts(job.get("output_dir"), job.get("representation"), job.get("algorithm_family"))
+  artifacts = read_runtime_artifacts(job.get("output_dir"), job.get("representation"), job.get("algorithm_family"), job)
   if artifacts.get("metrics"):
     job["metrics"] = {
       **job.get("metrics", {}),
       **artifacts["metrics"],
     }
+    if isinstance(artifacts["metrics"].get("analysis_metric_sources"), dict):
+      job["analysis_metric_sources"] = artifacts["metrics"]["analysis_metric_sources"]
   for key in ARTIFACT_RESULT_FIELDS:
     if artifacts.get(key):
       job[key] = artifacts[key]
@@ -3633,7 +4305,7 @@ def start_job_thread(job: Dict[str, Any], command: str, cwd: str | None = None) 
         append_job_log_line(job, channel, line)
         combined_log.append(line)
         job["metrics"] = extract_job_metrics("".join(combined_log[-2000:]))
-        artifacts = read_runtime_artifacts(job.get("output_dir"), job.get("representation"), job.get("algorithm_family"))
+        artifacts = read_runtime_artifacts(job.get("output_dir"), job.get("representation"), job.get("algorithm_family"), job)
         if artifacts.get("metrics"):
           job["metrics"] = {
             **job.get("metrics", {}),
@@ -3687,7 +4359,7 @@ def start_job_thread(job: Dict[str, Any], command: str, cwd: str | None = None) 
       return_code = process.wait()
       stdout_thread.join(timeout=1)
       stderr_thread.join(timeout=1)
-      artifacts = read_runtime_artifacts(job.get("output_dir"), job.get("representation"), job.get("algorithm_family"))
+      artifacts = read_runtime_artifacts(job.get("output_dir"), job.get("representation"), job.get("algorithm_family"), job)
       if artifacts.get("metrics"):
         job["metrics"] = {
           **job.get("metrics", {}),
@@ -3760,7 +4432,7 @@ def start_remote_job_thread(
     combined_log: list[str] = []
 
     def update_artifacts() -> None:
-      artifacts = read_runtime_artifacts(job.get("output_dir"), job.get("representation"), job.get("algorithm_family"))
+      artifacts = read_runtime_artifacts(job.get("output_dir"), job.get("representation"), job.get("algorithm_family"), job)
       if artifacts.get("metrics"):
         job["metrics"] = {
           **job.get("metrics", {}),

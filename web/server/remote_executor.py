@@ -13,6 +13,110 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Dict
 
 
+ALGORITHM_EVAL_REQUIREMENTS: Dict[str, Dict[str, Any]] = {
+  "vanilla-3dgs": {
+    "needs_eval_for_metrics": True,
+    "train_eval_arg": "--eval",
+    "cli_supports_eval": True,
+    "reason": "test split is required for render.py and metrics.py",
+  },
+  "reduced-3dgs": {
+    "needs_eval_for_metrics": True,
+    "train_eval_arg": "--eval",
+    "cli_supports_eval": True,
+    "reason": "metrics.py requires rendered test images and ground-truth test views",
+  },
+  "megs2": {
+    "needs_eval_for_metrics": True,
+    "train_eval_arg": "--eval",
+    "cli_supports_eval": True,
+    "reason": "ModelParams exposes eval and render.py/metrics.py need test views",
+  },
+  "scaffold-gs": {
+    "needs_eval_for_metrics": True,
+    "train_eval_arg": "--eval",
+    "cli_supports_eval": True,
+    "reason": "ModelParams exposes eval and metrics.py evaluates test renders",
+  },
+  "hac-plus-plus": {
+    "needs_eval_for_metrics": True,
+    "train_eval_arg": "--eval",
+    "cli_supports_eval": True,
+    "reason": "training/render evaluation uses held-out test cameras",
+  },
+  "contextgs": {
+    "needs_eval_for_metrics": True,
+    "train_eval_arg": "--eval",
+    "cli_supports_eval": True,
+    "reason": "training/test evaluation uses held-out test cameras",
+  },
+  "gaussian-splatting-lightning": {
+    "needs_eval_for_metrics": True,
+    "train_eval_arg": "",
+    "cli_supports_eval": False,
+    "reason": "inspected CLI has no top-level --eval; dataparser split parameters provide val/test views",
+  },
+  "compgs": {
+    "needs_eval_for_metrics": False,
+    "train_eval_arg": "",
+    "cli_supports_eval": False,
+    "reason": "CompGS uses its own Train/Test config workflow rather than a train.py --eval flag",
+  },
+}
+
+
+def command_has_arg(command: str, option: str) -> bool:
+  try:
+    return option in shlex.split(command)
+  except Exception:
+    return f" {option} " in f" {command} "
+
+
+def looks_like_training_command(command: str) -> bool:
+  lowered = f" {command.lower()} "
+  return any(
+    token in lowered
+    for token in (
+      " train.py",
+      " fit ",
+      " main.py fit",
+      " train.py ",
+      "run_compgs_training.py",
+      "run_fcgs_compgs_pipeline.py",
+    )
+  )
+
+
+def apply_training_eval_arg(family: str, command: str, *, user_disabled_eval: bool = False) -> str:
+  spec = ALGORITHM_EVAL_REQUIREMENTS.get(str(family or "").strip().lower(), {})
+  eval_arg = str(spec.get("train_eval_arg") or "").strip()
+  if (
+    not command
+    or user_disabled_eval
+    or not spec.get("needs_eval_for_metrics")
+    or not spec.get("cli_supports_eval")
+    or not eval_arg
+    or command_has_arg(command, eval_arg)
+    or not looks_like_training_command(command)
+  ):
+    return command
+  return f"{command} {eval_arg}"
+
+
+def should_run_post_train_eval(family: str, command: str) -> bool:
+  family_key = str(family or "").strip().lower()
+  if family_key not in {
+    "megs2",
+    "reduced-3dgs",
+    "scaffold-gs",
+    "hac-plus-plus",
+    "contextgs",
+    "gaussian-splatting-lightning",
+  }:
+    return False
+  return looks_like_training_command(command)
+
+
 class RemoteExecutionError(RuntimeError):
   def __init__(self, message: str, *, code_hint: str = "", stage: str = "", details: Dict[str, Any] | None = None):
     super().__init__(message)
@@ -828,7 +932,7 @@ def _remote_result_marker_path(remote_output_dir: str, remote_status_path: str =
   return str(PurePosixPath(remote_output_dir) / ".wgsc_job" / "status.json")
 
 
-def _read_remote_json_file(sftp, remote_path: str) -> Dict[str, Any]:
+def _read_remote_json_file_strict(sftp, remote_path: str) -> Dict[str, Any]:
   try:
     with sftp.open(remote_path, "r") as handle:
       raw = handle.read()
@@ -871,7 +975,7 @@ def _verify_remote_result_marker(
   expected_remote_output_dir: str = "",
 ) -> Dict[str, Any]:
   marker_path = _remote_result_marker_path(remote_output_dir, remote_status_path)
-  payload = _read_remote_json_file(sftp, marker_path)
+  payload = _read_remote_json_file_strict(sftp, marker_path)
   marker_job_id = str(payload.get("job_id", "")).strip()
   expected_job_id = str(expected_job_id or "").strip()
   if expected_job_id and marker_job_id != expected_job_id:
@@ -1417,6 +1521,424 @@ def _build_remote_colmap_script(workspace_dir: str) -> str:
   return _wrap_remote_colmap_headless_script(" && ".join(steps))
 
 
+def _remote_post_train_helper_functions() -> str:
+  return r'''
+resolve_gspl_explicit_name() {
+  "$PYTHON_BIN" - "$REMOTE_COMMAND_TEXT" <<'PY'
+import shlex
+import sys
+
+try:
+  args = shlex.split(sys.argv[1])
+except Exception:
+  args = []
+name = ""
+for index, token in enumerate(args):
+  if token in ("-n", "--name") and index + 1 < len(args):
+    name = args[index + 1]
+  elif token.startswith("--name="):
+    name = token.split("=", 1)[1]
+print(name)
+PY
+}
+
+resolve_gspl_output_dir() {
+  "$PYTHON_BIN" - "$OUTPUT_DIR" "$REMOTE_COMMAND_TEXT" "$REMOTE_DATASET_WORKSPACE" <<'PY'
+from pathlib import Path
+import os
+import shlex
+import sys
+
+root = Path(sys.argv[1])
+command = sys.argv[2]
+workspace = sys.argv[3]
+try:
+  args = shlex.split(command)
+except Exception:
+  args = []
+
+def explicit_name():
+  for index, token in enumerate(args):
+    if token in ("-n", "--name") and index + 1 < len(args):
+      return args[index + 1]
+    if token.startswith("--name="):
+      return token.split("=", 1)[1]
+  return ""
+
+def auto_name():
+  parts = Path(str(workspace).strip("/")).parts[-3:]
+  return "_".join(parts)
+
+def add_candidate(items, path):
+  try:
+    if path.exists() and path.is_dir():
+      items.append((path.stat().st_mtime, path.resolve()))
+  except Exception:
+    pass
+
+candidates = []
+for name in (explicit_name(), auto_name()):
+  if name:
+    add_candidate(candidates, root / name)
+add_candidate(candidates, root)
+
+try:
+  for ckpt in root.rglob("checkpoints/*.ckpt"):
+    add_candidate(candidates, ckpt.parent.parent)
+  for ply in root.rglob("point_cloud/iteration_*/point_cloud.ply"):
+    add_candidate(candidates, ply.parents[2])
+except Exception:
+  pass
+
+filtered = []
+seen = set()
+for mtime, path in candidates:
+  key = str(path)
+  if key in seen:
+    continue
+  seen.add(key)
+  if (path / "checkpoints").exists() or (path / "point_cloud").exists():
+    filtered.append((mtime, path))
+
+if filtered:
+  filtered.sort(key=lambda item: (item[0], str(item[1])), reverse=True)
+  print(filtered[0][1])
+PY
+}
+
+latest_gspl_checkpoint() {
+  "$PYTHON_BIN" - "$1" <<'PY'
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+items = []
+try:
+  for path in root.rglob("checkpoints/*.ckpt"):
+    items.append((path.stat().st_mtime, path.resolve()))
+except Exception:
+  pass
+if items:
+  items.sort(key=lambda item: (item[0], str(item[1])), reverse=True)
+  print(items[0][1])
+PY
+}
+
+write_render_metrics_json() {
+  "$PYTHON_BIN" - "$1" "$2" "$3" <<'PY'
+from pathlib import Path
+import json
+import sys
+import time
+
+root = Path(sys.argv[1])
+try:
+  started = float(sys.argv[2])
+  ended = float(sys.argv[3])
+except Exception:
+  started = ended = time.time()
+duration = max(0.0, ended - started)
+image_suffixes = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
+patterns = [
+  "test/*/renders/*",
+  "val/*",
+  "val/**/*",
+  "test/**/*",
+]
+images = []
+seen = set()
+for pattern in patterns:
+  for path in root.glob(pattern):
+    if not path.is_file() or path.suffix.lower() not in image_suffixes:
+      continue
+    key = str(path.resolve())
+    if key in seen:
+      continue
+    seen.add(key)
+    images.append(path)
+payload = {
+  "stage": "render",
+  "status": "success",
+  "render_images": len(images),
+  "render_duration_sec": duration,
+  "end_to_end_render_fps": (len(images) / duration) if duration > 0 and images else None,
+  "fps_definition": "saved_rendered_images / validate_wall_time",
+  "updated_at": time.time(),
+}
+with open(root / "render_metrics.json", "w", encoding="utf-8") as handle:
+  json.dump(payload, handle, ensure_ascii=False, indent=2)
+PY
+}
+
+write_canonical_result_json() {
+  "$PYTHON_BIN" - "$1" <<'PY'
+from pathlib import Path
+import csv
+import json
+import math
+import re
+import sys
+import time
+
+root = Path(sys.argv[1])
+target = root / "result.json"
+number_re = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?")
+
+def number(value):
+  if isinstance(value, bool) or value is None:
+    return None
+  if isinstance(value, (int, float)):
+    value = float(value)
+    return value if math.isfinite(value) else None
+  match = number_re.search(str(value).replace(",", ""))
+  if not match:
+    return None
+  try:
+    value = float(match.group(0))
+  except Exception:
+    return None
+  return value if math.isfinite(value) else None
+
+def key_id(value):
+  return re.sub(r"[^a-z0-9]+", "", str(value).lower())
+
+def collect_json_metrics(payload):
+  psnrs = []
+  ssims = []
+  def walk(obj, key=""):
+    if isinstance(obj, dict):
+      for child_key, child_value in obj.items():
+        walk(child_value, child_key)
+      return
+    if isinstance(obj, list):
+      for child in obj:
+        walk(child, key)
+      return
+    value = number(obj)
+    if value is None:
+      return
+    normalized = key_id(key)
+    if normalized in {"psnr", "psnrdb"}:
+      psnrs.append(value)
+    if normalized == "ssim":
+      ssims.append(value)
+  walk(payload)
+  return (
+    sum(psnrs) / len(psnrs) if psnrs else None,
+    sum(ssims) / len(ssims) if ssims else None,
+  )
+
+def read_json(path):
+  try:
+    with open(path, "r", encoding="utf-8") as handle:
+      payload = json.load(handle)
+    return payload if isinstance(payload, dict) else {}
+  except Exception:
+    return {}
+
+def csv_metrics(path):
+  try:
+    with open(path, "r", encoding="utf-8", newline="") as handle:
+      rows = list(csv.reader(handle))
+  except Exception:
+    return None, None
+  if not rows:
+    return None, None
+  header = rows[0]
+  data_rows = rows[1:]
+  selected = next((row for row in data_rows if row and str(row[0]).strip().upper() == "MEAN"), None)
+  if selected is None and data_rows:
+    selected = data_rows[-1]
+  if selected is None:
+    return None, None
+  psnr = None
+  ssim = None
+  for index, name in enumerate(header):
+    if index >= len(selected):
+      continue
+    normalized = key_id(name)
+    value = number(selected[index])
+    if value is None:
+      continue
+    if "psnr" in normalized:
+      psnr = value
+    if normalized.endswith("ssim") and "msssim" not in normalized:
+      ssim = value
+  return psnr, ssim
+
+payload = read_json(target)
+psnr, ssim = collect_json_metrics(payload)
+source = "result.json" if payload else ""
+
+if psnr is None or ssim is None:
+  candidates = []
+  for path in root.rglob("results.json"):
+    try:
+      candidates.append((path.stat().st_mtime, path))
+    except Exception:
+      pass
+  candidates.sort(key=lambda item: (item[0], str(item[1])), reverse=True)
+  for _, path in candidates:
+    candidate_psnr, candidate_ssim = collect_json_metrics(read_json(path))
+    if candidate_psnr is not None or candidate_ssim is not None:
+      psnr = psnr if psnr is not None else candidate_psnr
+      ssim = ssim if ssim is not None else candidate_ssim
+      try:
+        source = str(path.relative_to(root))
+      except Exception:
+        source = str(path)
+      break
+
+if psnr is None or ssim is None:
+  candidates = []
+  metric_dir = root / "metrics"
+  if metric_dir.exists():
+    for path in metric_dir.glob("*.csv"):
+      try:
+        candidates.append((path.stat().st_mtime, path))
+      except Exception:
+        pass
+  candidates.sort(key=lambda item: (item[0], str(item[1])), reverse=True)
+  for _, path in candidates:
+    candidate_psnr, candidate_ssim = csv_metrics(path)
+    if candidate_psnr is not None or candidate_ssim is not None:
+      psnr = psnr if psnr is not None else candidate_psnr
+      ssim = ssim if ssim is not None else candidate_ssim
+      try:
+        source = str(path.relative_to(root))
+      except Exception:
+        source = str(path)
+      break
+
+if psnr is not None:
+  payload["psnr"] = psnr
+  payload["psnr_db"] = psnr
+  payload["PSNR"] = psnr
+if ssim is not None:
+  payload["ssim"] = ssim
+  payload["SSIM"] = ssim
+if psnr is not None or ssim is not None:
+  payload["source"] = source
+  payload["generated_at"] = time.time()
+  with open(target, "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, ensure_ascii=False, indent=2)
+if psnr is not None and ssim is not None:
+  sys.exit(0)
+if target.exists():
+  sys.exit(2)
+sys.exit(3)
+PY
+}
+'''
+
+
+def _remote_post_train_eval_block(enabled: bool) -> str:
+  if not enabled:
+    return ""
+  return r'''
+  cd "$REMOTE_REPO_DIR" || finish_with "partial_success" "post_train_render_or_metrics" "65" "Unable to enter remote repository for render/metrics."
+  EVAL_OUTPUT_DIR="$OUTPUT_DIR"
+  if [ "$FAMILY" = "gaussian-splatting-lightning" ]; then
+    EVAL_OUTPUT_DIR="$(resolve_gspl_output_dir)"
+    if [ -z "$EVAL_OUTPUT_DIR" ]; then
+      POSTPROCESS_STATUS="${POSTPROCESS_STATUS:-skipped}"
+      RENDER_STATUS="failed"
+      METRICS_STATUS="skipped"
+      RESULT_JSON_EXISTS="false"
+      PARTIAL_SUCCESS="true"
+      FAILURE_STAGE="post_train_render_or_metrics"
+      write_status "partial_success" "post_train_render_or_metrics" "67" "Unable to locate GSLightning experiment output dir for render/metrics."
+      finish_with "partial_success" "post_train_render_or_metrics" "67" "Unable to locate GSLightning experiment output dir for render/metrics."
+    fi
+  fi
+
+  write_status "running" "post_train_render" "" "Training completed; running render stage."
+  render_started="$("$PYTHON_BIN" -c 'import time; print(time.time())')"
+  case "$FAMILY" in
+    "gaussian-splatting-lightning")
+      latest_ckpt="$(latest_gspl_checkpoint "$EVAL_OUTPUT_DIR")"
+      if [ -z "$latest_ckpt" ]; then
+        render_rc=68
+      else
+        gspl_name="$(resolve_gspl_explicit_name)"
+        if [ -n "$gspl_name" ]; then
+          "$PYTHON_BIN" main.py validate --data.path "$REMOTE_DATASET_WORKSPACE" --output "$OUTPUT_DIR" -n "$gspl_name" --ckpt_path "$latest_ckpt" --save_val
+        else
+          "$PYTHON_BIN" main.py validate --data.path "$REMOTE_DATASET_WORKSPACE" --output "$OUTPUT_DIR" --ckpt_path "$latest_ckpt" --save_val
+        fi
+        render_rc=$?
+      fi
+      ;;
+    "hac-plus-plus")
+      "$PYTHON_BIN" render.py -s "$REMOTE_DATASET_WORKSPACE" -m "$EVAL_OUTPUT_DIR"
+      render_rc=$?
+      ;;
+    "contextgs")
+      "$PYTHON_BIN" test.py -s "$REMOTE_DATASET_WORKSPACE" -m "$EVAL_OUTPUT_DIR"
+      render_rc=$?
+      ;;
+    *)
+      "$PYTHON_BIN" render.py -m "$EVAL_OUTPUT_DIR" --skip_train
+      render_rc=$?
+      ;;
+  esac
+  render_finished="$("$PYTHON_BIN" -c 'import time; print(time.time())')"
+  if [ "$render_rc" -ne 0 ]; then
+    RENDER_STATUS="failed"
+    METRICS_STATUS="skipped"
+    RESULT_JSON_EXISTS="false"
+    PARTIAL_SUCCESS="true"
+    FAILURE_STAGE="post_train_render_or_metrics"
+    write_status "partial_success" "post_train_render_or_metrics" "$render_rc" "Training succeeded, but render failed; result.json is missing because render/metrics pipeline did not complete."
+    finish_with "partial_success" "post_train_render_or_metrics" "$render_rc" "Training succeeded, but render failed; result.json is missing because render/metrics pipeline did not complete."
+  fi
+  RENDER_STATUS="success"
+  write_render_metrics_json "$EVAL_OUTPUT_DIR" "$render_started" "$render_finished"
+
+  write_status "running" "post_train_metrics" "" "Render completed; running metrics stage."
+  case "$FAMILY" in
+    "gaussian-splatting-lightning"|"hac-plus-plus"|"contextgs")
+      metrics_rc=0
+      ;;
+    *)
+      if [ -f metrics.py ]; then
+        "$PYTHON_BIN" metrics.py -m "$EVAL_OUTPUT_DIR"
+        metrics_rc=$?
+      else
+        metrics_rc=69
+      fi
+      ;;
+  esac
+  if [ "$metrics_rc" -ne 0 ]; then
+    METRICS_STATUS="failed"
+    RESULT_JSON_EXISTS="false"
+    PARTIAL_SUCCESS="true"
+    FAILURE_STAGE="post_train_render_or_metrics"
+    write_status "partial_success" "post_train_render_or_metrics" "$metrics_rc" "Training/render succeeded, but metrics failed; result.json is missing because render/metrics pipeline did not complete."
+    finish_with "partial_success" "post_train_render_or_metrics" "$metrics_rc" "Training/render succeeded, but metrics failed; result.json is missing because render/metrics pipeline did not complete."
+  fi
+
+  write_canonical_result_json "$EVAL_OUTPUT_DIR"
+  canonical_rc=$?
+  if [ -f "$EVAL_OUTPUT_DIR/result.json" ]; then
+    RESULT_JSON_EXISTS="true"
+    RESULT_JSON_PATH="$EVAL_OUTPUT_DIR/result.json"
+  else
+    RESULT_JSON_EXISTS="false"
+    RESULT_JSON_PATH=""
+  fi
+  if [ "$canonical_rc" -ne 0 ]; then
+    METRICS_STATUS="failed"
+    PARTIAL_SUCCESS="true"
+    FAILURE_STAGE="post_train_render_or_metrics"
+    write_status "partial_success" "post_train_render_or_metrics" "$canonical_rc" "result.json missing because render/metrics pipeline did not complete."
+    finish_with "partial_success" "post_train_render_or_metrics" "$canonical_rc" "result.json missing because render/metrics pipeline did not complete."
+  fi
+  METRICS_STATUS="success"
+  write_status "running" "post_train_metrics_completed" "" "Render and metrics completed; result.json is available."
+'''
+
+
 def _build_remote_detached_run_script(
   *,
   validated: Dict[str, Any],
@@ -1474,6 +1996,8 @@ fi"""
     environment_lines.append(activate_cmd)
   training_lines = [*environment_lines, remote_command]
   training_body = "\n".join(training_lines)
+  post_train_helpers = _remote_post_train_helper_functions()
+  post_train_eval_block = _remote_post_train_eval_block(should_run_post_train_eval(family, remote_command))
 
   post_train_export_block = ""
   if str(family or "").strip().lower() == "gaussian-splatting-lightning":
@@ -1483,8 +2007,13 @@ fi"""
       '  echo "[GSLightning] Missing utils/ckpt2ply.py in remote repo: $(pwd)" >&2',
       '  exit 66',
       'fi',
-      'echo "[GSLightning] Running python utils/ckpt2ply.py \\"$OUTPUT_DIR\\" --override"',
-      '"$PYTHON_BIN" utils/ckpt2ply.py "$OUTPUT_DIR" --override',
+      'REAL_OUTPUT_DIR="$(resolve_gspl_output_dir)"',
+      'if [ -z "$REAL_OUTPUT_DIR" ]; then',
+      '  echo "[GSLightning] Unable to locate experiment output dir under $OUTPUT_DIR" >&2',
+      '  exit 67',
+      'fi',
+      'echo "[GSLightning] Running python utils/ckpt2ply.py \\"$REAL_OUTPUT_DIR\\" --override"',
+      '"$PYTHON_BIN" utils/ckpt2ply.py "$REAL_OUTPUT_DIR" --override',
     ]
     export_body = "\n".join(export_lines)
     post_train_export_block = f"""
@@ -1494,13 +2023,18 @@ fi"""
   )
   export_rc=$?
   if [ "$export_rc" -ne 0 ]; then
-    finish_with "failed" "exporting_gaussian_ply" "$export_rc" "GSLightning checkpoint to PLY export failed."
+    POSTPROCESS_STATUS="failed"
+    PARTIAL_SUCCESS="true"
+    FAILURE_STAGE="ckpt2ply"
+    write_status "partial_success" "ckpt2ply" "$export_rc" "GSLightning checkpoint to PLY export failed."
+    finish_with "partial_success" "ckpt2ply" "$export_rc" "GSLightning checkpoint to PLY export failed."
   fi"""
 
   return f"""#!/usr/bin/env bash
 set +e
 
 PYTHON_BIN={_quote(validated["python"])}
+REMOTE_REPO_DIR={_quote(validated["repo_path"])}
 JOB_ID={_quote(job_id)}
 FAMILY={_quote(family)}
 JOB_DIR={_quote(remote_job_paths["job_dir"])}
@@ -1515,6 +2049,14 @@ REMOTE_DATASET_WORKSPACE={_quote(remote_workspace_for_command)}
 REMOTE_COMMAND_TEXT={_quote(remote_command)}
 AUTO_COLMAP={_quote("1" if auto_colmap else "0")}
 USE_EXISTING_REMOTE_DATASET={_quote("1" if use_existing_remote_dataset else "0")}
+TRAIN_STATUS="pending"
+RENDER_STATUS="skipped"
+METRICS_STATUS="skipped"
+POSTPROCESS_STATUS="skipped"
+RESULT_JSON_EXISTS="false"
+RESULT_JSON_PATH=""
+PARTIAL_SUCCESS="false"
+FAILURE_STAGE=""
 
 mkdir -p "$JOB_DIR" "$OUTPUT_DIR"
 echo "$$" > "$PID_FILE"
@@ -1537,6 +2079,14 @@ write_status() {{
   WGSC_DATASET_NAME="$REMOTE_DATASET_NAME" \\
   WGSC_DATASET_WORKSPACE="$REMOTE_DATASET_WORKSPACE" \\
   WGSC_REMOTE_COMMAND="$REMOTE_COMMAND_TEXT" \\
+  WGSC_TRAIN_STATUS="$TRAIN_STATUS" \\
+  WGSC_RENDER_STATUS="$RENDER_STATUS" \\
+  WGSC_METRICS_STATUS="$METRICS_STATUS" \\
+  WGSC_POSTPROCESS_STATUS="$POSTPROCESS_STATUS" \\
+  WGSC_RESULT_JSON_EXISTS="$RESULT_JSON_EXISTS" \\
+  WGSC_RESULT_JSON_PATH="$RESULT_JSON_PATH" \\
+  WGSC_PARTIAL_SUCCESS="$PARTIAL_SUCCESS" \\
+  WGSC_FAILURE_STAGE="$FAILURE_STAGE" \\
   "$PYTHON_BIN" - "$STATUS_FILE" <<'PY'
 import json
 import os
@@ -1557,6 +2107,14 @@ payload = {{
   "remote_dataset_name": os.environ.get("WGSC_DATASET_NAME", ""),
   "remote_dataset_workspace": os.environ.get("WGSC_DATASET_WORKSPACE", ""),
   "remote_command": os.environ.get("WGSC_REMOTE_COMMAND", ""),
+  "train_status": os.environ.get("WGSC_TRAIN_STATUS", ""),
+  "render_status": os.environ.get("WGSC_RENDER_STATUS", ""),
+  "metrics_status": os.environ.get("WGSC_METRICS_STATUS", ""),
+  "postprocess_status": os.environ.get("WGSC_POSTPROCESS_STATUS", ""),
+  "result_json_exists": os.environ.get("WGSC_RESULT_JSON_EXISTS", "").lower() == "true",
+  "result_path": os.environ.get("WGSC_RESULT_JSON_PATH", ""),
+  "partial_success": os.environ.get("WGSC_PARTIAL_SUCCESS", "").lower() == "true",
+  "failure_stage": os.environ.get("WGSC_FAILURE_STAGE", ""),
   "updated_at": time.time(),
 }}
 return_code = os.environ.get("WGSC_RETURN_CODE", "")
@@ -1581,6 +2139,8 @@ finish_with() {{
   exit "$return_code"
 }}
 
+{post_train_helpers}
+
 echo "[Web-GSC] Tmux remote job started at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 write_status "running" "remote_detached_running" "" "Remote tmux job is running. It is safe to close the web page."
 
@@ -1592,9 +2152,12 @@ write_status "running" "executing_remote_command" "" "Running remote training co
 )
 train_rc=$?
 if [ "$train_rc" -eq 0 ]; then
+  TRAIN_STATUS="success"
 {post_train_export_block}
+{post_train_eval_block}
   finish_with "completed" "completed" "$train_rc" "Remote training completed."
 fi
+TRAIN_STATUS="failed"
 finish_with "failed" "failed" "$train_rc" "Remote training failed."
 """
 
@@ -1723,6 +2286,11 @@ def start_remote_algorithm_detached(
       remote_command = sanitize_formatted_command(command_template, remote_command, format_args)
     except Exception:
       pass
+    remote_command = apply_training_eval_arg(
+      family,
+      remote_command,
+      user_disabled_eval=bool((training_args or {}).get("disable_eval") or (training_args or {}).get("no_eval")),
+    )
 
   if remote_command.lstrip().startswith("python "):
     remote_command = f"{validated['python']}{remote_command.lstrip()[len('python') :]}"
@@ -1910,7 +2478,7 @@ def poll_remote_detached_job(
       allow_agent=False,
     )
     sftp = client.open_sftp()
-    status_payload = _read_remote_json_file(sftp, remote_status_path)
+    status_payload = _read_remote_json_file_strict(sftp, remote_status_path)
     log_delta = _read_remote_log_delta(sftp, remote_log_path, log_cursor)
 
     status = str(status_payload.get("status") or "running")
@@ -1939,6 +2507,15 @@ def poll_remote_detached_job(
       "remote_dataset_name": str(status_payload.get("remote_dataset_name", "")),
       "remote_dataset_workspace": str(status_payload.get("remote_dataset_workspace", "")),
       "remote_command": str(status_payload.get("remote_command", "")),
+      "train_status": str(status_payload.get("train_status", "")),
+      "render_status": str(status_payload.get("render_status", "")),
+      "metrics_status": str(status_payload.get("metrics_status", "")),
+      "postprocess_status": str(status_payload.get("postprocess_status", "")),
+      "result_json_exists": bool(status_payload.get("result_json_exists")),
+      "result_path": str(status_payload.get("result_path", "")),
+      "partial_success": bool(status_payload.get("partial_success")),
+      "failure_stage": str(status_payload.get("failure_stage", "")),
+      "updated_at": status_payload.get("updated_at", ""),
       "log_text": log_delta["text"],
       "log_cursor": log_delta["cursor"],
       "log_available": log_delta["available"],

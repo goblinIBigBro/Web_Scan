@@ -285,6 +285,31 @@ export function buildJobMetricsCsvUrl(apiBaseUrl, jobId) {
   return withApiBase(apiBaseUrl, `api/jobs/${jobId}/metrics.csv`);
 }
 
+export async function exportAnalysisCsv(apiBaseUrl, jobIds = []) {
+  const response = await fetch(withApiBase(apiBaseUrl, "api/jobs/analysis/export"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ job_ids: jobIds }),
+  });
+  if (!response.ok) {
+    let payload = {};
+    try {
+      payload = await response.json();
+    } catch {
+      payload = { error: `${response.status} ${response.statusText}` };
+    }
+    throw new ApiRequestError(
+      payload.error ?? payload.message ?? `${response.status} ${response.statusText}`,
+      payload,
+      response.status,
+      response.statusText,
+    );
+  }
+  return response.blob();
+}
+
 export async function streamFrame(apiBaseUrl, payload) {
   const response = await fetch(withApiBase(apiBaseUrl, "api/stream-frame"), {
     method: "POST",

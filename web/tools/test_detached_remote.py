@@ -19,6 +19,7 @@ from web.server.remote_executor import (
   _build_remote_detached_run_script,
   _build_remote_tmux_start_command,
   _download_directory,
+  _list_remote_datasets,
   _remote_job_paths,
   _tmux_install_candidates,
   _verify_remote_result_marker,
@@ -418,6 +419,21 @@ def test_remote_download_uses_temp_file_and_reports_progress() -> None:
       shutil.rmtree(target_dir)
 
 
+def test_remote_dataset_listing_ignores_missing_manifests() -> None:
+  workspace_root = "/root/autodl-tmp/tmp/workspace"
+  dataset_id = "dataset2-preview-"
+  files = {
+    f"{workspace_root}/datasets/megs2/{dataset_id}/workspace/images/0001.png": b"png",
+  }
+  datasets = _list_remote_datasets(FakeTreeSftp(files), workspace_root=workspace_root, family="megs2")
+
+  assert len(datasets) == 1
+  assert datasets[0]["id"] == dataset_id
+  assert datasets[0]["name"] == dataset_id
+  assert datasets[0]["has_input_images"] is True
+  assert datasets[0]["stage_label"] == "raw_only"
+
+
 def test_remote_download_skips_complete_local_files() -> None:
   target_dir = Path(api_server.WEB_DIR) / "generated" / "download_tests" / f"skip-{uuid.uuid4().hex[:8]}"
   fake = FakeSftp()
@@ -518,10 +534,30 @@ def test_gaussian_splatting_lightning_train_exports_ply() -> None:
 
   assert 'write_status "running" "exporting_gaussian_ply"' in script
   assert "if ! test -f utils/ckpt2ply.py; then" in script
-  assert 'python utils/ckpt2ply.py \\"$OUTPUT_DIR\\" --override' in script
-  assert '"$PYTHON_BIN" utils/ckpt2ply.py "$OUTPUT_DIR" --override' in script
+  assert 'REAL_OUTPUT_DIR="$(resolve_gspl_output_dir)"' in script
+  assert 'python utils/ckpt2ply.py \\"$REAL_OUTPUT_DIR\\" --override' in script
+  assert '"$PYTHON_BIN" utils/ckpt2ply.py "$REAL_OUTPUT_DIR" --override' in script
+  assert 'finish_with "partial_success" "ckpt2ply"' in script
+  assert 'REMOTE_REPO_DIR=/remote/gaussian-splatting-lightning' in script
+  assert 'cd "$REMOTE_REPO_DIR" || finish_with "partial_success" "post_train_render_or_metrics"' in script
+  assert '"$PYTHON_BIN" main.py validate --data.path "$REMOTE_DATASET_WORKSPACE"' in script
   assert "--colored" not in script
   assert "--drop-shs-rest" not in script
+
+
+def test_training_eval_arg_injection_is_family_aware() -> None:
+  assert remote_executor.apply_training_eval_arg(
+    "reduced-3dgs",
+    "python train.py -s /data -m /out",
+  ).endswith("--eval")
+  assert remote_executor.apply_training_eval_arg(
+    "gaussian-splatting-lightning",
+    "python main.py fit --data.path /data --output /out",
+  ) == "python main.py fit --data.path /data --output /out"
+  assert remote_executor.apply_training_eval_arg(
+    "megs2",
+    "python train.py -s /data -m /out --eval",
+  ).count("--eval") == 1
 
 
 def test_ply_header_classifier_selects_viewer_format() -> None:
@@ -632,19 +668,20 @@ def test_gaussian_splatting_lightning_uses_rgb_checkpoint_ply_as_fallback() -> N
       shutil.rmtree(target_dir)
 
 
-def test_result_download_validation_allows_completed_only() -> None:
+def test_result_download_validation_allows_completed_or_partial_success() -> None:
   base = {
     "remote_detached": True,
     "remote_output_dir": "/remote/output",
     "output_dir": "/local/output",
   }
   assert api_server.validate_completed_result_download_job({**base, "status": "completed"}) == ("/remote/output", "/local/output")
+  assert api_server.validate_completed_result_download_job({**base, "status": "partial_success"}) == ("/remote/output", "/local/output")
 
   for status in ("failed", "canceled", "running", "detached"):
     try:
       api_server.validate_completed_result_download_job({**base, "status": status})
     except ValueError as exc:
-      assert "Only completed jobs can download results" in str(exc)
+      assert "Only completed or partial-success jobs can download results" in str(exc)
     else:
       raise AssertionError(f"status should be rejected: {status}")
 
@@ -916,11 +953,12 @@ def main() -> None:
   test_remote_download_skips_complete_local_files()
   test_remote_download_skips_project_checkpoint_artifacts()
   test_gaussian_splatting_lightning_train_exports_ply()
+  test_training_eval_arg_injection_is_family_aware()
   test_ply_header_classifier_selects_viewer_format()
   test_gaussian_splatting_lightning_prefers_exported_gaussian_ply()
   test_gaussian_splatting_lightning_finds_nested_existing_dataset_output()
   test_gaussian_splatting_lightning_uses_rgb_checkpoint_ply_as_fallback()
-  test_result_download_validation_allows_completed_only()
+  test_result_download_validation_allows_completed_or_partial_success()
   test_result_download_remote_identity_requires_original_server()
   test_remote_result_marker_must_match_job_and_output()
   test_remote_download_checks_disk_space_and_downloaded_size()

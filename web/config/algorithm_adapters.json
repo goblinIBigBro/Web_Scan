@@ -142,7 +142,7 @@
       "operations": {
         "train": {
           "enabled": true,
-          "template": "python train.py -s {workspace} -m {output_dir} --imp_metric indoor"
+          "template": "python train.py -s {workspace} -m {output_dir} --imp_metric indoor --eval"
         },
         "render": {
           "enabled": true,
@@ -198,11 +198,11 @@
       "operations": {
         "train": {
           "enabled": true,
-          "template": "python train.py -s {workspace} -m {output_dir}"
+          "template": "python train.py -s {workspace} -m {output_dir} --eval"
         },
         "render": {
           "enabled": true,
-          "template": "python render.py -m {workspace}"
+          "template": "python render.py -m {output_dir}"
         },
         "process_frame": {
           "enabled": true,
@@ -246,11 +246,11 @@
       "operations": {
         "train": {
           "enabled": true,
-          "template": "python train.py -s {workspace} -m {output_dir}"
+          "template": "python train.py -s {workspace} -m {output_dir} --eval"
         },
         "render": {
           "enabled": true,
-          "template": "python render.py -m {workspace}"
+          "template": "python render.py -m {output_dir}"
         },
         "compress": {
           "enabled": true,

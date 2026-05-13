@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import io
 import importlib.util
 import json
 import math
@@ -42,7 +43,9 @@ from web.server.adapter_registry import (
   validate_adapter,
 )
 from web.server.remote_executor import (
+  ALGORITHM_EVAL_REQUIREMENTS,
   RemoteExecutionError,
+  apply_training_eval_arg,
   build_remote_paths,
   build_remote_tmux_attach_command,
   build_remote_tmux_session_name,
@@ -65,7 +68,14 @@ MAX_JOB_HISTORY = 300
 MAX_PROCESS_FRAME_COMPLETED_HISTORY = 80
 MAX_METRICS_HISTORY = 5000
 JOB_STATE_FILE = "job.json"
-TERMINAL_STATUSES = {"completed", "failed", "canceled"}
+PARTIAL_SUCCESS_STATUSES = {
+  "partial_success",
+  "training_success_render_failed",
+  "training_success_metrics_failed",
+  "training_success_postprocess_failed",
+}
+TERMINAL_STATUSES = {"completed", "failed", "canceled", *PARTIAL_SUCCESS_STATUSES}
+DOWNLOADABLE_RESULT_STATUSES = {"completed", *PARTIAL_SUCCESS_STATUSES}
 ARTIFACT_RESULT_FIELDS = (
   "manifest_url",
   "viewer_url",
@@ -366,13 +376,6 @@ def extract_job_metrics(text: str) -> Dict[str, Any]:
     "loss": [
       rf"\bloss[:=\s]+({number})\b",
     ],
-    "psnr": [
-      rf"\bpsnr(?:\s*\(?\s*db\s*\)?)?[:=\s]+({number})\b",
-      rf"\bpsnr\s*\(\s*db\s*\)\s*[:=]\s*({number})\b",
-    ],
-    "ssim": [
-      rf"\bssim[:=\s]+({number})\b",
-    ],
     "lpips": [
       rf"\blpips[:=\s]+({number})\b",
     ],
@@ -592,8 +595,8 @@ def append_job_log_line(job: Dict[str, Any], channel: str, line: str) -> None:
     "channel": channel.upper(),
     "iter": metrics_update.get("iter", ""),
     "loss": metrics_update.get("loss", ""),
-    "psnr": metrics_update.get("psnr", ""),
-    "ssim": metrics_update.get("ssim", ""),
+    "psnr": "",
+    "ssim": "",
     "lpips": metrics_update.get("lpips", ""),
     "fps": metrics_update.get("fps", ""),
     "size_mb": metrics_update.get("size_mb", ""),
@@ -1592,6 +1595,12 @@ def build_capture_pipeline(
       training_args=training_args,
     )
     if command:
+      if operation == "train":
+        command = apply_training_eval_arg(
+          family,
+          command,
+          user_disabled_eval=bool((training_args or {}).get("disable_eval") or (training_args or {}).get("no_eval")),
+        )
       commands.append({"name": operation, "command": command})
 
   resolved_cwd = resolve_workspace_path(adapter.get("default_cwd") or resolved_repo)
@@ -2457,6 +2466,114 @@ def analysis_metric_files(candidate_dirs: list[Path]) -> list[Path]:
   return files
 
 
+def analysis_result_json_files(directory: Path, family: str | None = None, limit: int = 40) -> list[Path]:
+  files: list[Path] = []
+  if directory.is_file() and directory.name == "result.json":
+    add_unique_path(files, directory)
+    return files
+  if not directory.is_dir():
+    return []
+
+  for candidate_dir in result_candidate_dirs(directory, family):
+    candidate = candidate_dir / "result.json"
+    if candidate.is_file():
+      add_unique_path(files, candidate)
+
+  scanned = 0
+  for current_root, dirnames, filenames in os.walk(directory):
+    current = Path(current_root)
+    depth = path_depth_from(directory, current)
+    if depth > 6:
+      dirnames[:] = []
+      continue
+    dirnames[:] = [
+      dirname for dirname in dirnames
+      if dirname not in RESULT_SCAN_EXCLUDED_DIRS and not dirname.startswith(".")
+    ]
+    if "result.json" in filenames:
+      add_unique_path(files, current / "result.json")
+    scanned += 1
+    if scanned >= 300:
+      break
+
+  files.sort(key=lambda path: (path_mtime(path), str(path)), reverse=True)
+  return files[:limit]
+
+
+def result_json_metric_values(payload: Any) -> Dict[str, Any]:
+  psnr_values: list[float] = []
+  ssim_values: list[float] = []
+
+  def visit(value: Any, key: str = "") -> None:
+    if isinstance(value, dict):
+      for child_key, child_value in value.items():
+        visit(child_value, str(child_key))
+      return
+    if isinstance(value, list):
+      for child in value:
+        visit(child, key)
+      return
+    number = _coerce_metric_number(value)
+    if number is None:
+      return
+    key_id = _metric_path_id(key)
+    if key_id in {"psnr", "psnrdb"}:
+      psnr_values.append(number)
+    if key_id == "ssim":
+      ssim_values.append(number)
+
+  visit(payload)
+  metrics: Dict[str, Any] = {}
+  if psnr_values:
+    psnr = sum(psnr_values) / len(psnr_values)
+    metrics["psnr"] = _metric_number_text(psnr)
+    metrics["psnr_db"] = _metric_number_text(psnr)
+  if ssim_values:
+    metrics["ssim"] = _metric_number_text(sum(ssim_values) / len(ssim_values))
+  return metrics
+
+
+def read_result_json_metrics(directory: Path, family: str | None = None) -> tuple[Dict[str, Any], Path | None]:
+  for result_path in analysis_result_json_files(directory, family):
+    try:
+      payload = json.loads(result_path.read_text(encoding="utf-8"))
+    except Exception:
+      continue
+    metrics = result_json_metric_values(payload)
+    if metrics:
+      return metrics, result_path
+  return {}, None
+
+
+def analysis_render_metrics_files(directory: Path, candidate_dirs: list[Path]) -> list[Path]:
+  files: list[Path] = []
+  for candidate_dir in [directory, *candidate_dirs]:
+    if candidate_dir.is_file() and candidate_dir.name == "render_metrics.json":
+      add_unique_path(files, candidate_dir)
+      continue
+    if candidate_dir.is_dir():
+      candidate = candidate_dir / "render_metrics.json"
+      if candidate.is_file():
+        add_unique_path(files, candidate)
+  files.sort(key=lambda path: (path_mtime(path), str(path)), reverse=True)
+  return files
+
+
+def read_render_fps_metric(directory: Path, candidate_dirs: list[Path]) -> tuple[float | None, Path | None]:
+  for metrics_path in analysis_render_metrics_files(directory, candidate_dirs):
+    try:
+      payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+    except Exception:
+      continue
+    if not isinstance(payload, dict):
+      continue
+    value = _coerce_metric_number(payload.get("end_to_end_render_fps"))
+    if value is None:
+      continue
+    return value, metrics_path
+  return None, None
+
+
 def relative_metric_source(root: Path, path: Path, suffix: str = "") -> str:
   try:
     label = str(path.resolve().relative_to(root.resolve()))
@@ -2955,59 +3072,23 @@ def read_runtime_artifacts(
   payload: Dict[str, Any] = {}
   metrics: Dict[str, Any] = {}
   sources: Dict[str, str] = {}
-  candidate_dirs = analysis_result_candidate_dirs(directory, family, job=job)
+  candidate_dirs = result_candidate_dirs(directory, family)
 
-  job_metrics = job.get("metrics") if isinstance(job, dict) and isinstance(job.get("metrics"), dict) else {}
-  for key in ("psnr", "ssim", "size_mb", "render_fps"):
-    merge_analysis_metric(metrics, sources, key, job_metrics.get(key), f"job.metrics.{key}")
+  result_json_files = analysis_result_json_files(directory, family)
+  payload["result_json_exists"] = bool(result_json_files)
+  if result_json_files:
+    payload["result_path"] = str(result_json_files[0].resolve())
+  result_metrics, result_path = read_result_json_metrics(directory, family)
+  if result_path:
+    payload["result_path"] = str(result_path.resolve())
+    payload["result_json_exists"] = True
+    merge_analysis_metric(metrics, sources, "psnr", result_metrics.get("psnr"), "artifact:result.json", overwrite=True)
+    merge_analysis_metric(metrics, sources, "psnr_db", result_metrics.get("psnr_db") or result_metrics.get("psnr"), "artifact:result.json", overwrite=True)
+    merge_analysis_metric(metrics, sources, "ssim", result_metrics.get("ssim"), "artifact:result.json", overwrite=True)
 
-  metric_files = analysis_metric_files(candidate_dirs)
-  for metrics_path in metric_files:
-    try:
-      metric_payload = json.loads(metrics_path.read_text(encoding="utf-8"))
-    except Exception:
-      continue
-    if metrics_path.name == "metrics.json" and isinstance(metric_payload, dict):
-      for key, value in metric_payload.items():
-        metrics.setdefault(key, value)
-    inferred, inferred_sources = infer_analysis_metrics_with_sources(
-      metric_payload,
-      source_prefix=relative_metric_source(directory, metrics_path),
-    )
-    for key, value in inferred.items():
-      merge_analysis_metric(metrics, sources, key, value, inferred_sources.get(key, metrics_path.name))
-
-    if isinstance(metric_payload, dict):
-      average = metric_payload.get("average")
-      if average is not None and "eval" in str(metrics_path.parent).lower():
-        merge_analysis_metric(
-          metrics,
-          sources,
-          "psnr",
-          average,
-          relative_metric_source(directory, metrics_path, "average"),
-        )
-      test_time = _coerce_metric_number(metric_payload.get("test_time"))
-      if test_time and test_time > 0:
-        count = rendered_image_count([metrics_path.parent, metrics_path.parent.parent])
-        if count > 0:
-          merge_analysis_metric(
-            metrics,
-            sources,
-            "render_fps",
-            count * 1000.0 / test_time,
-            relative_metric_source(directory, metrics_path, "rendered_count/test_time"),
-          )
-
-  original_dir, rendered_dir = image_pair_dirs(candidate_dirs)
-  if original_dir and rendered_dir and ("psnr" not in metrics or "ssim" not in metrics):
-    computed = compute_image_pair_metrics(original_dir, rendered_dir)
-    merge_analysis_metric(metrics, sources, "psnr", computed.get("psnr"), "computed:psnr_from_images")
-    merge_analysis_metric(metrics, sources, "ssim", computed.get("ssim"), "computed:ssim_from_images")
-
-  if "render_fps" not in metrics:
-    log_fps = render_fps_from_log_text(runtime_log_text_for_job(job))
-    merge_analysis_metric(metrics, sources, "render_fps", log_fps, "runtime.log.validation_it_s")
+  render_fps, render_metrics_path = read_render_fps_metric(directory, candidate_dirs)
+  if render_metrics_path:
+    merge_analysis_metric(metrics, sources, "render_fps", render_fps, "artifact:render_metrics.json", overwrite=True)
 
   artifact: Dict[str, Any] = {}
   for candidate_dir in candidate_dirs:
@@ -3034,10 +3115,22 @@ def read_runtime_artifacts(
       size_bytes = int(artifact.get("file_size") or 0)
     if size_bytes > 0:
       metrics.setdefault("size_bytes", size_bytes)
-      merge_analysis_metric(metrics, sources, "size_mb", size_bytes / 1024 / 1024, "artifact:point_cloud.ply")
+      artifact_name = Path(str(artifact.get("resolved_path") or "point_cloud.ply")).name
+      merge_analysis_metric(metrics, sources, "size_mb", size_bytes / 1024 / 1024, f"artifact:{artifact_name}")
+
+  if "size_mb" not in metrics and isinstance(job, dict):
+    download = remote_download_info(job)
+    size_bytes = int(download.get("remote_total_bytes") or download.get("total_bytes") or download.get("bytes") or 0)
+    if size_bytes > 0:
+      metrics.setdefault("size_bytes", size_bytes)
+      merge_analysis_metric(metrics, sources, "size_mb", size_bytes / 1024 / 1024, "artifact:remote_download.bytes")
 
   if sources:
     metrics["analysis_metric_sources"] = sources
+    metrics["psnr_source"] = sources.get("psnr") or sources.get("psnr_db")
+    metrics["ssim_source"] = sources.get("ssim")
+    metrics["size_source"] = sources.get("size_mb")
+    metrics["render_fps_source"] = sources.get("render_fps")
   if metrics:
     payload["metrics"] = metrics
   return payload
@@ -3293,6 +3386,11 @@ def build_remote_algorithm_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
   }
   remote_command = command_template.format(**format_args)
   remote_command = sanitize_formatted_command(command_template, remote_command, format_args)
+  remote_command = apply_training_eval_arg(
+    family,
+    remote_command,
+    user_disabled_eval=bool(payload.get("disable_eval") or payload.get("no_eval")),
+  )
   if remote_command.lstrip().startswith("python "):
     remote_command = f"{remote_config['python']}{remote_command.lstrip()[len('python') :]}"
 
@@ -3370,6 +3468,124 @@ def file_download_response(
   handler.wfile.write(body)
 
 
+def csv_text_response(handler: "ApiHandler", text: str, *, download_name: str) -> None:
+  body = text.encode("utf-8")
+  handler.send_response(HTTPStatus.OK)
+  handler.send_header("Content-Type", "text/csv; charset=utf-8")
+  handler.send_header("Content-Length", str(len(body)))
+  handler.send_header("Content-Disposition", f'attachment; filename="{download_name}"')
+  handler.send_header("Access-Control-Allow-Origin", "*")
+  handler.send_header("Access-Control-Allow-Headers", "Content-Type")
+  handler.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+  handler.end_headers()
+  handler.wfile.write(body)
+
+
+ANALYSIS_EXPORT_COLUMNS = [
+  "job_id",
+  "algorithm_family",
+  "status",
+  "operation",
+  "created_at",
+  "dataset",
+  "output_dir",
+  "result_path",
+  "psnr_db",
+  "ssim",
+  "size_mb",
+  "render_fps",
+  "psnr_source",
+  "ssim_source",
+  "size_source",
+  "render_fps_source",
+  "metrics_csv_url",
+  "logs_download_url",
+]
+
+
+def analysis_export_csv(job_ids: list[str]) -> str:
+  rows: list[Dict[str, Any]] = []
+  for job_id in job_ids:
+    job = JOBS.get(job_id)
+    if not job:
+      raise ValueError(f"Unknown job id: {job_id}")
+    enriched = enrich_job(job)
+    metrics = enriched.get("metrics") if isinstance(enriched.get("metrics"), dict) else {}
+    sources = enriched.get("analysis_metric_sources") if isinstance(enriched.get("analysis_metric_sources"), dict) else {}
+    psnr_source = sources.get("psnr") or sources.get("psnr_db") or ""
+    ssim_source = sources.get("ssim") or ""
+    if psnr_source != "artifact:result.json":
+      psnr_source = ""
+    if ssim_source != "artifact:result.json":
+      ssim_source = ""
+    psnr_value = (metrics.get("psnr_db") or metrics.get("psnr") or "") if psnr_source else ""
+    ssim_value = (metrics.get("ssim") or "") if ssim_source else ""
+    rows.append({
+      "job_id": enriched.get("id", ""),
+      "algorithm_family": enriched.get("algorithm_family", ""),
+      "status": enriched.get("status", ""),
+      "operation": enriched.get("operation", ""),
+      "created_at": enriched.get("created_at", ""),
+      "dataset": enriched.get("dataset", ""),
+      "output_dir": enriched.get("output_dir", ""),
+      "result_path": enriched.get("result_path", ""),
+      "psnr_db": psnr_value,
+      "ssim": ssim_value,
+    "size_mb": metrics.get("size_mb", "") if sources.get("size_mb") else "",
+    "render_fps": metrics.get("render_fps", "") if sources.get("render_fps") == "artifact:render_metrics.json" else "",
+      "psnr_source": psnr_source,
+      "ssim_source": ssim_source,
+      "size_source": sources.get("size_mb", ""),
+      "render_fps_source": sources.get("render_fps", ""),
+      "metrics_csv_url": enriched.get("metrics_csv_url", ""),
+      "logs_download_url": enriched.get("logs_download_url", ""),
+    })
+
+  buffer = io.StringIO()
+  writer = csv.DictWriter(buffer, fieldnames=ANALYSIS_EXPORT_COLUMNS, extrasaction="ignore")
+  writer.writeheader()
+  writer.writerows(rows)
+  return buffer.getvalue()
+
+
+def derive_dataset_label_from_path(path_value: str) -> str:
+  text = str(path_value or "").strip().replace("\\", "/")
+  if not text:
+    return ""
+  path = PurePosixPath(text)
+  parts = [part for part in path.parts if part and part != "/"]
+  if not parts:
+    return ""
+  if parts[-1] == "workspace" and len(parts) >= 2:
+    return "/".join(parts[-2:])
+  return parts[-1]
+
+
+def normalize_job_dataset_fields(job: Dict[str, Any]) -> Dict[str, str]:
+  remote_result = job.get("remote_result") if isinstance(job.get("remote_result"), dict) else {}
+  dataset_path = str(
+    remote_result.get("remote_dataset_workspace")
+    or job.get("remote_dataset_path")
+    or job.get("dataset_path")
+    or job.get("workspace")
+    or ""
+  ).strip()
+  dataset = str(
+    remote_result.get("remote_dataset_id")
+    or job.get("remote_dataset_id")
+    or job.get("dataset")
+    or job.get("dataset_id")
+    or job.get("dataset_name")
+    or ""
+  ).strip()
+  if not dataset:
+    dataset = derive_dataset_label_from_path(dataset_path)
+  return {
+    "dataset": dataset or "-",
+    "dataset_path": dataset_path,
+  }
+
+
 def enrich_job(job: Dict[str, Any]) -> Dict[str, Any]:
   ensure_job_logging(job)
   if mark_stale_remote_download_if_needed(job):
@@ -3377,9 +3593,23 @@ def enrich_job(job: Dict[str, Any]) -> Dict[str, Any]:
   enriched = dict(job)
   if not is_remote_download_pending(enriched):
     artifacts = read_runtime_artifacts(enriched.get("output_dir"), enriched.get("representation"), enriched.get("algorithm_family"), enriched)
+    existing_metrics = dict(enriched.get("metrics", {})) if isinstance(enriched.get("metrics"), dict) else {}
+    for strict_key in (
+      "psnr",
+      "psnr_db",
+      "ssim",
+      "size_mb",
+      "size_bytes",
+      "render_fps",
+      "psnr_source",
+      "ssim_source",
+      "size_source",
+      "render_fps_source",
+    ):
+      existing_metrics.pop(strict_key, None)
     if artifacts.get("metrics"):
       enriched["metrics"] = {
-        **enriched.get("metrics", {}),
+        **existing_metrics,
         **artifacts["metrics"],
       }
       if isinstance(artifacts["metrics"].get("analysis_metric_sources"), dict):
@@ -3387,14 +3617,25 @@ def enrich_job(job: Dict[str, Any]) -> Dict[str, Any]:
     for key in ARTIFACT_RESULT_FIELDS:
       if artifacts.get(key):
         enriched[key] = artifacts[key]
+    for key in ("result_json_exists", "result_path"):
+      if key in artifacts:
+        enriched[key] = artifacts[key]
   else:
     for key in ARTIFACT_RESULT_FIELDS:
       enriched.pop(key, None)
+    enriched["result_json_exists"] = False
   job_id = str(enriched.get("id", "")).strip()
   if job_id:
     enriched["logs_api_url"] = f"/api/jobs/{job_id}/logs"
     enriched["logs_download_url"] = f"/api/jobs/{job_id}/logs/download"
     enriched["metrics_csv_url"] = f"/api/jobs/{job_id}/metrics.csv"
+  enriched.update(normalize_job_dataset_fields(enriched))
+  enriched["updated_at"] = enriched.get("updated_at") or enriched.get("finished_at") or enriched.get("started_at") or enriched.get("created_at")
+  metric_sources = enriched.get("analysis_metric_sources") if isinstance(enriched.get("analysis_metric_sources"), dict) else {}
+  enriched["psnr_source"] = metric_sources.get("psnr") or metric_sources.get("psnr_db")
+  enriched["ssim_source"] = metric_sources.get("ssim")
+  enriched["size_source"] = metric_sources.get("size_mb")
+  enriched["render_fps_source"] = metric_sources.get("render_fps")
   if isinstance(enriched.get("metrics_history"), list):
     enriched["metrics_history_count"] = len(enriched["metrics_history"])
     enriched.pop("metrics_history", None)
@@ -3511,7 +3752,7 @@ def _normalize_remote_dataset_path(path: str) -> str:
 
 def _append_family_coverage(coverage: Dict[str, set[str]], job_status: str, family: str) -> None:
   normalized_status = str(job_status or "").strip().lower()
-  if normalized_status == "completed":
+  if normalized_status == "completed" or normalized_status in PARTIAL_SUCCESS_STATUSES:
     coverage["trained"].add(family)
     return
   if normalized_status == "failed":
@@ -3778,8 +4019,8 @@ def result_download_remote_config(job: Dict[str, Any], payload: Dict[str, Any]) 
 
 def validate_completed_result_download_job(job: Dict[str, Any]) -> tuple[str, str]:
   status = str(job.get("status", "")).strip().lower()
-  if status != "completed":
-    raise ValueError("Only completed jobs can download results.")
+  if status not in DOWNLOADABLE_RESULT_STATUSES:
+    raise ValueError("Only completed or partial-success jobs can download results.")
   if not job.get("remote_detached"):
     raise ValueError("Only completed remote jobs can download results.")
   remote_output_dir, local_output_dir = completed_remote_result_paths(job)
@@ -4042,15 +4283,32 @@ def update_job_artifacts(job: Dict[str, Any]) -> None:
   if is_remote_download_pending(job):
     return
   artifacts = read_runtime_artifacts(job.get("output_dir"), job.get("representation"), job.get("algorithm_family"), job)
+  existing_metrics = dict(job.get("metrics", {})) if isinstance(job.get("metrics"), dict) else {}
+  for strict_key in (
+    "psnr",
+    "psnr_db",
+    "ssim",
+    "size_mb",
+    "size_bytes",
+    "render_fps",
+    "psnr_source",
+    "ssim_source",
+    "size_source",
+    "render_fps_source",
+  ):
+    existing_metrics.pop(strict_key, None)
   if artifacts.get("metrics"):
     job["metrics"] = {
-      **job.get("metrics", {}),
+      **existing_metrics,
       **artifacts["metrics"],
     }
     if isinstance(artifacts["metrics"].get("analysis_metric_sources"), dict):
       job["analysis_metric_sources"] = artifacts["metrics"]["analysis_metric_sources"]
   for key in ARTIFACT_RESULT_FIELDS:
     if artifacts.get(key):
+      job[key] = artifacts[key]
+  for key in ("result_json_exists", "result_path"):
+    if key in artifacts:
       job[key] = artifacts[key]
 
 
@@ -4065,6 +4323,19 @@ def apply_remote_poll_result(job: Dict[str, Any], poll_result: Dict[str, Any]) -
   job["safe_to_close_web"] = True
   if poll_result.get("return_code") not in (None, ""):
     job["return_code"] = poll_result.get("return_code")
+  for key in (
+    "train_status",
+    "render_status",
+    "metrics_status",
+    "postprocess_status",
+    "result_json_exists",
+    "result_path",
+    "partial_success",
+    "failure_stage",
+    "updated_at",
+  ):
+    if key in poll_result:
+      job[key] = poll_result[key]
   if poll_result.get("remote_pid"):
     job["remote_pid"] = poll_result.get("remote_pid")
   if poll_result.get("remote_tmux_session"):
@@ -4530,8 +4801,16 @@ class ApiHandler(SimpleHTTPRequestHandler):
   def __init__(self, *args, **kwargs):
     super().__init__(*args, directory=str(ROOT_DIR), **kwargs)
 
+  def _disable_static_cache(self) -> None:
+    for header in ("If-Modified-Since", "If-None-Match"):
+      if header in self.headers:
+        del self.headers[header]
+
   def end_headers(self) -> None:
     self.send_header("Access-Control-Allow-Origin", "*")
+    self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+    self.send_header("Pragma", "no-cache")
+    self.send_header("Expires", "0")
     super().end_headers()
 
   def do_OPTIONS(self) -> None:
@@ -4540,6 +4819,10 @@ class ApiHandler(SimpleHTTPRequestHandler):
     self.send_header("Access-Control-Allow-Headers", "Content-Type")
     self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
     self.end_headers()
+
+  def do_HEAD(self) -> None:
+    self._disable_static_cache()
+    super().do_HEAD()
 
   def do_GET(self) -> None:
     parsed = urlparse(self.path)
@@ -4564,7 +4847,16 @@ class ApiHandler(SimpleHTTPRequestHandler):
       json_response(self, {"algorithm": adapter, "operations": supported_operations(adapter), "validation": validate_adapter(adapter)})
       return
     if parsed.path == "/api/jobs":
-      json_response(self, {"jobs": [enrich_job(job) for job in JOBS.values()]})
+      ordered_jobs = sorted(
+        (enrich_job(job) for job in JOBS.values()),
+        key=lambda item: (
+          -float(item.get("created_at") or 0),
+          str(item.get("dataset") or ""),
+          str(item.get("algorithm_family") or ""),
+          str(item.get("id") or ""),
+        ),
+      )
+      json_response(self, {"jobs": ordered_jobs})
       return
     if parsed.path == "/api/flow/data":
       try:
@@ -4673,6 +4965,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
 
       json_response(self, {"error": f"Unsupported endpoint: {parsed.path}"}, status=404)
       return
+    self._disable_static_cache()
     super().do_GET()
 
   def do_POST(self) -> None:
@@ -4691,6 +4984,30 @@ class ApiHandler(SimpleHTTPRequestHandler):
         status=400,
         manual_anchor="#9-%E5%B8%B8%E8%A7%81%E9%94%99%E8%AF%AF%E7%A0%81%E4%B8%8E%E8%A7%A3%E5%86%B3%E6%96%B9%E6%A1%88",
       )
+      return
+
+    if parsed.path == "/api/jobs/analysis/export":
+      raw_job_ids = payload.get("job_ids", [])
+      job_ids = [str(item).strip() for item in raw_job_ids if str(item).strip()] if isinstance(raw_job_ids, list) else []
+      if not job_ids:
+        error_response(
+          self,
+          code="WGSC-ANALYSIS-EXPORT-001",
+          step="analysis",
+          message="job_ids must be a non-empty list.",
+          status=400,
+        )
+        return
+      try:
+        csv_text_response(self, analysis_export_csv(job_ids), download_name="analysis-metrics.csv")
+      except Exception as exc:
+        error_response(
+          self,
+          code="WGSC-ANALYSIS-EXPORT-001",
+          step="analysis",
+          message=str(exc),
+          status=400,
+        )
       return
 
     if parsed.path.startswith("/api/jobs/") and "/results/" in parsed.path:
@@ -5530,6 +5847,11 @@ class ApiHandler(SimpleHTTPRequestHandler):
         command = sanitize_formatted_command(command_template, command, format_args)
       except Exception:
         pass
+      command = apply_training_eval_arg(
+        family,
+        command,
+        user_disabled_eval=bool(payload.get("disable_eval") or payload.get("no_eval")),
+      )
       job_id = str(uuid.uuid4())
       job = {
         "id": job_id,

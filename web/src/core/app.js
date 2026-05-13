@@ -7,6 +7,7 @@ import {
   deleteFlowData,
   deleteJob,
   downloadJobResult,
+  exportAnalysisCsv,
   fetchAlgorithms,
   fetchDiscoveredResults,
   fetchFlowData,
@@ -140,6 +141,8 @@ function defaultState() {
     checkpointPath: "",
     renderMode: "ply",
     selectedJobId: "",
+    jobsDatasetFilter: "",
+    jobsSortOrder: "created_desc",
     quickPlyPath: "",
     loadedPly: null,
     flowData: null,
@@ -246,6 +249,12 @@ function summarize(value, length = 64) {
   const text = String(value ?? "").trim();
   if (text.length <= length) return text || "-";
   return `${text.slice(0, length - 1)}…`;
+}
+
+function formatTimestamp(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) return "-";
+  return new Date(number * 1000).toLocaleString();
 }
 
 function fileExtension(value) {
@@ -506,29 +515,39 @@ function latestMetricsRow(rows = []) {
 }
 
 function analysisMetricSource(job, rows = []) {
-  const latestRow = latestMetricsRow(rows);
   const metrics = job?.metrics || {};
   return {
     ...job,
     ...metrics,
     analysis_metric_sources: job?.analysis_metric_sources || metrics.analysis_metric_sources || {},
+    psnr: metrics.psnr_db ?? metrics.psnr,
+    psnr_db: metrics.psnr_db ?? metrics.psnr,
+    ssim: metrics.ssim,
     sizeMb: metrics.size_mb ?? job?.size_mb,
     renderFps: metrics.render_fps ?? job?.render_fps,
-    ...(latestRow || {}),
   };
 }
 
 function analysisMetricItems(job, rows = []) {
   const source = analysisMetricSource(job || {}, rows);
   return ANALYSIS_METRICS.map((metric) => {
-    const extracted = extractAnalysisMetric(source, metric.key);
     const sourceMap = source.analysis_metric_sources || {};
-    const mappedSource = sourceMap[metric.field] || sourceMap[metric.key] || extracted.source;
+    const mappedSource = sourceMap[metric.field] || sourceMap[metric.key] || "";
+    let rawValue = "";
+    if (metric.key === "psnr") {
+      rawValue = mappedSource === "artifact:result.json" ? (source.psnr_db ?? source.psnr ?? "") : "";
+    } else if (metric.key === "ssim") {
+      rawValue = mappedSource === "artifact:result.json" ? (source.ssim ?? "") : "";
+    } else if (metric.key === "sizeMb") {
+      rawValue = String(mappedSource || "").startsWith("artifact:") ? (source.size_mb ?? source.sizeMb ?? "") : "";
+    } else if (metric.key === "renderFps") {
+      rawValue = mappedSource === "artifact:render_metrics.json" ? (source.render_fps ?? source.renderFps ?? "") : "";
+    }
     return {
       ...metric,
-      value: formatAnalysisNumber(extracted.value, metric.key),
-      raw: extracted.raw,
-      numeric: Number(extracted.value),
+      value: formatAnalysisNumber(rawValue, metric.key),
+      raw: rawValue,
+      numeric: Number(rawValue),
       source: mappedSource,
     };
   });
@@ -555,7 +574,8 @@ function isRemoteDownloadFailed(job = {}) {
 }
 
 function canDownloadCompletedResult(job = {}) {
-  return String(job.status || "").toLowerCase() === "completed" && Boolean(job.remote_detached);
+  return ["completed", "partial_success", "training_success_render_failed", "training_success_metrics_failed", "training_success_postprocess_failed"]
+    .includes(String(job.status || "").toLowerCase()) && Boolean(job.remote_detached);
 }
 
 function normalizeRemotePath(value = "") {
@@ -710,13 +730,13 @@ function renderResultDownloadButton(job = {}, compact = false) {
 function statusClass(status) {
   const normalized = String(status || "").toLowerCase();
   if (["completed", "ok", "ready", "canceled"].includes(normalized)) return "ok";
-  if (["running", "queued", "detached"].includes(normalized)) return "warn";
+  if (["running", "queued", "detached", "partial_success", "training_success_render_failed", "training_success_metrics_failed", "training_success_postprocess_failed"].includes(normalized)) return "warn";
   if (["failed", "error"].includes(normalized)) return "bad";
   return "";
 }
 
 function isTerminal(status) {
-  return ["completed", "failed", "canceled"].includes(String(status || "").toLowerCase());
+  return ["completed", "failed", "canceled", "partial_success", "training_success_render_failed", "training_success_metrics_failed", "training_success_postprocess_failed"].includes(String(status || "").toLowerCase());
 }
 
 function selectedAlgorithm() {
@@ -786,6 +806,42 @@ function outputDirForPayload() {
 
 function getJob(jobId = state.selectedJobId) {
   return jobs.find((item) => item.id === jobId) || null;
+}
+
+function jobDatasetLabel(job = {}) {
+  const direct = String(job.dataset || job.remote_result?.remote_dataset_id || job.remote_dataset_id || job.dataset_name || "").trim();
+  if (direct) return direct;
+  const pathText = String(job.dataset_path || job.remote_result?.remote_dataset_workspace || job.remote_dataset_path || job.workspace || "").replace(/\/+$/, "");
+  if (!pathText) return "-";
+  const parts = pathText.split("/").filter(Boolean);
+  if (parts.at(-1) === "workspace" && parts.length >= 2) return `${parts.at(-2)}/workspace`;
+  return parts.at(-1) || "-";
+}
+
+function sortedJobsList(items = jobs) {
+  const direction = state.jobsSortOrder === "created_asc" ? 1 : -1;
+  return [...items].sort((left, right) => {
+    const timeDelta = (Number(left.created_at || 0) - Number(right.created_at || 0)) * direction;
+    if (timeDelta) return timeDelta;
+    return `${jobDatasetLabel(left)} ${left.algorithm_family || ""} ${left.id || ""}`
+      .localeCompare(`${jobDatasetLabel(right)} ${right.algorithm_family || ""} ${right.id || ""}`);
+  });
+}
+
+function jobDatasetOptions() {
+  return [...new Set(jobs.map(jobDatasetLabel).filter((item) => item && item !== "-"))].sort();
+}
+
+function visibleJobs() {
+  const selected = String(state.jobsDatasetFilter || "").trim();
+  const filtered = selected ? jobs.filter((job) => jobDatasetLabel(job) === selected) : jobs;
+  return sortedJobsList(filtered);
+}
+
+function syncJobFilters() {
+  if (state.jobsDatasetFilter && !jobDatasetOptions().includes(state.jobsDatasetFilter)) {
+    state.jobsDatasetFilter = "";
+  }
 }
 
 function setBusy(next) {
@@ -1040,7 +1096,7 @@ function renderCurrentJobSummary() {
       <p class="panel-copy">ID: ${escapeHtml(job.id)}</p>
       <p class="panel-copy">Stage: ${escapeHtml(job.remote_stage || "-")}</p>
       ${renderRemoteDownloadStatus(job)}
-      <p class="panel-copy">FPS ${escapeHtml(job.metrics?.fps || "-")} · PSNR ${escapeHtml(job.metrics?.psnr || "-")} · Loss ${escapeHtml(job.metrics?.loss || "-")}</p>
+      <p class="panel-copy">FPS ${escapeHtml(job.metrics?.fps || "-")} · Render ${escapeHtml(job.metrics?.render_fps || "-")} · Loss ${escapeHtml(job.metrics?.loss || "-")}</p>
       <div class="button-row">
         <button data-action="select-job" data-job-id="${escapeHtml(job.id)}" type="button">Logs</button>
         <button data-action="open-result" data-job-id="${escapeHtml(job.id)}" type="button">Results</button>
@@ -1121,7 +1177,7 @@ function renderOverviewPage() {
           <button data-page="algorithm" type="button">Open Job Monitor</button>
         </div>
       </div>
-      <div class="card">${renderJobsTable(jobs.slice(0, 6))}</div>
+      <div class="card">${renderJobsTable(sortedJobsList(jobs).slice(0, 6), { controls: false })}</div>
     </section>
   `;
 }
@@ -1555,7 +1611,7 @@ function renderAlgorithmPage() {
         </div>
       </div>
       <div class="card grid">
-        ${renderJobsTable(jobs)}
+        ${renderJobsTable(visibleJobs(), { controls: true })}
         ${renderLogPanel()}
       </div>
     </section>
@@ -1702,14 +1758,36 @@ function canSubmitRemoteJob() {
   return stagedUploadFrameCount() > 0 && Boolean(state.lastPreview);
 }
 
-function renderJobsTable(items) {
-  if (!items.length) return `<p class="panel-copy">No jobs yet.</p>`;
+function renderJobListControls() {
+  const options = jobDatasetOptions();
   return `
+    <div class="form-grid compact-form">
+      <label>Dataset
+        <select data-bind="jobsDatasetFilter">
+          <option value="">All</option>
+          ${options.map((item) => `<option value="${escapeHtml(item)}" ${state.jobsDatasetFilter === item ? "selected" : ""}>${escapeHtml(item)}</option>`).join("")}
+        </select>
+      </label>
+      <label>Sort by
+        <select data-bind="jobsSortOrder">
+          <option value="created_desc" ${state.jobsSortOrder !== "created_asc" ? "selected" : ""}>Newest first</option>
+          <option value="created_asc" ${state.jobsSortOrder === "created_asc" ? "selected" : ""}>Oldest first</option>
+        </select>
+      </label>
+    </div>
+  `;
+}
+
+function renderJobsTable(items, options = {}) {
+  const controls = options.controls ? renderJobListControls() : "";
+  if (!items.length) return `${controls}<p class="panel-copy">No jobs yet.</p>`;
+  return `
+    ${controls}
     <div class="table-wrap">
       <table class="job-table">
         <thead>
           <tr>
-            <th>Job</th><th>Status</th><th>Metrics</th><th>Dataset</th><th>Actions</th>
+            <th>Job</th><th>Status</th><th>Metrics</th><th>Dataset</th><th>Created</th><th>Output</th><th>Actions</th>
           </tr>
         </thead>
         <tbody>
@@ -1717,7 +1795,7 @@ function renderJobsTable(items) {
             <tr>
               <td>
                 <strong>${escapeHtml(job.algorithm_family || "-")}</strong>
-                <p class="panel-copy">${escapeHtml(summarize(job.id, 18))}</p>
+                <p class="panel-copy">${escapeHtml(job.operation || "-")} · ${escapeHtml(summarize(job.id, 18))}</p>
               </td>
               <td>
                 <span class="badge ${statusClass(job.status)}">${escapeHtml(job.status || "-")}</span>
@@ -1727,8 +1805,10 @@ function renderJobsTable(items) {
                 ${renderRemoteServerMatchWarning(job, { details: false })}
                 ${job.monitor_state === "needs_remote_config" ? `<p class="panel-copy">Waiting for remote reattach.</p>` : ""}
               </td>
-              <td>FPS ${escapeHtml(job.metrics?.fps || "-")}<br />PSNR ${escapeHtml(job.metrics?.psnr || "-")}<br />Loss ${escapeHtml(job.metrics?.loss || "-")}</td>
-              <td>${escapeHtml(summarize(job.remote_result?.remote_dataset_id || job.remote_dataset_id || job.dataset_name || "-", 32))}</td>
+              <td>FPS ${escapeHtml(job.metrics?.fps || "-")}<br />Render ${escapeHtml(job.metrics?.render_fps || "-")}<br />Loss ${escapeHtml(job.metrics?.loss || "-")}</td>
+              <td>${escapeHtml(summarize(jobDatasetLabel(job), 36))}</td>
+              <td>${escapeHtml(formatTimestamp(job.created_at))}</td>
+              <td>${escapeHtml(summarize(job.result_path || job.output_dir || "-", 42))}</td>
               <td>
                 <div class="table-actions">
                   <button class="compact-button" data-action="select-job" data-job-id="${escapeHtml(job.id)}" type="button">Logs</button>
@@ -1899,13 +1979,16 @@ function renderAnalysisPage() {
           <h2>Training Metrics Analysis</h2>
           <p class="panel-copy">Parse job data into PSNR(dB), SSIM, Size(MB), and Render(FPS).</p>
         </div>
-        <button data-action="load-analysis" type="button" ${job ? "" : "disabled"}>Load Metrics</button>
+        <div class="button-row">
+          <button data-action="load-analysis" type="button" ${job ? "" : "disabled"}>Load Metrics</button>
+          <button data-action="export-analysis" type="button" ${jobs.length ? "" : "disabled"}>Export CSV</button>
+        </div>
       </div>
       <div class="card grid">
         <label>Select Job
           <select data-bind="selectedJobId">
             <option value="">Not selected</option>
-            ${jobs.map((item) => `<option value="${escapeHtml(item.id)}" ${state.selectedJobId === item.id ? "selected" : ""}>${escapeHtml(item.algorithm_family || "-")} · ${escapeHtml(item.status || "-")} · ${escapeHtml(item.id.slice(0, 8))}</option>`).join("")}
+            ${sortedJobsList(jobs).map((item) => `<option value="${escapeHtml(item.id)}" ${state.selectedJobId === item.id ? "selected" : ""}>${escapeHtml(jobDatasetLabel(item))} · ${escapeHtml(item.algorithm_family || "-")} · ${escapeHtml(item.status || "-")} · ${escapeHtml(item.id.slice(0, 8))}</option>`).join("")}
           </select>
         </label>
         <div class="metric-grid analysis-metric-grid">
@@ -1913,7 +1996,7 @@ function renderAnalysisPage() {
             <div class="metric analysis-metric">
               <span class="muted">${escapeHtml(item.label)}</span>
               <strong title="${escapeHtml(item.raw || item.value)}">${escapeHtml(item.value)}</strong>
-              <p class="panel-copy">${escapeHtml(item.source || "No matching data")}</p>
+              <p class="panel-copy">${escapeHtml(item.source || "-")}</p>
             </div>
           `).join("") || `<p class="panel-copy">No jobs to compare yet.</p>`}
         </div>
@@ -2080,6 +2163,7 @@ async function handleClick(event) {
   if (action === "discover-results") await guarded(discoverResults, "Failed to discover results", actionKey);
   if (action === "open-discovered-result") openDiscovered(actionNode.dataset.outputDir);
   if (action === "load-analysis") await guarded(loadAnalysisRows, "Failed to load metrics", actionKey);
+  if (action === "export-analysis") await guarded(downloadAnalysisCsv, "Failed to export analysis CSV", actionKey);
   if (action === "set-render-mode") {
     state.renderMode = actionNode.dataset.mode || "ply";
     persistState();
@@ -2122,6 +2206,10 @@ function handleChange(event) {
     }
     if (node.dataset.bind === "operation" || node.dataset.bind === "useExistingRemoteDataset" || node.dataset.bind === "autoColmap") {
       invalidateRemoteState();
+      render();
+      afterRender();
+    }
+    if (node.dataset.bind === "jobsDatasetFilter" || node.dataset.bind === "jobsSortOrder") {
       render();
       afterRender();
     }
@@ -2263,7 +2351,8 @@ async function checkRuntime(shouldRender = true) {
 
 async function refreshJobs() {
   const data = await fetchJobs(state.apiBaseUrl);
-  jobs = data.jobs || [];
+  jobs = sortedJobsList(data.jobs || []);
+  syncJobFilters();
   if (state.selectedJobId && !jobs.some((job) => job.id === state.selectedJobId)) {
     state.selectedJobId = "";
     state.logText = "";
@@ -2461,8 +2550,9 @@ async function deleteCurrentFlowData(stage) {
 
 function parseStatuses(value) {
   const raw = String(value || "").trim();
-  if (!raw) return ["completed", "failed", "canceled"];
-  if (raw === "finished") return ["completed", "failed", "canceled"];
+  const finished = ["completed", "failed", "canceled", "partial_success", "training_success_render_failed", "training_success_metrics_failed", "training_success_postprocess_failed"];
+  if (!raw) return finished;
+  if (raw === "finished") return finished;
   return raw.split(",").map((item) => item.trim()).filter(Boolean);
 }
 
@@ -2821,6 +2911,8 @@ function upsertJob(updated) {
   jobs = existing
     ? jobs.map((job) => job.id === updated.id ? updated : job)
     : [updated, ...jobs];
+  jobs = sortedJobsList(jobs);
+  syncJobFilters();
 }
 
 async function checkAndDownloadResult(jobId) {
@@ -2944,6 +3036,20 @@ async function loadAnalysisRows() {
   persistState();
 }
 
+async function downloadAnalysisCsv() {
+  const jobIds = sortedJobsList(jobs).map((job) => job.id).filter(Boolean);
+  if (!jobIds.length) throw new Error("No jobs to export.");
+  const blob = await exportAnalysisCsv(state.apiBaseUrl, jobIds);
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = "analysis-metrics.csv";
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
+}
+
 function parseCsv(text) {
   const lines = String(text || "").trim().split(/\r?\n/);
   if (lines.length < 2) return [];
@@ -2969,7 +3075,7 @@ function drawMetricsChart() {
   const rows = state.metricsRows
     .map((row) => ({
       row,
-      values: Object.fromEntries(ANALYSIS_METRICS.map((metric) => [metric.key, extractAnalysisMetric(row, metric.key).value])),
+      values: Object.fromEntries(ANALYSIS_METRICS.map((metric) => [metric.key, ""])),
     }))
     .filter((item) => ANALYSIS_METRICS.some((metric) => Number.isFinite(Number(item.values[metric.key]))));
   if (!rows.length) {

@@ -252,6 +252,7 @@ class FakeSftp:
     }
     self.marker_payload = json.dumps({
       "job_id": "job-1",
+      "family": "family",
       "remote_output_dir": "/remote",
     }).encode("utf-8")
     self.get_calls: list[str] = []
@@ -541,8 +542,22 @@ def test_gaussian_splatting_lightning_train_exports_ply() -> None:
   assert 'REMOTE_REPO_DIR=/remote/gaussian-splatting-lightning' in script
   assert 'cd "$REMOTE_REPO_DIR" || finish_with "partial_success" "post_train_render_or_metrics"' in script
   assert '"$PYTHON_BIN" main.py validate --data.path "$REMOTE_DATASET_WORKSPACE"' in script
+  assert "render_metrics.json" not in script
   assert "--colored" not in script
   assert "--drop-shs-rest" not in script
+
+  repair_script = remote_executor._build_remote_repair_metrics_script(
+    validated=validated,
+    job_id="job-gspl",
+    family="gaussian-splatting-lightning",
+    remote_output_dir="/remote/output",
+    remote_dataset_workspace="/remote/dataset",
+    remote_command="python3 main.py fit --data.path /remote/dataset --output /remote/output --model.save_ply true",
+  )
+  assert 'REMOTE_REPO_DIR=/remote/gaussian-splatting-lightning' in repair_script
+  assert 'cd "$REMOTE_REPO_DIR" || finish_with "partial_success" "post_train_render_or_metrics"' in repair_script
+  assert '"$PYTHON_BIN" main.py validate --data.path "$REMOTE_DATASET_WORKSPACE"' in repair_script
+  assert "render_metrics.json" not in repair_script
 
 
 def test_training_eval_arg_injection_is_family_aware() -> None:
@@ -669,13 +684,17 @@ def test_gaussian_splatting_lightning_uses_rgb_checkpoint_ply_as_fallback() -> N
 
 
 def test_result_download_validation_allows_completed_or_partial_success() -> None:
+  output_dir = api_server.remote_job_local_output_dir("session", "family", "job-1")
   base = {
+    "id": "job-1",
+    "session_id": "session",
+    "algorithm_family": "family",
     "remote_detached": True,
     "remote_output_dir": "/remote/output",
-    "output_dir": "/local/output",
+    "output_dir": output_dir,
   }
-  assert api_server.validate_completed_result_download_job({**base, "status": "completed"}) == ("/remote/output", "/local/output")
-  assert api_server.validate_completed_result_download_job({**base, "status": "partial_success"}) == ("/remote/output", "/local/output")
+  assert api_server.validate_completed_result_download_job({**base, "status": "completed"}) == ("/remote/output", output_dir)
+  assert api_server.validate_completed_result_download_job({**base, "status": "partial_success"}) == ("/remote/output", output_dir)
 
   for status in ("failed", "canceled", "running", "detached"):
     try:
@@ -696,6 +715,13 @@ def test_result_download_validation_allows_completed_or_partial_success() -> Non
   else:
     raise AssertionError("local completed job should be rejected")
 
+  try:
+    api_server.validate_completed_result_download_job({**base, "status": "completed", "output_dir": "/local/wrong-family"})
+  except ValueError as exc:
+    assert "Local output_dir does not match" in str(exc)
+  else:
+    raise AssertionError("mismatched local output path should be rejected")
+
 
 def remote_config(**overrides):
   base = {
@@ -714,12 +740,15 @@ def remote_config(**overrides):
 
 
 def result_download_job(**overrides):
+  output_dir = api_server.remote_job_local_output_dir("session", "family", "job-1")
   base = {
     "id": "job-1",
+    "session_id": "session",
+    "algorithm_family": "family",
     "status": "completed",
     "remote_detached": True,
     "remote_output_dir": "/outputs/session/family/job-1/output",
-    "output_dir": "/local/output",
+    "output_dir": output_dir,
     "remote": {
       "host": "server.example.com",
       "port": 2222,
@@ -769,13 +798,15 @@ def test_remote_result_marker_must_match_job_and_output() -> None:
     FakeSftp(),
     remote_output_dir="/remote",
     expected_job_id="job-1",
+    expected_family="family",
     expected_remote_output_dir="/remote",
   )
   assert marker["verified"] is True
   assert marker["job_id"] == "job-1"
+  assert marker["family"] == "family"
 
   wrong_job = FakeSftp()
-  wrong_job.marker_payload = json.dumps({"job_id": "other-job", "remote_output_dir": "/remote"}).encode("utf-8")
+  wrong_job.marker_payload = json.dumps({"job_id": "other-job", "family": "family", "remote_output_dir": "/remote"}).encode("utf-8")
   try:
     _verify_remote_result_marker(
       wrong_job,
@@ -789,8 +820,24 @@ def test_remote_result_marker_must_match_job_and_output() -> None:
   else:
     raise AssertionError("wrong marker job_id should be rejected")
 
+  wrong_family = FakeSftp()
+  wrong_family.marker_payload = json.dumps({"job_id": "job-1", "family": "contextgs", "remote_output_dir": "/remote"}).encode("utf-8")
+  try:
+    _verify_remote_result_marker(
+      wrong_family,
+      remote_output_dir="/remote",
+      expected_job_id="job-1",
+      expected_family="family",
+      expected_remote_output_dir="/remote",
+    )
+  except RemoteExecutionError as exc:
+    assert exc.code_hint == "WGSC-JOB-RESULTS-MARKER-MISMATCH"
+    assert exc.details["actual_family"] == "contextgs"
+  else:
+    raise AssertionError("wrong marker family should be rejected")
+
   wrong_output = FakeSftp()
-  wrong_output.marker_payload = json.dumps({"job_id": "job-1", "remote_output_dir": "/other"}).encode("utf-8")
+  wrong_output.marker_payload = json.dumps({"job_id": "job-1", "family": "family", "remote_output_dir": "/other"}).encode("utf-8")
   try:
     _verify_remote_result_marker(
       wrong_output,

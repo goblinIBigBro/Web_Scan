@@ -21,7 +21,9 @@ import {
   materializeSession,
   prepareColmapWorkspace,
   previewRemoteAlgorithm,
+  redownloadJobResult,
   reattachRemoteJob,
+  repairJobMetrics,
   remoteCheck,
   resetFlow,
   runRemoteAlgorithm,
@@ -47,7 +49,6 @@ const ANALYSIS_METRICS = [
   { key: "psnr", field: "psnr", label: "PSNR(dB)" },
   { key: "ssim", field: "ssim", label: "SSIM" },
   { key: "sizeMb", field: "size_mb", label: "Size(MB)", staticSummary: true },
-  { key: "renderFps", field: "render_fps", label: "Render(FPS)", staticSummary: true },
 ];
 
 const NAV_ITEMS = [
@@ -455,13 +456,6 @@ function analysisMetricScore(path, key) {
     if (id.includes("size") && /(mb|mib|byte|bytes|gb|gib|kb|kib|ply|checkpoint|ckpt|model|storage|disk|result|pointcloud)/.test(id)) return 75;
     return 0;
   }
-  if (key === "renderFps") {
-    if (id.includes("renderfps") || id.includes("renderingfps") || id.includes("viewerfps") || id.includes("fpsrender")) return 120;
-    if (id.includes("fps") && /(render|viewer|display|raster|frame)/.test(id)) return 95;
-    if (id === "fps") return 45;
-    if (id.endsWith("fps") && !/(algo|train|training)/.test(id)) return 35;
-    return 0;
-  }
   return 0;
 }
 
@@ -501,7 +495,7 @@ function formatAnalysisNumber(value, key) {
   if (value == null || value === "") return "-";
   const number = Number(value);
   if (!Number.isFinite(number)) return summarize(value, 32);
-  const digits = key === "ssim" ? 4 : key === "renderFps" ? 1 : number >= 100 ? 1 : 2;
+  const digits = key === "ssim" ? 4 : number >= 100 ? 1 : 2;
   return number.toFixed(digits).replace(/\.?0+$/, "");
 }
 
@@ -524,7 +518,6 @@ function analysisMetricSource(job, rows = []) {
     psnr_db: metrics.psnr_db ?? metrics.psnr,
     ssim: metrics.ssim,
     sizeMb: metrics.size_mb ?? job?.size_mb,
-    renderFps: metrics.render_fps ?? job?.render_fps,
   };
 }
 
@@ -540,8 +533,6 @@ function analysisMetricItems(job, rows = []) {
       rawValue = mappedSource === "artifact:result.json" ? (source.ssim ?? "") : "";
     } else if (metric.key === "sizeMb") {
       rawValue = String(mappedSource || "").startsWith("artifact:") ? (source.size_mb ?? source.sizeMb ?? "") : "";
-    } else if (metric.key === "renderFps") {
-      rawValue = mappedSource === "artifact:render_metrics.json" ? (source.render_fps ?? source.renderFps ?? "") : "";
     }
     return {
       ...metric,
@@ -725,6 +716,18 @@ function renderResultDownloadButton(job = {}, compact = false) {
       ? "Remote credentials are incomplete."
       : "";
   return `<button class="${compact ? "compact-button" : ""}" data-action="check-result-download" data-job-id="${escapeHtml(job.id || "")}" type="button" ${disabled ? "disabled" : ""} title="${escapeHtml(title)}">${label}</button>`;
+}
+
+function renderRepairMetricsButton(job = {}, compact = false) {
+  if (!job.can_repair_metrics) return "";
+  const ready = remoteConfigReadyForReattach();
+  return `<button class="${compact ? "compact-button" : ""}" data-action="repair-metrics" data-job-id="${escapeHtml(job.id || "")}" type="button" ${ready ? "" : "disabled"} title="${ready ? "" : "Remote credentials are incomplete."}">Repair Metrics</button>`;
+}
+
+function renderRedownloadButton(job = {}, compact = false) {
+  if (!job.can_redownload_result || job.download_path_valid !== false) return "";
+  const ready = remoteConfigReadyForReattach();
+  return `<button class="${compact ? "compact-button" : ""}" data-action="redownload-result" data-job-id="${escapeHtml(job.id || "")}" type="button" ${ready ? "" : "disabled"} title="${ready ? "" : "Remote credentials are incomplete."}">Redownload</button>`;
 }
 
 function statusClass(status) {
@@ -1096,7 +1099,6 @@ function renderCurrentJobSummary() {
       <p class="panel-copy">ID: ${escapeHtml(job.id)}</p>
       <p class="panel-copy">Stage: ${escapeHtml(job.remote_stage || "-")}</p>
       ${renderRemoteDownloadStatus(job)}
-      <p class="panel-copy">FPS ${escapeHtml(job.metrics?.fps || "-")} · Render ${escapeHtml(job.metrics?.render_fps || "-")} · Loss ${escapeHtml(job.metrics?.loss || "-")}</p>
       <div class="button-row">
         <button data-action="select-job" data-job-id="${escapeHtml(job.id)}" type="button">Logs</button>
         <button data-action="open-result" data-job-id="${escapeHtml(job.id)}" type="button">Results</button>
@@ -1787,7 +1789,7 @@ function renderJobsTable(items, options = {}) {
       <table class="job-table">
         <thead>
           <tr>
-            <th>Job</th><th>Status</th><th>Metrics</th><th>Dataset</th><th>Created</th><th>Output</th><th>Actions</th>
+            <th>Job</th><th>Status</th><th>Dataset</th><th>Created</th><th>Output</th><th>Actions</th>
           </tr>
         </thead>
         <tbody>
@@ -1805,7 +1807,6 @@ function renderJobsTable(items, options = {}) {
                 ${renderRemoteServerMatchWarning(job, { details: false })}
                 ${job.monitor_state === "needs_remote_config" ? `<p class="panel-copy">Waiting for remote reattach.</p>` : ""}
               </td>
-              <td>FPS ${escapeHtml(job.metrics?.fps || "-")}<br />Render ${escapeHtml(job.metrics?.render_fps || "-")}<br />Loss ${escapeHtml(job.metrics?.loss || "-")}</td>
               <td>${escapeHtml(summarize(jobDatasetLabel(job), 36))}</td>
               <td>${escapeHtml(formatTimestamp(job.created_at))}</td>
               <td>${escapeHtml(summarize(job.result_path || job.output_dir || "-", 42))}</td>
@@ -1813,7 +1814,9 @@ function renderJobsTable(items, options = {}) {
                 <div class="table-actions">
                   <button class="compact-button" data-action="select-job" data-job-id="${escapeHtml(job.id)}" type="button">Logs</button>
                   <button class="compact-button" data-action="open-result" data-job-id="${escapeHtml(job.id)}" type="button">Results</button>
+                  ${renderRepairMetricsButton(job, true)}
                   ${renderResultDownloadButton(job, true)}
+                  ${renderRedownloadButton(job, true)}
                   <button class="compact-button" data-action="rerun-job" data-job-id="${escapeHtml(job.id)}" type="button">Rerun</button>
                   ${isTerminal(job.status)
                     ? `<button class="danger compact-button" data-action="delete-job" data-job-id="${escapeHtml(job.id)}" type="button">Remove</button>`
@@ -1977,7 +1980,7 @@ function renderAnalysisPage() {
       <div class="panel-head">
         <div>
           <h2>Training Metrics Analysis</h2>
-          <p class="panel-copy">Parse job data into PSNR(dB), SSIM, Size(MB), and Render(FPS).</p>
+          <p class="panel-copy">Parse job data into PSNR(dB), SSIM, and Size(MB).</p>
         </div>
         <div class="button-row">
           <button data-action="load-analysis" type="button" ${job ? "" : "disabled"}>Load Metrics</button>
@@ -2014,7 +2017,7 @@ function renderMetricsTable(rows, job) {
   return `
     <div class="table-wrap">
       <table class="analysis-table">
-        <thead><tr><th>Time</th><th>PSNR(dB)</th><th>SSIM</th><th>Size(MB)</th><th>Render(FPS)</th></tr></thead>
+        <thead><tr><th>Time</th><th>PSNR(dB)</th><th>SSIM</th><th>Size(MB)</th></tr></thead>
         <tbody>
           ${hasSummary ? `
             <tr class="analysis-summary-row">
@@ -2074,6 +2077,8 @@ function renderResultPage() {
           <button data-bind-render="ply" class="${mode === "ply" ? "primary" : ""}" data-action="set-render-mode" data-mode="ply" type="button" ${plyAsset ? "" : "disabled"}>PLY</button>
           <button data-bind-render="image" class="${mode === "image" ? "primary" : ""}" data-action="set-render-mode" data-mode="image" type="button" ${imageAsset ? "" : "disabled"}>Image</button>
           ${job ? renderResultDownloadButton(job) : ""}
+          ${job ? renderRepairMetricsButton(job) : ""}
+          ${job ? renderRedownloadButton(job) : ""}
           <button data-page="algorithm" type="button">Back to Jobs</button>
         </div>
       </div>
@@ -2155,6 +2160,8 @@ async function handleClick(event) {
   if (action === "load-log-reset") await guarded(() => loadLog(true), "Failed to load logs", actionKey);
   if (action === "cancel-job") await guarded(() => cancelSelectedJob(jobId), "Failed to cancel job", actionKey);
   if (action === "check-result-download") await guarded(() => checkAndDownloadResult(jobId), "Failed to check result download", actionKey);
+  if (action === "repair-metrics") await guarded(() => repairMetrics(jobId), "Failed to repair metrics", actionKey);
+  if (action === "redownload-result") await guarded(() => redownloadResult(jobId), "Failed to redownload result", actionKey);
   if (action === "open-result") openResult(jobId);
   if (action === "open-selected-result") openResult(state.selectedJobId);
   if (action === "rerun-job") rerunJob(jobId);
@@ -2962,6 +2969,37 @@ async function checkAndDownloadResult(jobId) {
   }
 }
 
+async function repairMetrics(jobId) {
+  const id = jobId || state.selectedJobId;
+  const job = getJob(id);
+  if (!job) throw new Error("Select a partial-success job first.");
+  if (!job.can_repair_metrics) throw new Error("This job is not eligible for metrics repair.");
+  if (!remoteConfigReadyForReattach()) {
+    throw new Error("Remote credentials are required. Fill the Remote Config fields before repairing metrics.");
+  }
+  const data = await repairJobMetrics(state.apiBaseUrl, id, state.remoteConfig);
+  upsertJob(data.job);
+  await refreshJobs();
+  render();
+  afterRender();
+  showToast(data.already_running ? "Metrics repair is already running." : "Metrics repair started.");
+}
+
+async function redownloadResult(jobId) {
+  const id = jobId || state.selectedJobId;
+  const job = getJob(id);
+  if (!job) throw new Error("Select a completed remote job first.");
+  if (!remoteConfigReadyForReattach()) {
+    throw new Error("Remote credentials are required. Fill the Remote Config fields before redownloading results.");
+  }
+  const data = await redownloadJobResult(state.apiBaseUrl, id, state.remoteConfig);
+  upsertJob(data.job);
+  await refreshJobs();
+  render();
+  afterRender();
+  showToast(data.already_running ? "Result download is already running." : "Result redownload started.");
+}
+
 function openResult(jobId) {
   if (!jobId) return;
   state.selectedJobId = jobId;
@@ -3087,7 +3125,6 @@ function drawMetricsChart() {
     { key: "psnr", label: "PSNR(dB)", color: "#2f7dff" },
     { key: "ssim", label: "SSIM", color: "#ffb44c" },
     { key: "sizeMb", label: "Size(MB)", color: "#ff5570" },
-    { key: "renderFps", label: "Render(FPS)", color: "#2be48f" },
   ];
   ctx.strokeStyle = "rgba(142,164,197,0.2)";
   for (let y = 40; y < 230; y += 38) {

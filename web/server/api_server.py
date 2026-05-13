@@ -54,6 +54,7 @@ from web.server.remote_executor import (
   download_remote_output_directory,
   poll_remote_detached_job,
   remote_preflight_check,
+  repair_remote_job_metrics,
   sanitize_remote_config,
   sanitize_formatted_command,
   start_remote_algorithm_detached,
@@ -278,16 +279,6 @@ def _analysis_metric_score(path: str, key: str) -> int:
     if "size" in key_id and re.search(r"mb|mib|byte|bytes|gb|gib|kb|kib|ply|checkpoint|ckpt|model|storage|disk|result|pointcloud", key_id):
       return 75
     return 0
-  if key == "render_fps":
-    if any(token in key_id for token in ("renderfps", "renderingfps", "viewerfps", "fpsrender")):
-      return 120
-    if "fps" in key_id and re.search(r"render|viewer|display|raster|frame", key_id):
-      return 95
-    if key_id == "fps":
-      return 45
-    if key_id.endswith("fps") and not re.search(r"algo|train|training", key_id):
-      return 35
-    return 0
   return 0
 
 
@@ -304,7 +295,7 @@ def infer_analysis_metrics_with_sources(payload: Any, source_prefix: str = "") -
   ]
   inferred: Dict[str, Any] = {}
   sources: Dict[str, str] = {}
-  for key in ("psnr", "ssim", "size_mb", "render_fps"):
+  for key in ("psnr", "ssim", "size_mb"):
     scored = [
       (_analysis_metric_score(path, key), path, value)
       for path, value in entries
@@ -364,11 +355,6 @@ def extract_job_metrics(text: str) -> Dict[str, Any]:
   metrics: Dict[str, Any] = {}
   number = METRIC_NUMBER_PATTERN
   patterns = {
-    "fps": [
-      rf"\b({number})[ \t]*fps\b",
-      rf"\bfps[:=]\s*({number})\b",
-      rf"\bfps\s+({number})\b",
-    ],
     "iter": [
       r"\biter(?:ation)?[:=\s]+([0-9]+)\b",
       r"\b([0-9]+)\s*/\s*[0-9]+\b",
@@ -378,11 +364,6 @@ def extract_job_metrics(text: str) -> Dict[str, Any]:
     ],
     "lpips": [
       rf"\blpips[:=\s]+({number})\b",
-    ],
-    "render_fps": [
-      rf"\brender\s*\(?\s*fps\s*\)?\s*[:=]\s*({number})\b",
-      rf"\b(?:render(?:ing)?|viewer|display|raster(?:izer|ize)?|frame)[ _-]*fps[:=\s]+({number})\b",
-      rf"\b(?:render(?:ing)?|viewer|display|raster(?:izer|ize)?|frame)[^\n]{{0,32}}?\b({number})\s*fps\b",
     ],
   }
 
@@ -416,15 +397,10 @@ def extract_job_metrics(text: str) -> Dict[str, Any]:
       pass
     break
 
-  if metrics.get("render_fps") and not metrics.get("fps"):
-    metrics["fps"] = metrics["render_fps"]
-  if metrics.get("fps") and not metrics.get("render_fps"):
-    if not re.search(r"\b(?:algo|train(?:ing)?|optimization)\s*fps\b", text, flags=re.IGNORECASE):
-      metrics["render_fps"] = metrics["fps"]
   return metrics
 
 
-METRICS_CSV_COLUMNS = ["timestamp", "channel", "iter", "loss", "psnr", "ssim", "lpips", "fps", "size_mb", "render_fps"]
+METRICS_CSV_COLUMNS = ["timestamp", "channel", "iter", "loss", "psnr", "ssim", "lpips", "size_mb"]
 
 
 def utc_timestamp_text(now: float | None = None) -> str:
@@ -598,9 +574,7 @@ def append_job_log_line(job: Dict[str, Any], channel: str, line: str) -> None:
     "psnr": "",
     "ssim": "",
     "lpips": metrics_update.get("lpips", ""),
-    "fps": metrics_update.get("fps", ""),
     "size_mb": metrics_update.get("size_mb", ""),
-    "render_fps": metrics_update.get("render_fps", ""),
   }
   history = job.setdefault("metrics_history", [])
   history.append(entry)
@@ -1004,6 +978,13 @@ def resolve_project_path(path_value: str | None) -> str:
 
 def default_run_output_dir(session_id: str, family: str) -> str:
   return str((WEB_DIR / "generated" / "runs" / session_id / family).resolve())
+
+
+def remote_job_local_output_dir(session_id: str, family: str, job_id: str) -> str:
+  safe_session = _normalize_slug(str(session_id or "").strip(), fallback="session")
+  safe_family = _normalize_slug(str(family or "").strip(), fallback="algorithm")
+  safe_job = _normalize_slug(str(job_id or "").strip(), fallback="job")
+  return str((WEB_DIR / "generated" / "runs" / safe_session / safe_family / safe_job / "output").resolve())
 
 
 def strip_empty_repo_path_flag(command: str, repo_path: str) -> str:
@@ -2545,35 +2526,6 @@ def read_result_json_metrics(directory: Path, family: str | None = None) -> tupl
   return {}, None
 
 
-def analysis_render_metrics_files(directory: Path, candidate_dirs: list[Path]) -> list[Path]:
-  files: list[Path] = []
-  for candidate_dir in [directory, *candidate_dirs]:
-    if candidate_dir.is_file() and candidate_dir.name == "render_metrics.json":
-      add_unique_path(files, candidate_dir)
-      continue
-    if candidate_dir.is_dir():
-      candidate = candidate_dir / "render_metrics.json"
-      if candidate.is_file():
-        add_unique_path(files, candidate)
-  files.sort(key=lambda path: (path_mtime(path), str(path)), reverse=True)
-  return files
-
-
-def read_render_fps_metric(directory: Path, candidate_dirs: list[Path]) -> tuple[float | None, Path | None]:
-  for metrics_path in analysis_render_metrics_files(directory, candidate_dirs):
-    try:
-      payload = json.loads(metrics_path.read_text(encoding="utf-8"))
-    except Exception:
-      continue
-    if not isinstance(payload, dict):
-      continue
-    value = _coerce_metric_number(payload.get("end_to_end_render_fps"))
-    if value is None:
-      continue
-    return value, metrics_path
-  return None, None
-
-
 def relative_metric_source(root: Path, path: Path, suffix: str = "") -> str:
   try:
     label = str(path.resolve().relative_to(root.resolve()))
@@ -2667,27 +2619,6 @@ def rendered_image_count(candidate_dirs: list[Path]) -> int:
   if rendered_dir is None:
     return 0
   return len([path for path in rendered_dir.iterdir() if path.is_file() and is_image_file(path)])
-
-
-def render_fps_from_log_text(text: str) -> float | None:
-  best_value: float | None = None
-  fallback_value: float | None = None
-  normalized = text.replace("\r", "\n")
-  for line in normalized.splitlines():
-    lowered = line.lower()
-    matches = re.findall(rf"({METRIC_NUMBER_PATTERN})\s*it/s\b", line)
-    if not matches:
-      continue
-    try:
-      value = float(matches[-1])
-    except ValueError:
-      continue
-    if value <= 0 or value > 10000:
-      continue
-    fallback_value = value
-    if any(token in lowered for token in ("validation", "render", "eval", "dataloader")):
-      best_value = value
-  return best_value if best_value is not None else fallback_value
 
 
 def runtime_log_text_for_job(job: Dict[str, Any] | None) -> str:
@@ -3086,10 +3017,6 @@ def read_runtime_artifacts(
     merge_analysis_metric(metrics, sources, "psnr_db", result_metrics.get("psnr_db") or result_metrics.get("psnr"), "artifact:result.json", overwrite=True)
     merge_analysis_metric(metrics, sources, "ssim", result_metrics.get("ssim"), "artifact:result.json", overwrite=True)
 
-  render_fps, render_metrics_path = read_render_fps_metric(directory, candidate_dirs)
-  if render_metrics_path:
-    merge_analysis_metric(metrics, sources, "render_fps", render_fps, "artifact:render_metrics.json", overwrite=True)
-
   artifact: Dict[str, Any] = {}
   for candidate_dir in candidate_dirs:
     artifact = load_result_path(str(candidate_dir), family=family, representation=representation)
@@ -3130,7 +3057,6 @@ def read_runtime_artifacts(
     metrics["psnr_source"] = sources.get("psnr") or sources.get("psnr_db")
     metrics["ssim_source"] = sources.get("ssim")
     metrics["size_source"] = sources.get("size_mb")
-    metrics["render_fps_source"] = sources.get("render_fps")
   if metrics:
     payload["metrics"] = metrics
   return payload
@@ -3357,11 +3283,6 @@ def build_remote_algorithm_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
       PurePosixPath(remote_config["workspace_root"]) / "datasets" / family / remote_dataset_id / "workspace"
     )
 
-  requested_output_dir = str(payload.get("output_dir", "")).strip()
-  resolved_output_dir = resolve_project_path(requested_output_dir)
-  if not resolved_output_dir:
-    resolved_output_dir = default_run_output_dir(session_id, family)
-
   remote_paths = build_remote_paths(
     workspace_root=remote_config["workspace_root"],
     output_root=remote_config["output_root"],
@@ -3369,6 +3290,7 @@ def build_remote_algorithm_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
     family=family,
     job_id=preview_job_id,
   )
+  resolved_output_dir = remote_job_local_output_dir(session_id, family, preview_job_id)
   remote_tmux_session = build_remote_tmux_session_name(family=family, job_id=preview_job_id)
   remote_tmux_attach_command = build_remote_tmux_attach_command(remote_config, remote_tmux_session)
 
@@ -3493,11 +3415,9 @@ ANALYSIS_EXPORT_COLUMNS = [
   "psnr_db",
   "ssim",
   "size_mb",
-  "render_fps",
   "psnr_source",
   "ssim_source",
   "size_source",
-  "render_fps_source",
   "metrics_csv_url",
   "logs_download_url",
 ]
@@ -3531,12 +3451,10 @@ def analysis_export_csv(job_ids: list[str]) -> str:
       "result_path": enriched.get("result_path", ""),
       "psnr_db": psnr_value,
       "ssim": ssim_value,
-    "size_mb": metrics.get("size_mb", "") if sources.get("size_mb") else "",
-    "render_fps": metrics.get("render_fps", "") if sources.get("render_fps") == "artifact:render_metrics.json" else "",
+      "size_mb": metrics.get("size_mb", "") if sources.get("size_mb") else "",
       "psnr_source": psnr_source,
       "ssim_source": ssim_source,
       "size_source": sources.get("size_mb", ""),
-      "render_fps_source": sources.get("render_fps", ""),
       "metrics_csv_url": enriched.get("metrics_csv_url", ""),
       "logs_download_url": enriched.get("logs_download_url", ""),
     })
@@ -3591,6 +3509,19 @@ def enrich_job(job: Dict[str, Any]) -> Dict[str, Any]:
   if mark_stale_remote_download_if_needed(job):
     persist_job_state(job)
   enriched = dict(job)
+  if isinstance(enriched.get("metrics"), dict):
+    cleaned_metrics = dict(enriched["metrics"])
+    for removed_key in ("fps", "render_fps", "render_fps_source"):
+      cleaned_metrics.pop(removed_key, None)
+    if isinstance(cleaned_metrics.get("analysis_metric_sources"), dict):
+      cleaned_sources = dict(cleaned_metrics["analysis_metric_sources"])
+      cleaned_sources.pop("render_fps", None)
+      cleaned_metrics["analysis_metric_sources"] = cleaned_sources
+    enriched["metrics"] = cleaned_metrics
+  if isinstance(enriched.get("analysis_metric_sources"), dict):
+    cleaned_top_sources = dict(enriched["analysis_metric_sources"])
+    cleaned_top_sources.pop("render_fps", None)
+    enriched["analysis_metric_sources"] = cleaned_top_sources
   if not is_remote_download_pending(enriched):
     artifacts = read_runtime_artifacts(enriched.get("output_dir"), enriched.get("representation"), enriched.get("algorithm_family"), enriched)
     existing_metrics = dict(enriched.get("metrics", {})) if isinstance(enriched.get("metrics"), dict) else {}
@@ -3600,11 +3531,9 @@ def enrich_job(job: Dict[str, Any]) -> Dict[str, Any]:
       "ssim",
       "size_mb",
       "size_bytes",
-      "render_fps",
       "psnr_source",
       "ssim_source",
       "size_source",
-      "render_fps_source",
     ):
       existing_metrics.pop(strict_key, None)
     if artifacts.get("metrics"):
@@ -3635,12 +3564,16 @@ def enrich_job(job: Dict[str, Any]) -> Dict[str, Any]:
   enriched["psnr_source"] = metric_sources.get("psnr") or metric_sources.get("psnr_db")
   enriched["ssim_source"] = metric_sources.get("ssim")
   enriched["size_source"] = metric_sources.get("size_mb")
-  enriched["render_fps_source"] = metric_sources.get("render_fps")
+  status = str(enriched.get("status", "")).strip().lower()
+  enriched["download_path_valid"] = job_download_path_valid(enriched)
+  enriched["can_repair_metrics"] = bool(status in PARTIAL_SUCCESS_STATUSES and enriched.get("remote_detached"))
+  enriched["can_redownload_result"] = bool(status in DOWNLOADABLE_RESULT_STATUSES and enriched.get("remote_detached"))
+  enriched["analysis_metrics_ready"] = bool(enriched.get("result_json_exists"))
   if isinstance(enriched.get("metrics_history"), list):
     enriched["metrics_history_count"] = len(enriched["metrics_history"])
     enriched.pop("metrics_history", None)
   private_fields = [key for key in enriched if key.startswith("_")]
-  for private_field in ("log_dir", "log_file", "metrics_csv_file", *private_fields):
+  for private_field in ("log_dir", "log_file", "metrics_csv_file", "stdout", "stderr", *private_fields):
     enriched.pop(private_field, None)
   return enriched
 
@@ -3940,6 +3873,43 @@ def completed_remote_result_paths(job: Dict[str, Any]) -> tuple[str, str]:
   return remote_output_dir, local_output_dir
 
 
+def canonical_job_output_dir(job: Dict[str, Any]) -> str:
+  return remote_job_local_output_dir(
+    str(job.get("session_id") or "default-session"),
+    str(job.get("algorithm_family") or "algorithm"),
+    str(job.get("id") or "job"),
+  )
+
+
+def job_download_path_valid(job: Dict[str, Any]) -> bool:
+  local_output_dir = str(job.get("output_dir") or "").strip()
+  if not local_output_dir:
+    return False
+  try:
+    return Path(local_output_dir).expanduser().resolve() == Path(canonical_job_output_dir(job)).resolve()
+  except Exception:
+    return False
+
+
+def ensure_job_download_path_valid(job: Dict[str, Any]) -> None:
+  if job_download_path_valid(job):
+    job["download_path_valid"] = True
+    return
+  job["download_path_valid"] = False
+  job["remote_stage"] = "download_path_mismatch"
+  raise ValueError(
+    "Local output_dir does not match this job/family. Refusing to download results into a potentially stale directory."
+  )
+
+
+def reset_job_output_dir_to_canonical(job: Dict[str, Any]) -> str:
+  output_dir = canonical_job_output_dir(job)
+  job["output_dir"] = output_dir
+  job["download_path_valid"] = True
+  Path(output_dir).mkdir(parents=True, exist_ok=True)
+  return output_dir
+
+
 def normalize_remote_identity(config: Dict[str, Any]) -> Dict[str, Any]:
   if not isinstance(config, dict):
     return {}
@@ -4028,6 +3998,7 @@ def validate_completed_result_download_job(job: Dict[str, Any]) -> tuple[str, st
     raise ValueError("Completed remote job has no remote_output_dir to download.")
   if not local_output_dir:
     raise ValueError("Completed remote job has no local output_dir to download into.")
+  ensure_job_download_path_valid(job)
   return remote_output_dir, local_output_dir
 
 
@@ -4076,6 +4047,7 @@ def check_completed_result_download(job: Dict[str, Any], remote_config: Dict[str
     local_output_dir=local_output_dir,
     remote_status_path=completed_remote_status_path(job, remote_output_dir),
     expected_job_id=str(job.get("id", "")),
+    expected_family=str(job.get("algorithm_family", "")),
     expected_remote_output_dir=remote_output_dir,
   )
   apply_completed_result_check(job, check)
@@ -4098,6 +4070,7 @@ def start_completed_result_download(job: Dict[str, Any], remote_config: Dict[str
       local_output_dir=local_output_dir,
       remote_status_path=completed_remote_status_path(job, remote_output_dir),
       expected_job_id=str(job.get("id", "")),
+      expected_family=str(job.get("algorithm_family", "")),
       expected_remote_output_dir=remote_output_dir,
     )
   except Exception:
@@ -4134,6 +4107,7 @@ def start_completed_result_download(job: Dict[str, Any], remote_config: Dict[str
         local_output_dir=local_output_dir,
         remote_status_path=completed_remote_status_path(job, remote_output_dir),
         expected_job_id=str(job.get("id", "")),
+        expected_family=str(job.get("algorithm_family", "")),
         expected_remote_output_dir=remote_output_dir,
         progress_callback=record_download_progress,
       )
@@ -4167,6 +4141,124 @@ def start_completed_result_download(job: Dict[str, Any], remote_config: Dict[str
     job.pop("_result_download_starting", None)
   thread.start()
   return {"ok": True, "started": True, "complete": False, "check": check, "job": enrich_job(job)}
+
+
+def start_completed_result_redownload(job: Dict[str, Any], remote_config: Dict[str, Any]) -> Dict[str, Any]:
+  reset_job_output_dir_to_canonical(job)
+  persist_job_state(job)
+  return start_completed_result_download(job, remote_config)
+
+
+def start_job_metrics_repair(job: Dict[str, Any], remote_config: Dict[str, Any], *, force: bool = False) -> Dict[str, Any]:
+  status = str(job.get("status", "")).strip().lower()
+  if status not in PARTIAL_SUCCESS_STATUSES and not force:
+    raise ValueError("Only partial-success jobs can repair metrics unless force=true.")
+  if not job.get("remote_detached"):
+    raise ValueError("Only remote detached jobs can repair metrics.")
+  if job.get("_repair_metrics_running"):
+    return {"ok": True, "started": False, "already_running": True, "job": enrich_job(job)}
+
+  remote_result = job.get("remote_result") if isinstance(job.get("remote_result"), dict) else {}
+  remote_output_dir = str(job.get("remote_output_dir") or remote_result.get("remote_output_dir") or "").strip()
+  remote_dataset_workspace = str(remote_result.get("remote_dataset_workspace") or job.get("remote_dataset_path") or "").strip()
+  if not remote_output_dir:
+    raise ValueError("Job has no remote_output_dir for metrics repair.")
+  if not remote_dataset_workspace:
+    raise ValueError("Job has no remote_dataset_workspace for metrics repair.")
+
+  job["_repair_metrics_running"] = True
+  job["remote_stage"] = "repair_metrics_queued"
+  job["monitor_state"] = "monitoring"
+  job["safe_to_close_web"] = True
+  persist_job_state(job)
+
+  def runner() -> None:
+    try:
+      append_job_log_line(job, "stdout", "[Repair] Starting render/metrics repair for partial-success job.\n")
+
+      def on_log(channel: str, line: str) -> None:
+        append_job_log_line(job, channel, line)
+
+      result = repair_remote_job_metrics(
+        remote_config=remote_config,
+        job_id=str(job.get("id", "")),
+        family=str(job.get("algorithm_family", "")),
+        remote_output_dir=remote_output_dir,
+        remote_dataset_workspace=remote_dataset_workspace,
+        remote_command=str(job.get("remote_command") or remote_result.get("remote_command") or job.get("command") or ""),
+        log_callback=on_log,
+      )
+      for key in (
+        "train_status",
+        "render_status",
+        "metrics_status",
+        "postprocess_status",
+        "result_json_exists",
+        "result_path",
+        "failure_stage",
+      ):
+        if key in result:
+          job[key] = result[key]
+      if result.get("ok") and result.get("result_json_exists"):
+        job["status"] = "completed"
+        job["partial_success"] = False
+        job["failure_stage"] = ""
+        job["remote_stage"] = "completed"
+        job["monitor_state"] = "completed"
+        job["return_code"] = 0
+        reset_job_output_dir_to_canonical(job)
+        try:
+          remote_download_dir, local_download_dir = completed_remote_result_paths(job)
+
+          def record_download_progress(progress: Dict[str, Any]) -> None:
+            set_remote_download_progress(job, progress)
+            persist_job_state(job)
+
+          download_result = download_remote_output_directory(
+            remote_config=remote_config,
+            remote_output_dir=remote_download_dir,
+            local_output_dir=local_download_dir,
+            remote_status_path=completed_remote_status_path(job, remote_download_dir),
+            expected_job_id=str(job.get("id", "")),
+            expected_family=str(job.get("algorithm_family", "")),
+            expected_remote_output_dir=remote_download_dir,
+            progress_callback=record_download_progress,
+          )
+          set_remote_download_progress(job, {
+            **download_result,
+            "pending": False,
+            "phase": "complete",
+          })
+        except Exception as exc:
+          set_remote_download_progress(job, {
+            "pending": False,
+            "phase": "error",
+            "error": str(exc),
+          })
+          append_job_log_line(job, "stderr", f"[Repair] Metrics repair succeeded, but result download failed: {exc}\n")
+      else:
+        job["status"] = "partial_success"
+        job["partial_success"] = True
+        job["remote_stage"] = result.get("stage") or "post_train_render_or_metrics"
+        job["monitor_state"] = "completed"
+        job["return_code"] = result.get("return_code", job.get("return_code", ""))
+      job["finished_at"] = time.time()
+      update_job_artifacts(job)
+      persist_job_state(job)
+    except Exception as exc:  # pragma: no cover - network dependent
+      job["status"] = "partial_success"
+      job["partial_success"] = True
+      job["failure_stage"] = "post_train_render_or_metrics"
+      job["remote_stage"] = "repair_metrics_failed"
+      job["monitor_state"] = "completed"
+      append_job_log_line(job, "stderr", f"[Repair] Metrics repair failed: {exc}\n")
+      persist_job_state(job)
+    finally:
+      job.pop("_repair_metrics_running", None)
+      persist_job_state(job)
+
+  threading.Thread(target=runner, daemon=True).start()
+  return {"ok": True, "started": True, "job": enrich_job(job)}
 
 
 def output_dir_has_pending_remote_download(directory: Path) -> bool:
@@ -4290,6 +4382,7 @@ def update_job_artifacts(job: Dict[str, Any]) -> None:
     "ssim",
     "size_mb",
     "size_bytes",
+    "fps",
     "render_fps",
     "psnr_source",
     "ssim_source",
@@ -4376,6 +4469,8 @@ def start_remote_monitor_thread(job: Dict[str, Any], remote_config: Dict[str, An
             local_output_dir=str(job.get("output_dir", "")),
             log_cursor=int(job.get("remote_log_cursor", 0) or 0),
             download_output=False,
+            expected_job_id=str(job.get("id", "")),
+            expected_family=str(job.get("algorithm_family", "")),
           )
           apply_remote_poll_result(job, poll_result)
           persist_job_state(job)
@@ -4401,6 +4496,8 @@ def start_remote_monitor_thread(job: Dict[str, Any], remote_config: Dict[str, An
               log_cursor=int(job.get("remote_log_cursor", 0) or 0),
               download_output=True,
               download_progress_callback=record_download_progress,
+              expected_job_id=str(job.get("id", "")),
+              expected_family=str(job.get("algorithm_family", "")),
             )
             apply_remote_poll_result(job, final_poll)
             if str(job.get("monitor_state", "")) != "completed":
@@ -5010,6 +5107,48 @@ class ApiHandler(SimpleHTTPRequestHandler):
         )
       return
 
+    if parsed.path.startswith("/api/jobs/") and not "/results/" in parsed.path:
+      parts = parsed.path.strip("/").split("/")
+      job_id = parts[2] if len(parts) >= 3 else ""
+      action = parts[3] if len(parts) == 4 else ""
+      if action in {"repair-metrics", "redownload-result"}:
+        job = JOBS.get(job_id)
+        if not job:
+          json_response(self, {"ok": False, "error": f"Unknown job: {job_id}"}, status=404)
+          return
+        try:
+          remote_config = result_download_remote_config(job, payload)
+          if action == "repair-metrics":
+            result = start_job_metrics_repair(job, remote_config, force=bool(payload.get("force")))
+          else:
+            result = start_completed_result_redownload(job, remote_config)
+          json_response(self, result)
+          return
+        except RemoteExecutionError as exc:
+          error_response(
+            self,
+            code=exc.code_hint or "WGSC-JOB-REPAIR-REMOTE-001",
+            step="job",
+            message=str(exc),
+            status=400,
+            details={
+              "job_id": job_id,
+              "stage": exc.stage,
+              **(exc.details if isinstance(getattr(exc, "details", None), dict) else {}),
+            },
+          )
+          return
+        except Exception as exc:
+          error_response(
+            self,
+            code="WGSC-JOB-REPAIR-001",
+            step="job",
+            message=str(exc),
+            status=400,
+            details={"job_id": job_id},
+          )
+          return
+
     if parsed.path.startswith("/api/jobs/") and "/results/" in parsed.path:
       parts = parsed.path.strip("/").split("/")
       job_id = parts[2] if len(parts) >= 3 else ""
@@ -5548,10 +5687,9 @@ class ApiHandler(SimpleHTTPRequestHandler):
           )
           return
 
-      requested_output_dir = payload.get("output_dir", "")
-      resolved_output_dir = resolve_project_path(requested_output_dir)
-      if not resolved_output_dir:
-        resolved_output_dir = default_run_output_dir(session_id, family)
+      requested_job_id = str(payload.get("job_id", payload.get("preview_job_id", ""))).strip()
+      job_id = requested_job_id if requested_job_id and requested_job_id not in JOBS else str(uuid.uuid4())
+      resolved_output_dir = remote_job_local_output_dir(session_id, family, job_id)
       Path(resolved_output_dir).mkdir(parents=True, exist_ok=True)
 
       remote_config_input = extract_remote_config_input(payload)
@@ -5650,8 +5788,6 @@ class ApiHandler(SimpleHTTPRequestHandler):
         return
 
       command_override = str(payload.get("command_override", "")).strip()
-      requested_job_id = str(payload.get("job_id", payload.get("preview_job_id", ""))).strip()
-      job_id = requested_job_id if requested_job_id and requested_job_id not in JOBS else str(uuid.uuid4())
       job_tmux_session = build_remote_tmux_session_name(family=family, job_id=job_id)
       job = {
         "id": job_id,

@@ -146,22 +146,21 @@ def test_discover_generated_runs() -> None:
 def test_analysis_metrics_only_use_result_json_for_quality() -> None:
   result_dir = TEST_ROOT / "analysis-source"
   write_file(result_dir / "point_cloud" / "iteration_1" / "point_cloud.ply", b"ply\n")
-  (result_dir / "metrics.json").write_text('{"psnr": 99, "ssim": 0.99, "render_fps": 777}', encoding="utf-8")
+  (result_dir / "metrics.json").write_text('{"psnr": 99, "ssim": 0.99}', encoding="utf-8")
   (result_dir / "result.json").write_text('{"PSNR": 31.25, "SSIM": 0.8123}', encoding="utf-8")
   (result_dir / "render_metrics.json").write_text('{"end_to_end_render_fps": 12.5}', encoding="utf-8")
 
   artifacts = read_runtime_artifacts(
     str(result_dir),
     family="megs2",
-    job={"metrics": {"psnr": 1, "ssim": 0.1, "render_fps": 2}},
+    job={"metrics": {"psnr": 1, "ssim": 0.1}},
   )
   metrics = artifacts["metrics"]
   assert metrics["psnr"] == "31.25", metrics
   assert metrics["ssim"] == "0.8123", metrics
-  assert metrics["render_fps"] == "12.5", metrics
   assert metrics["analysis_metric_sources"]["psnr"] == "artifact:result.json", metrics
   assert metrics["analysis_metric_sources"]["ssim"] == "artifact:result.json", metrics
-  assert metrics["analysis_metric_sources"]["render_fps"] == "artifact:render_metrics.json", metrics
+  assert "render_fps" not in metrics, metrics
 
   missing_dir = TEST_ROOT / "analysis-missing-result"
   missing_dir.mkdir(parents=True, exist_ok=True)
@@ -183,7 +182,7 @@ def test_analysis_size_uses_bitstream_artifacts() -> None:
   artifacts = read_runtime_artifacts(
     str(result_dir),
     family="hac-plus-plus",
-    job={"metrics": {"size_mb": 999, "render_fps": 777}},
+    job={"metrics": {"size_mb": 999}},
   )
   metrics = artifacts["metrics"]
   assert abs(float(metrics["size_mb"]) - (3072 / 1024 / 1024)) < 1e-9, metrics

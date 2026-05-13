@@ -181,6 +181,28 @@ export async function downloadJobResult(apiBaseUrl, jobId, remote = {}) {
   return parseJson(response);
 }
 
+export async function redownloadJobResult(apiBaseUrl, jobId, remote = {}) {
+  const response = await fetch(withApiBase(apiBaseUrl, `api/jobs/${jobId}/redownload-result`), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ remote }),
+  });
+  return parseJson(response);
+}
+
+export async function repairJobMetrics(apiBaseUrl, jobId, remote = {}, options = {}) {
+  const response = await fetch(withApiBase(apiBaseUrl, `api/jobs/${jobId}/repair-metrics`), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ remote, force: Boolean(options.force) }),
+  });
+  return parseJson(response);
+}
+
 export async function resetFlow(apiBaseUrl, payload) {
   const response = await fetch(withApiBase(apiBaseUrl, "api/flow/reset"), {
     method: "POST",

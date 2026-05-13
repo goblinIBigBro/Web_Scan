@@ -972,6 +972,7 @@ def _verify_remote_result_marker(
   remote_output_dir: str,
   remote_status_path: str = "",
   expected_job_id: str = "",
+  expected_family: str = "",
   expected_remote_output_dir: str = "",
 ) -> Dict[str, Any]:
   marker_path = _remote_result_marker_path(remote_output_dir, remote_status_path)
@@ -987,6 +988,19 @@ def _verify_remote_result_marker(
         "remote_status_path": marker_path,
         "expected_job_id": expected_job_id,
         "actual_job_id": marker_job_id,
+      },
+    )
+  marker_family = str(payload.get("family", "")).strip()
+  expected_family = str(expected_family or "").strip()
+  if expected_family and marker_family != expected_family:
+    raise RemoteExecutionError(
+      "Remote result marker belongs to a different algorithm family.",
+      code_hint="WGSC-JOB-RESULTS-MARKER-MISMATCH",
+      stage="result_marker",
+      details={
+        "remote_status_path": marker_path,
+        "expected_family": expected_family,
+        "actual_family": marker_family,
       },
     )
   marker_output_dir = str(PurePosixPath(str(payload.get("remote_output_dir", "") or "")))
@@ -1006,6 +1020,7 @@ def _verify_remote_result_marker(
     "verified": True,
     "remote_status_path": marker_path,
     "job_id": marker_job_id,
+    "family": marker_family,
     "remote_output_dir": marker_output_dir,
   }
 
@@ -1173,6 +1188,7 @@ def check_remote_output_download(
   local_output_dir: str,
   remote_status_path: str = "",
   expected_job_id: str = "",
+  expected_family: str = "",
   expected_remote_output_dir: str = "",
 ) -> Dict[str, Any]:
   validated = validate_remote_config(remote_config)
@@ -1196,6 +1212,7 @@ def check_remote_output_download(
       remote_output_dir=remote_output_dir,
       remote_status_path=remote_status_path,
       expected_job_id=expected_job_id,
+      expected_family=expected_family,
       expected_remote_output_dir=expected_remote_output_dir,
     )
     plan = _build_remote_download_plan(sftp, remote_output_dir, Path(local_output_dir))
@@ -1219,6 +1236,7 @@ def download_remote_output_directory(
   local_output_dir: str,
   remote_status_path: str = "",
   expected_job_id: str = "",
+  expected_family: str = "",
   expected_remote_output_dir: str = "",
   progress_callback: Callable[[Dict[str, Any]], None] | None = None,
 ) -> Dict[str, Any]:
@@ -1243,6 +1261,7 @@ def download_remote_output_directory(
       remote_output_dir=remote_output_dir,
       remote_status_path=remote_status_path,
       expected_job_id=expected_job_id,
+      expected_family=expected_family,
       expected_remote_output_dir=expected_remote_output_dir,
     )
     result = _download_directory(
@@ -1624,52 +1643,6 @@ if items:
 PY
 }
 
-write_render_metrics_json() {
-  "$PYTHON_BIN" - "$1" "$2" "$3" <<'PY'
-from pathlib import Path
-import json
-import sys
-import time
-
-root = Path(sys.argv[1])
-try:
-  started = float(sys.argv[2])
-  ended = float(sys.argv[3])
-except Exception:
-  started = ended = time.time()
-duration = max(0.0, ended - started)
-image_suffixes = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
-patterns = [
-  "test/*/renders/*",
-  "val/*",
-  "val/**/*",
-  "test/**/*",
-]
-images = []
-seen = set()
-for pattern in patterns:
-  for path in root.glob(pattern):
-    if not path.is_file() or path.suffix.lower() not in image_suffixes:
-      continue
-    key = str(path.resolve())
-    if key in seen:
-      continue
-    seen.add(key)
-    images.append(path)
-payload = {
-  "stage": "render",
-  "status": "success",
-  "render_images": len(images),
-  "render_duration_sec": duration,
-  "end_to_end_render_fps": (len(images) / duration) if duration > 0 and images else None,
-  "fps_definition": "saved_rendered_images / validate_wall_time",
-  "updated_at": time.time(),
-}
-with open(root / "render_metrics.json", "w", encoding="utf-8") as handle:
-  json.dump(payload, handle, ensure_ascii=False, indent=2)
-PY
-}
-
 write_canonical_result_json() {
   "$PYTHON_BIN" - "$1" <<'PY'
 from pathlib import Path
@@ -1853,7 +1826,6 @@ def _remote_post_train_eval_block(enabled: bool) -> str:
   fi
 
   write_status "running" "post_train_render" "" "Training completed; running render stage."
-  render_started="$("$PYTHON_BIN" -c 'import time; print(time.time())')"
   case "$FAMILY" in
     "gaussian-splatting-lightning")
       latest_ckpt="$(latest_gspl_checkpoint "$EVAL_OUTPUT_DIR")"
@@ -1882,7 +1854,6 @@ def _remote_post_train_eval_block(enabled: bool) -> str:
       render_rc=$?
       ;;
   esac
-  render_finished="$("$PYTHON_BIN" -c 'import time; print(time.time())')"
   if [ "$render_rc" -ne 0 ]; then
     RENDER_STATUS="failed"
     METRICS_STATUS="skipped"
@@ -1893,7 +1864,6 @@ def _remote_post_train_eval_block(enabled: bool) -> str:
     finish_with "partial_success" "post_train_render_or_metrics" "$render_rc" "Training succeeded, but render failed; result.json is missing because render/metrics pipeline did not complete."
   fi
   RENDER_STATUS="success"
-  write_render_metrics_json "$EVAL_OUTPUT_DIR" "$render_started" "$render_finished"
 
   write_status "running" "post_train_metrics" "" "Render completed; running metrics stage."
   case "$FAMILY" in
@@ -2461,6 +2431,8 @@ def poll_remote_detached_job(
   log_cursor: int = 0,
   download_output: bool = False,
   download_progress_callback: Callable[[Dict[str, Any]], None] | None = None,
+  expected_job_id: str = "",
+  expected_family: str = "",
 ) -> Dict[str, Any]:
   validated = validate_remote_config(remote_config)
   paramiko = _load_paramiko()
@@ -2485,7 +2457,23 @@ def poll_remote_detached_job(
     stage = str(status_payload.get("stage") or "remote_detached_running")
     return_code = status_payload.get("return_code")
     download_info: Dict[str, Any] = {}
-    if download_output and status in {"completed", "failed", "canceled"}:
+    if download_output and status in {"completed", "partial_success", "training_success_render_failed", "training_success_metrics_failed", "training_success_postprocess_failed"}:
+      marker_job_id = str(status_payload.get("job_id", "")).strip()
+      marker_family = str(status_payload.get("family", "")).strip()
+      if expected_job_id and marker_job_id != str(expected_job_id).strip():
+        raise RemoteExecutionError(
+          "Remote result marker belongs to a different job.",
+          code_hint="WGSC-JOB-RESULTS-MARKER-MISMATCH",
+          stage="result_marker",
+          details={"expected_job_id": expected_job_id, "actual_job_id": marker_job_id},
+        )
+      if expected_family and marker_family != str(expected_family).strip():
+        raise RemoteExecutionError(
+          "Remote result marker belongs to a different algorithm family.",
+          code_hint="WGSC-JOB-RESULTS-MARKER-MISMATCH",
+          stage="result_marker",
+          details={"expected_family": expected_family, "actual_family": marker_family},
+        )
       download_info = _download_directory(
         sftp,
         remote_output_dir,
@@ -2597,6 +2585,209 @@ def cancel_remote_detached_job(
     }
     _write_remote_text(sftp, remote_job_paths["status_file"], json.dumps(status_payload, ensure_ascii=False, indent=2))
     return {"ok": True, "remote_pid": resolved_pid, "remote_tmux_session": tmux_session, "status": "canceled"}
+  finally:
+    try:
+      if sftp is not None:
+        sftp.close()
+    except Exception:
+      pass
+    try:
+      client.close()
+    except Exception:
+      pass
+
+
+def _build_remote_repair_metrics_script(
+  *,
+  validated: Dict[str, Any],
+  job_id: str,
+  family: str,
+  remote_output_dir: str,
+  remote_dataset_workspace: str,
+  remote_command: str = "",
+) -> str:
+  remote_job_paths = _remote_job_paths(remote_output_dir)
+  helpers = _remote_post_train_helper_functions()
+  eval_block = _remote_post_train_eval_block(True)
+  return f"""#!/usr/bin/env bash
+set +e
+
+PYTHON_BIN={_quote(validated["python"])}
+REMOTE_REPO_DIR={_quote(validated["repo_path"])}
+JOB_ID={_quote(job_id)}
+FAMILY={_quote(family)}
+JOB_DIR={_quote(remote_job_paths["job_dir"])}
+STATUS_FILE={_quote(remote_job_paths["status_file"])}
+EXIT_CODE_FILE={_quote(remote_job_paths["exit_code_file"])}
+LOG_FILE={_quote(remote_job_paths["runtime_log"])}
+PID_FILE={_quote(remote_job_paths["pid_file"])}
+OUTPUT_DIR={_quote(remote_output_dir)}
+REMOTE_DATASET_ID=""
+REMOTE_DATASET_NAME=""
+REMOTE_DATASET_WORKSPACE={_quote(remote_dataset_workspace)}
+REMOTE_COMMAND_TEXT={_quote(remote_command)}
+TRAIN_STATUS="success"
+RENDER_STATUS="pending"
+METRICS_STATUS="pending"
+POSTPROCESS_STATUS="skipped"
+RESULT_JSON_EXISTS="false"
+RESULT_JSON_PATH=""
+PARTIAL_SUCCESS="true"
+FAILURE_STAGE="post_train_render_or_metrics"
+
+mkdir -p "$JOB_DIR" "$OUTPUT_DIR"
+echo "$$" > "$PID_FILE"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+write_status() {{
+  local status="$1"
+  local stage="$2"
+  local return_code="${{3:-}}"
+  local message="${{4:-}}"
+  WGSC_STATUS="$status" \\
+  WGSC_STAGE="$stage" \\
+  WGSC_RETURN_CODE="$return_code" \\
+  WGSC_MESSAGE="$message" \\
+  WGSC_JOB_ID="$JOB_ID" \\
+  WGSC_FAMILY="$FAMILY" \\
+  WGSC_PID="$$" \\
+  WGSC_LOG_PATH="$LOG_FILE" \\
+  WGSC_OUTPUT_DIR="$OUTPUT_DIR" \\
+  WGSC_DATASET_ID="$REMOTE_DATASET_ID" \\
+  WGSC_DATASET_NAME="$REMOTE_DATASET_NAME" \\
+  WGSC_DATASET_WORKSPACE="$REMOTE_DATASET_WORKSPACE" \\
+  WGSC_REMOTE_COMMAND="$REMOTE_COMMAND_TEXT" \\
+  WGSC_TRAIN_STATUS="$TRAIN_STATUS" \\
+  WGSC_RENDER_STATUS="$RENDER_STATUS" \\
+  WGSC_METRICS_STATUS="$METRICS_STATUS" \\
+  WGSC_POSTPROCESS_STATUS="$POSTPROCESS_STATUS" \\
+  WGSC_RESULT_JSON_EXISTS="$RESULT_JSON_EXISTS" \\
+  WGSC_RESULT_JSON_PATH="$RESULT_JSON_PATH" \\
+  WGSC_PARTIAL_SUCCESS="$PARTIAL_SUCCESS" \\
+  WGSC_FAILURE_STAGE="$FAILURE_STAGE" \\
+  "$PYTHON_BIN" - "$STATUS_FILE" <<'PY'
+import json
+import os
+import sys
+import time
+
+status_path = sys.argv[1]
+payload = {{
+  "job_id": os.environ.get("WGSC_JOB_ID", ""),
+  "family": os.environ.get("WGSC_FAMILY", ""),
+  "status": os.environ.get("WGSC_STATUS", ""),
+  "stage": os.environ.get("WGSC_STAGE", ""),
+  "pid": os.environ.get("WGSC_PID", ""),
+  "message": os.environ.get("WGSC_MESSAGE", ""),
+  "remote_log_path": os.environ.get("WGSC_LOG_PATH", ""),
+  "remote_output_dir": os.environ.get("WGSC_OUTPUT_DIR", ""),
+  "remote_dataset_id": os.environ.get("WGSC_DATASET_ID", ""),
+  "remote_dataset_name": os.environ.get("WGSC_DATASET_NAME", ""),
+  "remote_dataset_workspace": os.environ.get("WGSC_DATASET_WORKSPACE", ""),
+  "remote_command": os.environ.get("WGSC_REMOTE_COMMAND", ""),
+  "train_status": os.environ.get("WGSC_TRAIN_STATUS", ""),
+  "render_status": os.environ.get("WGSC_RENDER_STATUS", ""),
+  "metrics_status": os.environ.get("WGSC_METRICS_STATUS", ""),
+  "postprocess_status": os.environ.get("WGSC_POSTPROCESS_STATUS", ""),
+  "result_json_exists": os.environ.get("WGSC_RESULT_JSON_EXISTS", "").lower() == "true",
+  "result_path": os.environ.get("WGSC_RESULT_JSON_PATH", ""),
+  "partial_success": os.environ.get("WGSC_PARTIAL_SUCCESS", "").lower() == "true",
+  "failure_stage": os.environ.get("WGSC_FAILURE_STAGE", ""),
+  "updated_at": time.time(),
+}}
+return_code = os.environ.get("WGSC_RETURN_CODE", "")
+if return_code not in ("", None):
+  try:
+    payload["return_code"] = int(return_code)
+  except Exception:
+    payload["return_code"] = return_code
+os.makedirs(os.path.dirname(status_path), exist_ok=True)
+with open(status_path, "w", encoding="utf-8") as handle:
+  json.dump(payload, handle, ensure_ascii=False, indent=2)
+PY
+}}
+
+finish_with() {{
+  local status="$1"
+  local stage="$2"
+  local return_code="$3"
+  local message="${{4:-}}"
+  echo "$return_code" > "$EXIT_CODE_FILE"
+  write_status "$status" "$stage" "$return_code" "$message"
+  exit "$return_code"
+}}
+
+{helpers}
+
+echo "[Repair] Starting render/metrics repair at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+write_status "running" "repair_metrics" "" "Repairing render/metrics for partial-success job."
+{eval_block}
+"""
+
+
+def repair_remote_job_metrics(
+  *,
+  remote_config: Dict[str, Any],
+  job_id: str,
+  family: str,
+  remote_output_dir: str,
+  remote_dataset_workspace: str,
+  remote_command: str = "",
+  log_callback: Callable[[str, str], None] | None = None,
+) -> Dict[str, Any]:
+  validated = validate_remote_config(remote_config)
+  if not str(remote_output_dir or "").strip():
+    raise RemoteExecutionError("remote_output_dir is required to repair metrics.", code_hint="WGSC-REPAIR-REMOTE-OUTPUT", stage="repair")
+  if not str(remote_dataset_workspace or "").strip():
+    raise RemoteExecutionError("remote_dataset_workspace is required to repair metrics.", code_hint="WGSC-REPAIR-DATASET", stage="repair")
+
+  remote_job_paths = _remote_job_paths(remote_output_dir)
+  repair_script_path = str(PurePosixPath(remote_job_paths["job_dir"]) / "repair_metrics.sh")
+  script = _build_remote_repair_metrics_script(
+    validated=validated,
+    job_id=job_id,
+    family=family,
+    remote_output_dir=remote_output_dir,
+    remote_dataset_workspace=remote_dataset_workspace,
+    remote_command=remote_command,
+  )
+
+  paramiko = _load_paramiko()
+  client = paramiko.SSHClient()
+  client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+  sftp = None
+  try:
+    client.connect(
+      hostname=validated["host"],
+      port=validated["port"],
+      username=validated["username"],
+      password=validated["password"],
+      timeout=20,
+      look_for_keys=False,
+      allow_agent=False,
+    )
+    sftp = client.open_sftp()
+    _write_remote_text(sftp, repair_script_path, script)
+    rc = _run_remote_command(client, f"bash -lc {_quote(f'bash {repair_script_path}')}", log_callback)
+    status_payload = _read_remote_json_file_strict(sftp, remote_job_paths["status_file"])
+    return {
+      "ok": rc == 0 and str(status_payload.get("status", "")) == "completed",
+      "return_code": rc,
+      "status": str(status_payload.get("status", "")),
+      "stage": str(status_payload.get("stage", "")),
+      "remote_log_path": str(status_payload.get("remote_log_path", remote_job_paths["runtime_log"])),
+      "remote_output_dir": str(status_payload.get("remote_output_dir", remote_output_dir)),
+      "remote_dataset_workspace": str(status_payload.get("remote_dataset_workspace", remote_dataset_workspace)),
+      "train_status": str(status_payload.get("train_status", "")),
+      "render_status": str(status_payload.get("render_status", "")),
+      "metrics_status": str(status_payload.get("metrics_status", "")),
+      "postprocess_status": str(status_payload.get("postprocess_status", "")),
+      "result_json_exists": bool(status_payload.get("result_json_exists")),
+      "result_path": str(status_payload.get("result_path", "")),
+      "partial_success": bool(status_payload.get("partial_success")),
+      "failure_stage": str(status_payload.get("failure_stage", "")),
+      "updated_at": status_payload.get("updated_at", ""),
+    }
   finally:
     try:
       if sftp is not None:

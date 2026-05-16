@@ -147,7 +147,7 @@ def test_analysis_metrics_only_use_result_json_for_quality() -> None:
   result_dir = TEST_ROOT / "analysis-source"
   write_file(result_dir / "point_cloud" / "iteration_1" / "point_cloud.ply", b"ply\n")
   (result_dir / "metrics.json").write_text('{"psnr": 99, "ssim": 0.99}', encoding="utf-8")
-  (result_dir / "result.json").write_text('{"PSNR": 31.25, "SSIM": 0.8123}', encoding="utf-8")
+  (result_dir / "result.json").write_text('{"PSNR": 31.25, "SSIM": 0.8123, "LPIPS": 0.1234}', encoding="utf-8")
   (result_dir / "render_metrics.json").write_text('{"end_to_end_render_fps": 12.5}', encoding="utf-8")
 
   artifacts = read_runtime_artifacts(
@@ -158,8 +158,10 @@ def test_analysis_metrics_only_use_result_json_for_quality() -> None:
   metrics = artifacts["metrics"]
   assert metrics["psnr"] == "31.25", metrics
   assert metrics["ssim"] == "0.8123", metrics
+  assert metrics["lpips"] == "0.1234", metrics
   assert metrics["analysis_metric_sources"]["psnr"] == "artifact:result.json", metrics
   assert metrics["analysis_metric_sources"]["ssim"] == "artifact:result.json", metrics
+  assert metrics["analysis_metric_sources"]["lpips"] == "artifact:result.json", metrics
   assert "render_fps" not in metrics, metrics
 
   missing_dir = TEST_ROOT / "analysis-missing-result"
@@ -172,6 +174,51 @@ def test_analysis_metrics_only_use_result_json_for_quality() -> None:
   )
   assert "metrics" not in missing_artifacts or "psnr" not in missing_artifacts["metrics"], missing_artifacts
   assert missing_artifacts.get("result_json_exists") is False, missing_artifacts
+
+
+def test_atomgs_rgb_render_fallback() -> None:
+  result_dir = TEST_ROOT / "atomgs-rgb"
+  write_file(result_dir / "test" / "ours_30" / "rgb" / "00001.png", b"png")
+  write_file(result_dir / "train" / "ours_30" / "rgb" / "00002.png", b"png")
+
+  result = load_result_path(str(result_dir), family="atomgs")
+  assert result["ok"], result
+  assert result["type"] == "image", result
+  assert result["render_image_count"] == 2, result
+  assert any(url.endswith("/rgb/00001.png") for url in result["result_urls"]), result
+
+
+def test_gaussianpro_atomgs_choose_latest_iteration_ply() -> None:
+  for family in ("gaussianpro", "atomgs"):
+    result_dir = TEST_ROOT / f"{family}-latest-ply"
+    write_file(result_dir / "point_cloud" / "iteration_7000" / "point_cloud.ply", b"old")
+    write_file(result_dir / "point_cloud" / "iteration_30000" / "point_cloud.ply", b"new")
+    write_file(result_dir / "chkpnt30000.pth", b"checkpoint")
+    write_file(result_dir / "test" / "ours_30000" / "renders" / "00001.png", b"png")
+
+    result = load_result_path(str(result_dir), family=family)
+    assert result["ok"], result
+    assert result["type"] == "ply", result
+    assert result["resolved_path"].endswith("point_cloud/iteration_30000/point_cloud.ply"), result
+    assert result["render_image_count"] == 1, result
+
+
+def test_gaussianpro_atomgs_result_metrics_include_lpips() -> None:
+  for family in ("gaussianpro", "atomgs"):
+    result_dir = TEST_ROOT / f"{family}-metrics"
+    write_file(result_dir / "point_cloud" / "iteration_30000" / "point_cloud.ply", b"ply\n")
+    (result_dir / "result.json").write_text(
+      '{"ours_30000": {"PSNR": 28.5, "SSIM": 0.9012, "LPIPS": 0.0789}}',
+      encoding="utf-8",
+    )
+
+    artifacts = read_runtime_artifacts(str(result_dir), family=family)
+    metrics = artifacts["metrics"]
+    assert artifacts["type"] == "ply", artifacts
+    assert metrics["psnr"] == "28.5", metrics
+    assert metrics["ssim"] == "0.9012", metrics
+    assert metrics["lpips"] == "0.0789", metrics
+    assert metrics["analysis_metric_sources"]["lpips"] == "artifact:result.json", metrics
 
 
 def test_analysis_size_uses_bitstream_artifacts() -> None:
@@ -203,6 +250,9 @@ def main() -> None:
     test_empty_directory()
     test_discover_generated_runs()
     test_analysis_metrics_only_use_result_json_for_quality()
+    test_atomgs_rgb_render_fallback()
+    test_gaussianpro_atomgs_choose_latest_iteration_ply()
+    test_gaussianpro_atomgs_result_metrics_include_lpips()
     test_analysis_size_uses_bitstream_artifacts()
     print("result loader tests passed")
   finally:

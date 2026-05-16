@@ -13,7 +13,7 @@ This folder provides a standalone web platform that serves as a unified visualiz
 #### 🚀 Setup and Configuration
 - **Remote SSH Environment Setup** (Recommended for remote training)
   - Quick Navigator: [`project_md/REMOTE_SETUP_INDEX.md`](project_md/REMOTE_SETUP_INDEX.md)
-  - New Algorithms (Gaussian Splatting Lightning, HAC-plus, FCGS, ContextGS, CompGS, reduced-3dgs, MEGS-2): [`project_md/REMOTE_SETUP_GUIDE_NEW.md`](project_md/REMOTE_SETUP_GUIDE_NEW.md)
+  - New Algorithms (Gaussian Splatting Lightning, HAC-plus, FCGS, ContextGS, CompGS, reduced-3dgs, MEGS-2, GaussianPro, AtomGS): [`project_md/REMOTE_SETUP_GUIDE_NEW.md`](project_md/REMOTE_SETUP_GUIDE_NEW.md)
   - Legacy Algorithms (Scaffold-GS): [`project_md/REMOTE_SETUP_GUIDE_OLD.md`](project_md/REMOTE_SETUP_GUIDE_OLD.md)
   - Verification Script: [`tools/remote_verify_setup.sh`](tools/remote_verify_setup.sh)
 
@@ -74,7 +74,7 @@ python -m pip install paramiko
 **Important**: Before using remote training features, configure your remote server environment:
 
 1. **Choose your algorithm family**:
-   - HAC-plus, FCGS, ContextGS, CompGS, reduced-3dgs, MEGS-2, or Gaussian Splatting Lightning? → See [`project_md/REMOTE_SETUP_GUIDE_NEW.md`](project_md/REMOTE_SETUP_GUIDE_NEW.md)
+   - HAC-plus, FCGS, ContextGS, CompGS, reduced-3dgs, MEGS-2, GaussianPro, AtomGS, or Gaussian Splatting Lightning? → See [`project_md/REMOTE_SETUP_GUIDE_NEW.md`](project_md/REMOTE_SETUP_GUIDE_NEW.md)
    - Legacy Scaffold-GS? → See [`project_md/REMOTE_SETUP_GUIDE_OLD.md`](project_md/REMOTE_SETUP_GUIDE_OLD.md)
 
 2. **Verify environment setup**:
@@ -110,7 +110,7 @@ The web UI covers the following flow:
 
 1. Check API and validate adapter in `Runtime Config`.
 2. Capture at least one frame in `Capture`.
-3. Fill remote credentials and paths in `Remote Training Config`. Current remote mode is HAC++ only; other algorithm families are reserved as placeholders. Run the preflight checklist in the training manual before clicking submit.
+3. Fill remote credentials and paths in `Remote Training Config`. Run the selected algorithm's preflight checklist in the training manual before clicking submit.
 4. Click `One-click Upload and Remote Train` in `Remote Run`.
 5. The backend executes: upload frame -> materialize session -> remote train -> download outputs.
 6. The frontend polls task status, updates metrics, and auto-switches viewer to latest result.

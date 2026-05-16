@@ -1,14 +1,14 @@
 # 远程 SSH 环境配置 — 快速导航
 
 > **最后更新**：2026 年 4 月  
-> **适用版本**：Web_Scan 所有算法（包含 8 个 3D Gaussian Splatting 项目）  
+> **适用版本**：Web_Scan 所有算法（包含 10 个 3D Gaussian Splatting 项目）  
 > **核心特性**：一键环境验证、清晰的参数配置指南、完整的故障排除
 
 ---
 
 ## 🎯 快速选择：我应该读哪份文档？
 
-### 情景 1: 使用 Gaussian Splatting Lightning、HAC-plus、FCGS、ContextGS、CompGS、reduced-3dgs 或 MEGS-2
+### 情景 1: 使用 Gaussian Splatting Lightning、HAC-plus、FCGS、ContextGS、CompGS、reduced-3dgs、MEGS-2、GaussianPro 或 AtomGS
 
 👉 **阅读**：[REMOTE_SETUP_GUIDE_NEW.md](REMOTE_SETUP_GUIDE_NEW.md)
 
@@ -39,6 +39,9 @@ python Train.py --config Configs/my_training.yaml
 
 # MEGS-2 训练示例
 python train.py -s /data/scene -m /output/result --iterations 30000 --eval --imp_metric indoor
+
+# GaussianPro / AtomGS 训练示例
+python train.py -s /data/scene -m /output/result --iterations 30000 --eval
 ```
 
 ---
@@ -70,6 +73,8 @@ python train.py -s /data/scene -m /output/result --iterations 30000 --eval
 | **reduced-3dgs** | [NEW](REMOTE_SETUP_GUIDE_NEW.md) | 新版 | 3.10 | 2.2.* | 12.1 | 命令行 |
 | **CompGS** | [NEW](REMOTE_SETUP_GUIDE_NEW.md) | 新版 | 3.10 | 2.2.* | 12.1 | YAML 配置 |
 | **MEGS-2** | [NEW](REMOTE_SETUP_GUIDE_NEW.md) | 新版 | 3.10 | 2.2.* | 12.1 | 命令行 |
+| **GaussianPro** | [NEW](REMOTE_SETUP_GUIDE_NEW.md) | 新版 | 3.10 | 2.2.* | 12.1 | 命令行 |
+| **AtomGS** | [NEW](REMOTE_SETUP_GUIDE_NEW.md) | 新版 | 3.10 | 2.2.* | 12.1 | 命令行 |
 | **Scaffold-GS** | [OLD](REMOTE_SETUP_GUIDE_OLD.md) | 旧版 | 3.7.13 | 1.12.1 | 11.6 | 命令行 |
 
 ---
@@ -95,6 +100,8 @@ bash remote_verify_setup.sh compgs   # CompGS（Python 3.10 + PyTorch 2.2 + CUDA
 bash remote_verify_setup.sh reduced-3dgs   # reduced-3dgs（Python 3.10 + PyTorch 2.2 + CUDA 12.1 + RTX 4090）
 bash remote_verify_setup.sh megs2   # MEGS-2（Python 3.10 + PyTorch 2.2 + CUDA 12.1 + RTX 4090）
 bash remote_verify_setup.sh gaussian-splatting-lightning   # GSL（Python 3.10 + PyTorch 2.2 + CUDA 12.1 + RTX 4090）
+bash remote_verify_setup.sh gaussianpro   # GaussianPro（Python 3.10 + PyTorch 2.2 + CUDA 12.1 + RTX 4090）
+bash remote_verify_setup.sh atomgs   # AtomGS（Python 3.10 + PyTorch 2.2 + CUDA 12.1 + RTX 4090）
 bash remote_verify_setup.sh old   # 旧版（Python 3.7 + PyTorch 1.12）
 ```
 
@@ -111,7 +118,7 @@ bash remote_verify_setup.sh old   # 旧版（Python 3.7 + PyTorch 1.12）
 
 | 文档 | 适用范围 | 内容 |
 |------|---------|------|
-| [REMOTE_SETUP_GUIDE_NEW.md](REMOTE_SETUP_GUIDE_NEW.md) | Gaussian Splatting Lightning、HAC-plus、FCGS、ContextGS、CompGS、reduced-3dgs、MEGS-2 | 环境部署、参数配置、训练启动、故障排除 |
+| [REMOTE_SETUP_GUIDE_NEW.md](REMOTE_SETUP_GUIDE_NEW.md) | Gaussian Splatting Lightning、HAC-plus、FCGS、ContextGS、CompGS、reduced-3dgs、MEGS-2、GaussianPro、AtomGS | 环境部署、参数配置、训练启动、故障排除 |
 | [REMOTE_SETUP_GUIDE_OLD.md](REMOTE_SETUP_GUIDE_OLD.md) | Scaffold-GS | 环境部署、参数配置、训练启动、故障排除 |
 
 ### 工具和脚本
@@ -169,6 +176,16 @@ bash remote_verify_setup.sh old   # 旧版（Python 3.7 + PyTorch 1.12）
    conda activate gspl
    export CUDA_HOME=/usr/local/cuda-12.1
    export TORCH_CUDA_ARCH_LIST=8.9
+
+   【GaussianPro】
+   cd GaussianPro-version1.0
+   bash setup_env.sh
+   conda activate gaussianpro
+
+   【AtomGS】
+   cd AtomGS-main
+   bash setup_env.sh
+   conda activate AtomGS
 
    【旧版算法】
    cd Scaffold-GS-main
@@ -251,7 +268,7 @@ python Train.py --config Configs/my_training.yaml
 
 ---
 
-### Gaussian Splatting Lightning / ContextGS / reduced-3dgs / MEGS-2 / 旧版命令行算法
+### Gaussian Splatting Lightning / ContextGS / reduced-3dgs / MEGS-2 / GaussianPro / AtomGS / 旧版命令行算法
 
 ```bash
 # Gaussian Splatting Lightning 基础训练（Python 3.10 + PyTorch 2.2 + CUDA 12.1）
@@ -266,6 +283,9 @@ python train.py -s /workspace/data/scene -m /output/result --eval
 # MEGS-2 基础训练（Python 3.10 + PyTorch 2.2 + CUDA 12.1）
 python train.py -s /workspace/data/scene -m /output/result \
   --iterations 30000 --eval --test_iterations 7000 --imp_metric indoor
+
+# GaussianPro / AtomGS 基础训练（Python 3.10 + PyTorch 2.2 + CUDA 12.1）
+python train.py -s /workspace/data/scene -m /output/result --iterations 30000 --eval
 
 # Scaffold-GS 仍使用旧版环境，但参数形式类似
 python train.py -s /workspace/data/scene -m /output/result --iterations 30000 --eval
@@ -289,6 +309,8 @@ python train.py -s /workspace/data/scene -m /output/result --iterations 30000 --
 - [ ] reduced-3dgs 运行 `bash remote_verify_setup.sh reduced-3dgs`
 - [ ] MEGS-2 运行 `bash remote_verify_setup.sh megs2`
 - [ ] Gaussian Splatting Lightning 运行 `bash remote_verify_setup.sh gaussian-splatting-lightning`
+- [ ] GaussianPro 运行 `bash remote_verify_setup.sh gaussianpro`
+- [ ] AtomGS 运行 `bash remote_verify_setup.sh atomgs`
 - [ ] HAC-plus 运行 `bash remote_verify_setup.sh hac-plus-plus`
 - [ ] FCGS 运行 `bash remote_verify_setup.sh new`
 - [ ] 旧版算法运行 `bash remote_verify_setup.sh old`
@@ -300,7 +322,7 @@ python train.py -s /workspace/data/scene -m /output/result --iterations 30000 --
 
 ### Q: 我不确定应该使用哪份文档
 
-**A**: 查看 [算法速查表](#-算法速查表)。如果你使用 **Gaussian Splatting Lightning、HAC-plus、FCGS、ContextGS、CompGS、reduced-3dgs 或 MEGS-2**，选择 **NEW** 文档。Scaffold-GS 选择 **OLD** 文档。
+**A**: 查看 [算法速查表](#-算法速查表)。如果你使用 **Gaussian Splatting Lightning、HAC-plus、FCGS、ContextGS、CompGS、reduced-3dgs、MEGS-2、GaussianPro 或 AtomGS**，选择 **NEW** 文档。Scaffold-GS 选择 **OLD** 文档。
 
 ---
 

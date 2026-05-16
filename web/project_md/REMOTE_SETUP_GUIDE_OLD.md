@@ -2,7 +2,7 @@
 
 > **适用项目**：Scaffold-GS  
 > **环境**：Python 3.7.13 + PyTorch 1.12.1 + CUDA 11.6  
-> **说明**：CompGS、ContextGS、reduced-3dgs 和 MEGS-2 已升级到 Python 3.10 + PyTorch 2.2 + CUDA 12.1，请使用 [REMOTE_SETUP_GUIDE_NEW.md](REMOTE_SETUP_GUIDE_NEW.md)。
+> **说明**：CompGS、ContextGS、reduced-3dgs、MEGS-2、GaussianPro 和 AtomGS 已升级到 Python 3.10 + PyTorch 2.2 + CUDA 12.1，请使用 [REMOTE_SETUP_GUIDE_NEW.md](REMOTE_SETUP_GUIDE_NEW.md)。
 > **更新日期**：2026 年 4 月  
 > **作者**：Web_Scan 文档
 

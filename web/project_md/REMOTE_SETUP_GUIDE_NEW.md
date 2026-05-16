@@ -1,6 +1,6 @@
 # 远程 SSH 环境配置指南 — 新版算法组
 
-> **适用项目**：Gaussian Splatting Lightning、HAC-plus、FCGS、ContextGS、CompGS、reduced-3dgs、MEGS-2  
+> **适用项目**：Gaussian Splatting Lightning、HAC-plus、FCGS、ContextGS、CompGS、reduced-3dgs、MEGS-2、GaussianPro、AtomGS  
 > **环境**：Python 3.10 + PyTorch 2.2.* + CUDA 11.8/12.1  
 > **更新日期**：2026 年 4 月  
 > **作者**：Web_Scan 文档
@@ -69,6 +69,16 @@ conda activate gaussian_splatting
 cd ~/Web_Scan/MEGS-2-main
 conda env create --file environment.yml
 conda activate MEGS2
+
+# 或者 GaussianPro（RTX 4090 推荐 CUDA 12.1）
+cd ~/Web_Scan/GaussianPro-version1.0
+bash setup_env.sh
+conda activate gaussianpro
+
+# 或者 AtomGS（RTX 4090 推荐 CUDA 12.1）
+cd ~/Web_Scan/AtomGS-main
+bash setup_env.sh
+conda activate AtomGS
 ```
 
 **预计时间**：10-15 分钟（首次下载）
@@ -110,7 +120,7 @@ pip install torch-scatter -f https://data.pyg.org/whl/torch-2.2.0+cu121.html
 
 ```bash
 # 进入项目目录
-cd ~/Web_Scan/HAC-plus-main  # 或 FCGS-main / ContextGS-main / CompGS-main / reduced-3dgs-main / MEGS-2-main / gaussian-splatting-lightning-main
+cd ~/Web_Scan/HAC-plus-main  # 或 FCGS-main / ContextGS-main / CompGS-main / reduced-3dgs-main / MEGS-2-main / gaussian-splatting-lightning-main / GaussianPro-version1.0 / AtomGS-main
 
 # 初始化子模块（非常重要）
 git submodule update --init --recursive
@@ -136,7 +146,11 @@ cd ..
 
 **HAC-plus 注意**：`setup_env.sh` 会解压并编译 `arithmetic`、`diff-gaussian-rasterization`、`simple-knn` 和 `gridencoder`。HAC++ 的 Web 3D 查看使用 `point_cloud/iteration_<max>/point_cloud.ply`；压缩大小优先参考 `bitstreams/`；`checkpoint.pth` 默认不需要回传。
 
-**常见问题**：如果子模块中的 `simple-knn`、`diff-gaussian-rasterization`、`arithmetic` 或 `gridencoder` 编译失败，参考 [故障排除](#️-故障排除) 章节。
+**GaussianPro 注意**：需要 `diff-gaussian-rasterization`、`simple-knn` 和 `Propagation` 三个 CUDA 扩展。当前本地 `diff-gaussian-rasterization/simple-knn` 目录可能为空，必须先恢复子模块再运行 `setup_env.sh`。
+
+**AtomGS 注意**：需要 `diff-gaussian-rasterization` 和 `simple-knn` 两个 CUDA 扩展，额外依赖 `open3d`。Web 3D 查看使用 `point_cloud/iteration_<max>/point_cloud.ply`。
+
+**常见问题**：如果子模块中的 `simple-knn`、`diff-gaussian-rasterization`、`Propagation`、`arithmetic` 或 `gridencoder` 编译失败，参考 [故障排除](#️-故障排除) 章节。
 
 ---
 
@@ -165,6 +179,12 @@ bash ../web/tools/remote_verify_setup.sh megs2
 
 # 或 Gaussian Splatting Lightning
 bash ../web/tools/remote_verify_setup.sh gaussian-splatting-lightning
+
+# 或 GaussianPro
+bash ../web/tools/remote_verify_setup.sh gaussianpro
+
+# 或 AtomGS
+bash ../web/tools/remote_verify_setup.sh atomgs
 ```
 
 如果没有诊断脚本，手动运行以下检查：
@@ -644,8 +664,8 @@ pip install git+https://github.com/richzhang/PerceptualSimilarity.git
 - [ ] Python 版本 3.10：`python3 --version`
 
 ### ✅ 环境检查
-- [ ] Conda 环境已创建：`conda env list | grep -E "HAC_env|FCGS_env|contextgs|CompGS_env|gaussian_splatting|MEGS2|gspl"`
-- [ ] 环境激活命令可用：`source ~/.bashrc && conda activate HAC_env`、`source ~/.bashrc && conda activate contextgs`、`source ~/.bashrc && conda activate CompGS_env`、`source ~/.bashrc && conda activate gaussian_splatting`、`source ~/.bashrc && conda activate MEGS2` 或 `source ~/.bashrc && conda activate gspl`
+- [ ] Conda 环境已创建：`conda env list | grep -E "HAC_env|FCGS_env|contextgs|CompGS_env|gaussian_splatting|MEGS2|gspl|gaussianpro|AtomGS"`
+- [ ] 环境激活命令可用：`source ~/.bashrc && conda activate HAC_env`、`source ~/.bashrc && conda activate contextgs`、`source ~/.bashrc && conda activate CompGS_env`、`source ~/.bashrc && conda activate gaussian_splatting`、`source ~/.bashrc && conda activate MEGS2`、`source ~/.bashrc && conda activate gspl`、`source ~/.bashrc && conda activate gaussianpro` 或 `source ~/.bashrc && conda activate AtomGS`
 
 ### ✅ 项目检查
 - [ ] 项目代码已克隆/复制到远程主机
@@ -660,7 +680,7 @@ pip install git+https://github.com/richzhang/PerceptualSimilarity.git
 ## 📞 联系与支持
 
 - **文档位置**：[web/project_md/REMOTE_SETUP_GUIDE_NEW.md](../REMOTE_SETUP_GUIDE_NEW.md)
-- **诊断工具**：`bash web/tools/remote_verify_setup.sh hac-plus-plus` (HAC++)、`python diagnose.py` (FCGS)、`bash web/tools/remote_verify_setup.sh contextgs` (ContextGS)、`bash web/tools/remote_verify_setup.sh compgs` (CompGS)、`bash web/tools/remote_verify_setup.sh reduced-3dgs` (reduced-3dgs)、`bash web/tools/remote_verify_setup.sh megs2` (MEGS-2) 或 `bash web/tools/remote_verify_setup.sh gaussian-splatting-lightning` (GSL)
+- **诊断工具**：`bash web/tools/remote_verify_setup.sh hac-plus-plus` (HAC++)、`python diagnose.py` (FCGS)、`bash web/tools/remote_verify_setup.sh contextgs` (ContextGS)、`bash web/tools/remote_verify_setup.sh compgs` (CompGS)、`bash web/tools/remote_verify_setup.sh reduced-3dgs` (reduced-3dgs)、`bash web/tools/remote_verify_setup.sh megs2` (MEGS-2)、`bash web/tools/remote_verify_setup.sh gaussian-splatting-lightning` (GSL)、`bash web/tools/remote_verify_setup.sh gaussianpro` (GaussianPro) 或 `bash web/tools/remote_verify_setup.sh atomgs` (AtomGS)
 - **问题报告**：记录 `diagnose.py` 的输出，提交至项目 Issue
 
 ---

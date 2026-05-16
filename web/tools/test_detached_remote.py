@@ -23,6 +23,8 @@ from web.server.remote_executor import (
   _remote_job_paths,
   _tmux_install_candidates,
   _verify_remote_result_marker,
+  build_remote_paths,
+  build_remote_run_key,
   build_remote_tmux_attach_command,
   build_remote_tmux_session_name,
 )
@@ -34,10 +36,15 @@ def test_detached_script_contract() -> None:
     "repo_path": "/remote/repo",
     "activate_cmd": "source /opt/env/bin/activate",
   }
-  remote_paths = {
-    "workspace_dir": "/tmp/web_scan/workspaces/session/hac/job/workspace",
-    "output_dir": "/tmp/web_scan/outputs/session/hac/job/output",
-  }
+  run_key = build_remote_run_key("Demo Dataset", "hac", "2026-05-14T10:25:30Z")
+  remote_paths = build_remote_paths(
+    workspace_root="/tmp/web_scan/workspaces",
+    output_root="/tmp/web_scan/outputs",
+    session_id="session",
+    family="hac",
+    job_id="job",
+    run_key=run_key,
+  )
   job_paths = _remote_job_paths(remote_paths["output_dir"])
   script = _build_remote_detached_run_script(
     validated=validated,
@@ -52,7 +59,7 @@ def test_detached_script_contract() -> None:
     resolved_dataset_name="Demo",
     use_existing_remote_dataset=False,
   )
-  tmux_session = build_remote_tmux_session_name(family="hac", job_id="job 1:unsafe/name")
+  tmux_session = build_remote_tmux_session_name(family="hac", job_id="job 1:unsafe/name", run_key=run_key)
   start_command = _build_remote_tmux_start_command(job_paths, tmux_session)
   attach_command = build_remote_tmux_attach_command(
     {
@@ -72,15 +79,39 @@ def test_detached_script_contract() -> None:
   assert "status.json" in script
   assert "runtime.log" in script
   assert "echo \"$$\" > \"$PID_FILE\"" in script
+  assert "os.replace(tmp_path, status_path)" in script
+  assert "start_heartbeat" in script
+  assert "stop_heartbeat" in script
   assert "EXIT_CODE_FILE" in script
   assert "sequential_matcher" in script
+  assert "partial_success" not in script
   assert "tmux new-session" in start_command
+  assert '"status": "starting"' in start_command
+  assert "status_tmp=" in start_command
+  assert "rm -f '/tmp/web_scan/outputs/runs/demo-dataset-hac-20260514T102530Z/output/.wgsc_job/status.json'" not in start_command
   assert "tee -a" in start_command
   assert "setsid" not in start_command
   assert "nohup" not in start_command
-  assert tmux_session == "wgsc-hac-job-1-unsafe-name"
+  assert run_key == "demo-dataset-hac-20260514T102530Z"
+  assert remote_paths["workspace_dir"] == "/tmp/web_scan/workspaces/runs/demo-dataset-hac-20260514T102530Z/workspace"
+  assert remote_paths["output_dir"] == "/tmp/web_scan/outputs/runs/demo-dataset-hac-20260514T102530Z/output"
+  assert tmux_session == "wgsc-demo-dataset-hac-20260514T102530Z"
   assert "tmux attach -t" in attach_command
   assert "secret-password" not in attach_command
+
+
+def test_remote_run_key_conflict_appends_job_prefix() -> None:
+  run_key = build_remote_run_key("Demo Dataset", "megs2", "2026-05-14T10:25:30Z")
+  original_jobs = dict(api_server.JOBS)
+  try:
+    api_server.JOBS.clear()
+    api_server.JOBS["existing"] = {"id": "existing", "remote_run_key": run_key}
+    unique_key = api_server.unique_remote_run_key(run_key, "abcdef123456")
+  finally:
+    api_server.JOBS.clear()
+    api_server.JOBS.update(original_jobs)
+
+  assert unique_key == f"{run_key}-abcdef12"
 
 
 def test_existing_dataset_disables_auto_colmap_contract() -> None:
@@ -531,6 +562,7 @@ def test_gaussian_splatting_lightning_train_exports_ply() -> None:
     resolved_dataset_id="dataset",
     resolved_dataset_name="Dataset",
     use_existing_remote_dataset=True,
+    post_train_config={"run_render": True, "run_metrics": False},
   )
 
   assert 'write_status "running" "exporting_gaussian_ply"' in script
@@ -538,10 +570,15 @@ def test_gaussian_splatting_lightning_train_exports_ply() -> None:
   assert 'REAL_OUTPUT_DIR="$(resolve_gspl_output_dir)"' in script
   assert 'python utils/ckpt2ply.py \\"$REAL_OUTPUT_DIR\\" --override' in script
   assert '"$PYTHON_BIN" utils/ckpt2ply.py "$REAL_OUTPUT_DIR" --override' in script
-  assert 'finish_with "partial_success" "ckpt2ply"' in script
+  assert 'finish_with "failed" "postprocess"' in script
   assert 'REMOTE_REPO_DIR=/remote/gaussian-splatting-lightning' in script
-  assert 'cd "$REMOTE_REPO_DIR" || finish_with "partial_success" "post_train_render_or_metrics"' in script
+  assert "wgsc_activate_env() {" in script
+  assert "source /opt/env/bin/activate" in script
+  assert "wgsc_activate_env" in script.split('cd "$REMOTE_REPO_DIR"')[0]
+  assert script.count("wgsc_activate_env") >= 3
+  assert 'cd "$REMOTE_REPO_DIR" || finish_with "failed" "render"' in script
   assert '"$PYTHON_BIN" main.py validate --data.path "$REMOTE_DATASET_WORKSPACE"' in script
+  assert "partial_success" not in script
   assert "render_metrics.json" not in script
   assert "--colored" not in script
   assert "--drop-shs-rest" not in script
@@ -555,7 +592,11 @@ def test_gaussian_splatting_lightning_train_exports_ply() -> None:
     remote_command="python3 main.py fit --data.path /remote/dataset --output /remote/output --model.save_ply true",
   )
   assert 'REMOTE_REPO_DIR=/remote/gaussian-splatting-lightning' in repair_script
-  assert 'cd "$REMOTE_REPO_DIR" || finish_with "partial_success" "post_train_render_or_metrics"' in repair_script
+  assert "wgsc_activate_env() {" in repair_script
+  assert "source /opt/env/bin/activate" in repair_script
+  assert "wgsc_activate_env" in repair_script.split('cd "$REMOTE_REPO_DIR"')[0]
+  assert repair_script.count("wgsc_activate_env") >= 3
+  assert 'cd "$REMOTE_REPO_DIR" || finish_with "failed" "render"' in repair_script
   assert '"$PYTHON_BIN" main.py validate --data.path "$REMOTE_DATASET_WORKSPACE"' in repair_script
   assert "render_metrics.json" not in repair_script
 
@@ -565,6 +606,16 @@ def test_training_eval_arg_injection_is_family_aware() -> None:
     "reduced-3dgs",
     "python train.py -s /data -m /out",
   ).endswith("--eval")
+  for family in ("gaussianpro", "atomgs"):
+    command = remote_executor.apply_training_eval_arg(
+      family,
+      "python train.py -s /data -m /out",
+    )
+    assert command.endswith("--eval")
+    assert remote_executor.apply_training_eval_arg(
+      family,
+      "python train.py -s /data -m /out --eval",
+    ).count("--eval") == 1
   assert remote_executor.apply_training_eval_arg(
     "gaussian-splatting-lightning",
     "python main.py fit --data.path /data --output /out",
@@ -573,6 +624,61 @@ def test_training_eval_arg_injection_is_family_aware() -> None:
     "megs2",
     "python train.py -s /data -m /out --eval",
   ).count("--eval") == 1
+
+
+def test_atomgs_gaussianpro_adapters_and_post_train_contract() -> None:
+  config_path = Path(api_server.WEB_DIR) / "config" / "algorithm_adapters.json"
+  config = json.loads(config_path.read_text(encoding="utf-8"))
+  adapters = {item["family"]: item for item in config["adapters"]}
+
+  for family, repo_path in {
+    "gaussianpro": "../GaussianPro-version1.0",
+    "atomgs": "../AtomGS-main",
+  }.items():
+    adapter = adapters[family]
+    assert adapter["repo_type"] == "local"
+    assert adapter["repo_path"] == repo_path
+    assert adapter["default_cwd"] == repo_path
+    assert adapter["operations"]["train"]["enabled"] is True
+    assert "-s {workspace}" in adapter["operations"]["train"]["template"]
+    assert "-m {output_dir}" in adapter["operations"]["train"]["template"]
+    assert "--eval" in adapter["operations"]["train"]["template"]
+    assert adapter["operations"]["render"]["enabled"] is True
+    assert adapter["operations"]["metrics"]["enabled"] is True
+
+    validated = {
+      "python": "python3",
+      "repo_path": f"/remote/{family}",
+      "activate_cmd": "source /opt/env/bin/activate",
+    }
+    remote_paths = {
+      "workspace_dir": f"/remote/workspace/{family}",
+      "output_dir": f"/remote/output/{family}",
+    }
+    script = _build_remote_detached_run_script(
+      validated=validated,
+      job_id=f"job-{family}",
+      family=family,
+      remote_paths=remote_paths,
+      remote_job_paths=_remote_job_paths(remote_paths["output_dir"]),
+      remote_workspace_for_command=f"/remote/dataset/{family}",
+      remote_command=f"python train.py -s /remote/dataset/{family} -m /remote/output/{family} --eval",
+      auto_colmap=False,
+      resolved_dataset_id="dataset",
+      resolved_dataset_name="Dataset",
+      use_existing_remote_dataset=True,
+      post_train_config={
+        "run_render": True,
+        "run_metrics": True,
+        "render_template": adapter["operations"]["render"]["template"],
+        "metrics_template": adapter["operations"]["metrics"]["template"],
+      },
+    )
+    assert "POST_TRAIN_RENDER_COMMAND='python3 render.py" in script
+    assert "POST_TRAIN_METRICS_COMMAND='python3 metrics.py" in script
+    assert "write_canonical_result_json" in script
+    assert "LPIPS" in script
+    assert "partial_success" not in script
 
 
 def test_ply_header_classifier_selects_viewer_format() -> None:
@@ -715,12 +821,10 @@ def test_result_download_validation_allows_completed_or_partial_success() -> Non
   else:
     raise AssertionError("local completed job should be rejected")
 
-  try:
-    api_server.validate_completed_result_download_job({**base, "status": "completed", "output_dir": "/local/wrong-family"})
-  except ValueError as exc:
-    assert "Local output_dir does not match" in str(exc)
-  else:
-    raise AssertionError("mismatched local output path should be rejected")
+  legacy_job = {**base, "status": "completed", "output_dir": "/local/wrong-family"}
+  assert api_server.validate_completed_result_download_job(legacy_job) == ("/remote/output", output_dir)
+  assert legacy_job["legacy_output_dir_migrated"] is True
+  assert legacy_job["previous_output_dir"] == "/local/wrong-family"
 
 
 def remote_config(**overrides):
@@ -988,8 +1092,209 @@ def test_stale_pending_remote_download_becomes_retryable() -> None:
   assert api_server.is_remote_download_pending(job) is False
 
 
+class PollFakeFile:
+  def __init__(self, payload: bytes):
+    self.payload = payload
+    self.cursor = 0
+
+  def __enter__(self):
+    return self
+
+  def __exit__(self, exc_type, exc, traceback):
+    return False
+
+  def seek(self, cursor: int):
+    self.cursor = max(0, int(cursor or 0))
+
+  def read(self):
+    return self.payload[self.cursor:]
+
+
+class PollFakeStat:
+  def __init__(self, size: int):
+    self.st_size = size
+
+
+class PollFallbackSftp:
+  def __init__(self, files: dict[str, bytes]):
+    self.files = files
+
+  def open(self, remote_path: str, mode: str = "r"):
+    if remote_path not in self.files:
+      raise FileNotFoundError(remote_path)
+    return PollFakeFile(self.files[remote_path])
+
+  def stat(self, remote_path: str):
+    if remote_path not in self.files:
+      raise FileNotFoundError(remote_path)
+    return PollFakeStat(len(self.files[remote_path]))
+
+  def close(self):
+    pass
+
+
+class PollFallbackClient:
+  def __init__(self, sftp: PollFallbackSftp):
+    self.sftp = sftp
+
+  def set_missing_host_key_policy(self, policy):
+    pass
+
+  def connect(self, **kwargs):
+    pass
+
+  def open_sftp(self):
+    return self.sftp
+
+  def close(self):
+    pass
+
+
+class PollFallbackParamiko:
+  class AutoAddPolicy:
+    pass
+
+  def __init__(self, sftp: PollFallbackSftp):
+    self.sftp = sftp
+
+  def SSHClient(self):
+    return PollFallbackClient(self.sftp)
+
+
+def test_poll_remote_detached_job_falls_back_to_runtime_log_when_status_missing() -> None:
+  sftp = PollFallbackSftp({
+    "/remote/.wgsc_job/runtime.log": b"Training progress: 10/100\n",
+  })
+  original_loader = remote_executor._load_paramiko
+  try:
+    remote_executor._load_paramiko = lambda: PollFallbackParamiko(sftp)
+    result = remote_executor.poll_remote_detached_job(
+      remote_config=remote_config(),
+      remote_status_path="/remote/.wgsc_job/status.json",
+      remote_log_path="/remote/.wgsc_job/runtime.log",
+      remote_output_dir="/remote",
+      local_output_dir="/local",
+      log_cursor=0,
+    )
+  finally:
+    remote_executor._load_paramiko = original_loader
+
+  assert result["status"] == "running"
+  assert result["stage"] == "executing_remote_command"
+  assert result["status_fallback"] == "runtime_log"
+  assert "Training progress" in result["log_text"]
+
+
+def test_poll_remote_detached_job_stays_running_when_status_missing_and_log_unchanged() -> None:
+  log_text = b"Training progress: 10/100\n"
+  sftp = PollFallbackSftp({
+    "/remote/.wgsc_job/runtime.log": log_text,
+  })
+  original_loader = remote_executor._load_paramiko
+  try:
+    remote_executor._load_paramiko = lambda: PollFallbackParamiko(sftp)
+    result = remote_executor.poll_remote_detached_job(
+      remote_config=remote_config(),
+      remote_status_path="/remote/.wgsc_job/status.json",
+      remote_log_path="/remote/.wgsc_job/runtime.log",
+      remote_output_dir="/remote",
+      local_output_dir="/local",
+      log_cursor=len(log_text),
+    )
+  finally:
+    remote_executor._load_paramiko = original_loader
+
+  assert result["status"] == "running"
+  assert result["stage"] == "executing_remote_command"
+  assert result["status_fallback"] == "runtime_log"
+  assert result["log_text"] == ""
+
+
+def test_poll_remote_detached_job_falls_back_to_exit_code_when_status_missing() -> None:
+  sftp = PollFallbackSftp({
+    "/remote/.wgsc_job/exit_code": b"0\n",
+  })
+  original_loader = remote_executor._load_paramiko
+  try:
+    remote_executor._load_paramiko = lambda: PollFallbackParamiko(sftp)
+    result = remote_executor.poll_remote_detached_job(
+      remote_config=remote_config(),
+      remote_status_path="/remote/.wgsc_job/status.json",
+      remote_log_path="/remote/.wgsc_job/runtime.log",
+      remote_output_dir="/remote",
+      local_output_dir="/local",
+      log_cursor=0,
+    )
+  finally:
+    remote_executor._load_paramiko = original_loader
+
+  assert result["status"] == "completed"
+  assert result["stage"] == "completed"
+  assert result["return_code"] == 0
+  assert result["status_fallback"] == "exit_code"
+
+
+def test_remote_monitor_retries_transient_poll_errors() -> None:
+  job = {
+    "id": f"monitor-retry-{uuid.uuid4().hex[:8]}",
+    "status": "running",
+    "algorithm_family": "family",
+    "output_dir": str(Path(api_server.WEB_DIR) / "generated" / "download_tests" / "monitor-retry"),
+    "remote_status_path": "/remote/.wgsc_job/status.json",
+    "remote_log_path": "/remote/.wgsc_job/runtime.log",
+    "remote_output_dir": "/remote",
+    "remote_log_cursor": 0,
+  }
+  calls: list[int] = []
+  logs: list[str] = []
+  original_poll = api_server.poll_remote_detached_job
+  original_persist = api_server.persist_job_state
+  original_append = api_server.append_job_log_line
+  original_sleep = api_server.time.sleep
+
+  def fake_poll(**kwargs):
+    calls.append(1)
+    if len(calls) <= 2:
+      raise RemoteExecutionError(
+        "Remote result marker not found: /remote/.wgsc_job/status.json",
+        code_hint="WGSC-JOB-RESULTS-MARKER-MISSING",
+        stage="result_marker",
+      )
+    job["cancel_requested"] = True
+    return {
+      "status": "running",
+      "stage": "executing_remote_command",
+      "return_code": "",
+      "log_text": "still running\n",
+      "log_cursor": 14,
+      "remote_output_dir": "/remote",
+      "download": {},
+    }
+
+  try:
+    api_server.poll_remote_detached_job = fake_poll
+    api_server.persist_job_state = lambda _job: None
+    api_server.append_job_log_line = lambda _job, _channel, line: logs.append(line)
+    api_server.time.sleep = lambda _seconds: None
+    api_server.start_remote_monitor_thread(job, remote_config())
+    deadline = api_server.time.time() + 2
+    while job.get("_monitoring") and api_server.time.time() < deadline:
+      original_sleep(0.01)
+  finally:
+    api_server.poll_remote_detached_job = original_poll
+    api_server.persist_job_state = original_persist
+    api_server.append_job_log_line = original_append
+    api_server.time.sleep = original_sleep
+
+  assert len(calls) == 3
+  assert job["monitor_state"] == "monitoring"
+  assert job["remote_stage"] == "executing_remote_command"
+  assert any("transient error" in line for line in logs)
+
+
 def main() -> None:
   test_detached_script_contract()
+  test_remote_run_key_conflict_appends_job_prefix()
   test_existing_dataset_disables_auto_colmap_contract()
   test_existing_dataset_colmap_preflight_is_optional()
   test_tmux_install_candidates_use_mamba_or_noninteractive_sudo_only()
@@ -1001,6 +1306,7 @@ def main() -> None:
   test_remote_download_skips_project_checkpoint_artifacts()
   test_gaussian_splatting_lightning_train_exports_ply()
   test_training_eval_arg_injection_is_family_aware()
+  test_atomgs_gaussianpro_adapters_and_post_train_contract()
   test_ply_header_classifier_selects_viewer_format()
   test_gaussian_splatting_lightning_prefers_exported_gaussian_ply()
   test_gaussian_splatting_lightning_finds_nested_existing_dataset_output()
@@ -1012,6 +1318,10 @@ def main() -> None:
   test_result_download_repeated_request_returns_already_running()
   test_pending_remote_download_hides_partial_artifacts()
   test_stale_pending_remote_download_becomes_retryable()
+  test_poll_remote_detached_job_falls_back_to_runtime_log_when_status_missing()
+  test_poll_remote_detached_job_stays_running_when_status_missing_and_log_unchanged()
+  test_poll_remote_detached_job_falls_back_to_exit_code_when_status_missing()
+  test_remote_monitor_retries_transient_poll_errors()
   print("detached remote tests passed")
 
 

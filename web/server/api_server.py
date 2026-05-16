@@ -47,6 +47,7 @@ from web.server.remote_executor import (
   RemoteExecutionError,
   apply_training_eval_arg,
   build_remote_paths,
+  build_remote_run_key,
   build_remote_tmux_attach_command,
   build_remote_tmux_session_name,
   cancel_remote_detached_job,
@@ -77,6 +78,10 @@ PARTIAL_SUCCESS_STATUSES = {
 }
 TERMINAL_STATUSES = {"completed", "failed", "canceled", *PARTIAL_SUCCESS_STATUSES}
 DOWNLOADABLE_RESULT_STATUSES = {"completed", *PARTIAL_SUCCESS_STATUSES}
+REMOTE_MONITOR_MAX_CONSECUTIVE_FAILURES = 20
+REMOTE_MONITOR_MAX_FAILURE_SECONDS = 300
+REMOTE_MONITOR_RETRY_MIN_SECONDS = 3
+REMOTE_MONITOR_RETRY_MAX_SECONDS = 10
 ARTIFACT_RESULT_FIELDS = (
   "manifest_url",
   "viewer_url",
@@ -154,6 +159,18 @@ LOCAL_RESULT_PROJECTS = [
     "family": "reduced-3dgs",
     "label": "Reduced 3DGS",
     "root": ROOT_DIR / "reduced-3dgs-main",
+    "representation": "sh",
+  },
+  {
+    "family": "gaussianpro",
+    "label": "GaussianPro",
+    "root": ROOT_DIR / "GaussianPro-version1.0",
+    "representation": "sh",
+  },
+  {
+    "family": "atomgs",
+    "label": "AtomGS",
+    "root": ROOT_DIR / "AtomGS-main",
     "representation": "sh",
   },
 ]
@@ -260,6 +277,8 @@ def _analysis_metric_score(path: str, key: str) -> int:
     if key_id.endswith("ssim") and "msssim" not in key_id:
       return 70
     return 0
+  if key == "lpips":
+    return 100 if _metric_has_token(path, "lpips") else 0
   if key == "size_mb":
     is_component_size = bool(re.search(r"feat|feature|offset|opacity|scaling|rotation|mask|anchor", key_id))
     if key_id in {"ttlsizemb", "totalsizemb", "totalmodelsize", "totalmodelsizeinmb"}:
@@ -295,7 +314,7 @@ def infer_analysis_metrics_with_sources(payload: Any, source_prefix: str = "") -
   ]
   inferred: Dict[str, Any] = {}
   sources: Dict[str, str] = {}
-  for key in ("psnr", "ssim", "size_mb"):
+  for key in ("psnr", "ssim", "lpips", "size_mb"):
     scored = [
       (_analysis_metric_score(path, key), path, value)
       for path, value in entries
@@ -1283,6 +1302,34 @@ ALGORITHM_CUDA_CHECK_SPECS: Dict[str, Dict[str, Any]] = {
       ("tqdm", "tqdm"),
     ],
   },
+  "gaussianpro": {
+    "label": "GaussianPro",
+    "root": ROOT_DIR / "GaussianPro-version1.0",
+    "env_name": "gaussianpro",
+    "required_modules": [
+      ("torchvision", "torchvision"),
+      ("diff_gaussian_rasterization", "diff_gaussian_rasterization"),
+      ("simple_knn", "simple_knn"),
+      ("gaussianpro", "gaussianpro"),
+      ("cv2", "opencv-python"),
+      ("imageio", "imageio"),
+      ("plyfile", "plyfile"),
+      ("lpips", "lpips"),
+    ],
+  },
+  "atomgs": {
+    "label": "AtomGS",
+    "root": ROOT_DIR / "AtomGS-main",
+    "env_name": "AtomGS",
+    "required_modules": [
+      ("torchvision", "torchvision"),
+      ("diff_gaussian_rasterization", "diff_gaussian_rasterization"),
+      ("simple_knn", "simple_knn"),
+      ("plyfile", "plyfile"),
+      ("lpips", "lpips"),
+      ("open3d", "open3d"),
+    ],
+  },
 }
 
 
@@ -2070,6 +2117,8 @@ def result_marker_names_for_family(family: str | None = None) -> tuple[str, ...]
     return ("point_cloud", "checkpoints", "test", "train", "results.json", "per_view.json")
   if family == "hac-plus-plus":
     return ("point_cloud", "bitstreams", "test", "train", "results.json", "per_view.json", "outputs.log")
+  if family in {"gaussianpro", "atomgs"}:
+    return ("point_cloud", "test", "train", "results.json", "per_view.json", "result.json")
   return ("point_cloud", "test", "train", "results.json", "per_view.json", "metrics.json")
 
 
@@ -2377,6 +2426,13 @@ def result_image_patterns_for_family(family: str | None = None) -> list[str]:
       "test/*/renders/*",
       "train/*/renders/*",
     ]
+  if family == "atomgs":
+    return [
+      "test/ours_*/renders/*",
+      "train/ours_*/renders/*",
+      "test/ours_*/rgb/*",
+      "train/ours_*/rgb/*",
+    ]
   return [
     "test/ours_*/renders/*",
     "train/ours_*/renders/*",
@@ -2484,6 +2540,7 @@ def analysis_result_json_files(directory: Path, family: str | None = None, limit
 def result_json_metric_values(payload: Any) -> Dict[str, Any]:
   psnr_values: list[float] = []
   ssim_values: list[float] = []
+  lpips_values: list[float] = []
 
   def visit(value: Any, key: str = "") -> None:
     if isinstance(value, dict):
@@ -2502,6 +2559,8 @@ def result_json_metric_values(payload: Any) -> Dict[str, Any]:
       psnr_values.append(number)
     if key_id == "ssim":
       ssim_values.append(number)
+    if key_id == "lpips":
+      lpips_values.append(number)
 
   visit(payload)
   metrics: Dict[str, Any] = {}
@@ -2511,6 +2570,8 @@ def result_json_metric_values(payload: Any) -> Dict[str, Any]:
     metrics["psnr_db"] = _metric_number_text(psnr)
   if ssim_values:
     metrics["ssim"] = _metric_number_text(sum(ssim_values) / len(ssim_values))
+  if lpips_values:
+    metrics["lpips"] = _metric_number_text(sum(lpips_values) / len(lpips_values))
   return metrics
 
 
@@ -3016,6 +3077,7 @@ def read_runtime_artifacts(
     merge_analysis_metric(metrics, sources, "psnr", result_metrics.get("psnr"), "artifact:result.json", overwrite=True)
     merge_analysis_metric(metrics, sources, "psnr_db", result_metrics.get("psnr_db") or result_metrics.get("psnr"), "artifact:result.json", overwrite=True)
     merge_analysis_metric(metrics, sources, "ssim", result_metrics.get("ssim"), "artifact:result.json", overwrite=True)
+    merge_analysis_metric(metrics, sources, "lpips", result_metrics.get("lpips"), "artifact:result.json", overwrite=True)
 
   artifact: Dict[str, Any] = {}
   for candidate_dir in candidate_dirs:
@@ -3056,6 +3118,7 @@ def read_runtime_artifacts(
     metrics["analysis_metric_sources"] = sources
     metrics["psnr_source"] = sources.get("psnr") or sources.get("psnr_db")
     metrics["ssim_source"] = sources.get("ssim")
+    metrics["lpips_source"] = sources.get("lpips")
     metrics["size_source"] = sources.get("size_mb")
   if metrics:
     payload["metrics"] = metrics
@@ -3234,6 +3297,67 @@ def operation_command_template(adapter: Dict[str, Any], operation: str) -> str:
   return command_template
 
 
+def format_remote_operation_command(
+  adapter: Dict[str, Any],
+  operation: str,
+  format_args: Dict[str, Any],
+  python_bin: str,
+) -> str:
+  command_template = operation_command_template(adapter, operation)
+  command = command_template.format(**format_args)
+  command = sanitize_formatted_command(command_template, command, format_args)
+  if command.lstrip().startswith("python "):
+    command = f"{python_bin}{command.lstrip()[len('python') :]}"
+  return command
+
+
+def post_train_config_for_adapter(
+  adapter: Dict[str, Any],
+  format_args: Dict[str, Any],
+  python_bin: str,
+  *,
+  format_commands: bool = True,
+) -> Dict[str, Any]:
+  explicit = adapter.get("post_train") if isinstance(adapter.get("post_train"), dict) else {}
+  operations = adapter.get("operations", {}) if isinstance(adapter.get("operations"), dict) else {}
+  family = str(adapter.get("family", "")).strip()
+  train_produces_eval = bool(explicit.get("train_produces_eval"))
+  run_render = bool(explicit.get("run_render", operations.get("render", {}).get("enabled", False)))
+  run_metrics = bool(explicit.get("run_metrics", operations.get("metrics", {}).get("enabled", False)))
+  render_template = str((operations.get("render", {}) or {}).get("template", "") or "")
+  metrics_template = str((operations.get("metrics", {}) or {}).get("template", "") or "")
+  render_command = str(explicit.get("render_command", "") or "").strip()
+  metrics_command = str(explicit.get("metrics_command", "") or "").strip()
+
+  if format_commands and run_render and not render_command and family != "gaussian-splatting-lightning" and operations.get("render", {}).get("enabled"):
+    render_command = format_remote_operation_command(adapter, "render", format_args, python_bin)
+  if format_commands and run_metrics and not metrics_command and operations.get("metrics", {}).get("enabled"):
+    metrics_command = format_remote_operation_command(adapter, "metrics", format_args, python_bin)
+
+  return {
+    "train_produces_eval": train_produces_eval,
+    "run_render": run_render,
+    "run_metrics": run_metrics,
+    "render_template": render_template,
+    "metrics_template": metrics_template,
+    "render_command": render_command,
+    "metrics_command": metrics_command,
+  }
+
+
+def unique_remote_run_key(base_run_key: str, job_id: str) -> str:
+  run_key = str(base_run_key or "").strip()
+  if not run_key:
+    return ""
+  if not any(str(job.get("remote_run_key", "")).strip() == run_key for job in JOBS.values()):
+    return run_key
+  suffix = str(job_id or "").strip().replace("_", "-")[:8].strip("-") or uuid.uuid4().hex[:8]
+  candidate = f"{run_key}-{suffix}"
+  if not any(str(job.get("remote_run_key", "")).strip() == candidate for job in JOBS.values()):
+    return candidate
+  return f"{run_key}-{uuid.uuid4().hex[:8]}"
+
+
 def effective_auto_colmap(auto_colmap: Any, use_existing_remote_dataset: Any) -> bool:
   return bool(auto_colmap) and not bool(use_existing_remote_dataset)
 
@@ -3261,6 +3385,7 @@ def build_remote_algorithm_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
   session_id = str(payload.get("session_id", "default-session")).strip() or "default-session"
   dataset_name = str(payload.get("dataset_name", "")).strip() or session_id
   preview_job_id = str(payload.get("preview_job_id", "")).strip() or f"preview-{uuid.uuid4().hex[:8]}"
+  remote_run_key = build_remote_run_key(dataset_name, family, time.time())
   use_existing_remote_dataset = bool(payload.get("use_existing_remote_dataset", False))
   remote_dataset_id = str(payload.get("remote_dataset_id", "")).strip()
   remote_dataset_path = str(payload.get("remote_dataset_path", "")).strip()
@@ -3289,9 +3414,10 @@ def build_remote_algorithm_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
     session_id=session_id,
     family=family,
     job_id=preview_job_id,
+    run_key=remote_run_key,
   )
   resolved_output_dir = remote_job_local_output_dir(session_id, family, preview_job_id)
-  remote_tmux_session = build_remote_tmux_session_name(family=family, job_id=preview_job_id)
+  remote_tmux_session = build_remote_tmux_session_name(family=family, job_id=preview_job_id, run_key=remote_run_key)
   remote_tmux_attach_command = build_remote_tmux_attach_command(remote_config, remote_tmux_session)
 
   checkpoint_path = str(payload.get("remote_checkpoint_path", payload.get("checkpoint_path", ""))).strip()
@@ -3315,6 +3441,7 @@ def build_remote_algorithm_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
   )
   if remote_command.lstrip().startswith("python "):
     remote_command = f"{remote_config['python']}{remote_command.lstrip()[len('python') :]}"
+  post_train_config = post_train_config_for_adapter(adapter, format_args, remote_config["python"])
 
   steps = [
     f"mkdir -p {shlex.quote(remote_paths['output_dir'])}",
@@ -3333,6 +3460,7 @@ def build_remote_algorithm_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
     "execution_backend": "tmux",
     "remote_tmux_session": remote_tmux_session,
     "remote_tmux_attach_command": remote_tmux_attach_command,
+    "remote_run_key": remote_run_key,
     "tmux_available": None,
     "tmux_install": {
       "policy": "submit_time_mamba_or_sudo_n",
@@ -3346,6 +3474,7 @@ def build_remote_algorithm_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
     "checkpoint_path": checkpoint_path,
     "command_template": command_template,
     "remote_command": remote_command,
+    "post_train": post_train_config,
     "shell_command": f"bash -lc {shlex.quote(remote_script)}",
     "missing_inputs": missing_inputs,
     "remote": sanitize_remote_config(remote_config),
@@ -3414,9 +3543,11 @@ ANALYSIS_EXPORT_COLUMNS = [
   "result_path",
   "psnr_db",
   "ssim",
+  "lpips",
   "size_mb",
   "psnr_source",
   "ssim_source",
+  "lpips_source",
   "size_source",
   "metrics_csv_url",
   "logs_download_url",
@@ -3434,12 +3565,16 @@ def analysis_export_csv(job_ids: list[str]) -> str:
     sources = enriched.get("analysis_metric_sources") if isinstance(enriched.get("analysis_metric_sources"), dict) else {}
     psnr_source = sources.get("psnr") or sources.get("psnr_db") or ""
     ssim_source = sources.get("ssim") or ""
+    lpips_source = sources.get("lpips") or ""
     if psnr_source != "artifact:result.json":
       psnr_source = ""
     if ssim_source != "artifact:result.json":
       ssim_source = ""
+    if lpips_source != "artifact:result.json":
+      lpips_source = ""
     psnr_value = (metrics.get("psnr_db") or metrics.get("psnr") or "") if psnr_source else ""
     ssim_value = (metrics.get("ssim") or "") if ssim_source else ""
+    lpips_value = (metrics.get("lpips") or "") if lpips_source else ""
     rows.append({
       "job_id": enriched.get("id", ""),
       "algorithm_family": enriched.get("algorithm_family", ""),
@@ -3451,9 +3586,11 @@ def analysis_export_csv(job_ids: list[str]) -> str:
       "result_path": enriched.get("result_path", ""),
       "psnr_db": psnr_value,
       "ssim": ssim_value,
+      "lpips": lpips_value,
       "size_mb": metrics.get("size_mb", "") if sources.get("size_mb") else "",
       "psnr_source": psnr_source,
       "ssim_source": ssim_source,
+      "lpips_source": lpips_source,
       "size_source": sources.get("size_mb", ""),
       "metrics_csv_url": enriched.get("metrics_csv_url", ""),
       "logs_download_url": enriched.get("logs_download_url", ""),
@@ -3529,10 +3666,12 @@ def enrich_job(job: Dict[str, Any]) -> Dict[str, Any]:
       "psnr",
       "psnr_db",
       "ssim",
+      "lpips",
       "size_mb",
       "size_bytes",
       "psnr_source",
       "ssim_source",
+      "lpips_source",
       "size_source",
     ):
       existing_metrics.pop(strict_key, None)
@@ -3563,6 +3702,7 @@ def enrich_job(job: Dict[str, Any]) -> Dict[str, Any]:
   metric_sources = enriched.get("analysis_metric_sources") if isinstance(enriched.get("analysis_metric_sources"), dict) else {}
   enriched["psnr_source"] = metric_sources.get("psnr") or metric_sources.get("psnr_db")
   enriched["ssim_source"] = metric_sources.get("ssim")
+  enriched["lpips_source"] = metric_sources.get("lpips")
   enriched["size_source"] = metric_sources.get("size_mb")
   status = str(enriched.get("status", "")).strip().lower()
   enriched["download_path_valid"] = job_download_path_valid(enriched)
@@ -3996,9 +4136,15 @@ def validate_completed_result_download_job(job: Dict[str, Any]) -> tuple[str, st
   remote_output_dir, local_output_dir = completed_remote_result_paths(job)
   if not remote_output_dir:
     raise ValueError("Completed remote job has no remote_output_dir to download.")
-  if not local_output_dir:
-    raise ValueError("Completed remote job has no local output_dir to download into.")
-  ensure_job_download_path_valid(job)
+  if not local_output_dir or not job_download_path_valid(job):
+    previous_output_dir = local_output_dir
+    local_output_dir = reset_job_output_dir_to_canonical(job)
+    job["legacy_output_dir_migrated"] = True
+    if previous_output_dir:
+      job["previous_output_dir"] = previous_output_dir
+    job["remote_stage"] = "download_path_migrated"
+  else:
+    job["download_path_valid"] = True
   return remote_output_dir, local_output_dir
 
 
@@ -4380,12 +4526,14 @@ def update_job_artifacts(job: Dict[str, Any]) -> None:
     "psnr",
     "psnr_db",
     "ssim",
+    "lpips",
     "size_mb",
     "size_bytes",
     "fps",
     "render_fps",
     "psnr_source",
     "ssim_source",
+    "lpips_source",
     "size_source",
     "render_fps_source",
   ):
@@ -4456,6 +4604,8 @@ def start_remote_monitor_thread(job: Dict[str, Any], remote_config: Dict[str, An
   job["_remote_config"] = dict(remote_config)
 
   def monitor() -> None:
+    consecutive_failures = 0
+    first_failure_at = 0.0
     try:
       while True:
         if job.get("cancel_requested"):
@@ -4472,6 +4622,10 @@ def start_remote_monitor_thread(job: Dict[str, Any], remote_config: Dict[str, An
             expected_job_id=str(job.get("id", "")),
             expected_family=str(job.get("algorithm_family", "")),
           )
+          consecutive_failures = 0
+          first_failure_at = 0.0
+          job.pop("remote_monitor_error", None)
+          job.pop("remote_monitor_failures", None)
           apply_remote_poll_result(job, poll_result)
           persist_job_state(job)
           if is_job_terminal(job):
@@ -4505,11 +4659,37 @@ def start_remote_monitor_thread(job: Dict[str, Any], remote_config: Dict[str, An
             persist_job_state(job)
             break
         except Exception as exc:  # pragma: no cover - network dependent
-          job["monitor_state"] = "needs_remote_config"
-          job["remote_stage"] = "detached_monitor_disconnected"
-          append_job_log_line(job, "stderr", f"[Monitor] Detached remote monitor disconnected: {exc}\n")
+          now = time.time()
+          consecutive_failures += 1
+          if not first_failure_at:
+            first_failure_at = now
+          elapsed = now - first_failure_at
+          job["monitor_state"] = "monitoring"
+          job["remote_stage"] = "detached_monitor_retrying"
+          job["remote_monitor_error"] = str(exc)
+          job["remote_monitor_failures"] = consecutive_failures
+          if consecutive_failures == 1 or consecutive_failures % 5 == 0:
+            append_job_log_line(
+              job,
+              "stderr",
+              f"[Monitor] Detached remote monitor transient error "
+              f"({consecutive_failures}/{REMOTE_MONITOR_MAX_CONSECUTIVE_FAILURES}): {exc}\n",
+            )
           persist_job_state(job)
-          break
+          if (
+            consecutive_failures >= REMOTE_MONITOR_MAX_CONSECUTIVE_FAILURES
+            or elapsed >= REMOTE_MONITOR_MAX_FAILURE_SECONDS
+          ):
+            job["monitor_state"] = "needs_remote_config"
+            job["remote_stage"] = "detached_monitor_disconnected"
+            append_job_log_line(job, "stderr", f"[Monitor] Detached remote monitor disconnected: {exc}\n")
+            persist_job_state(job)
+            break
+          time.sleep(min(
+            REMOTE_MONITOR_RETRY_MAX_SECONDS,
+            REMOTE_MONITOR_RETRY_MIN_SECONDS + max(0, consecutive_failures - 1),
+          ))
+          continue
         time.sleep(3)
     finally:
       job["_monitoring"] = False
@@ -4779,6 +4959,8 @@ def start_remote_job_thread(
   use_existing_remote_dataset: bool,
   training_args: Dict[str, Any] | None = None,
   command_override: str = "",
+  remote_run_key: str = "",
+  post_train_config: Dict[str, Any] | None = None,
 ) -> None:
   auto_colmap = effective_auto_colmap(auto_colmap, use_existing_remote_dataset)
 
@@ -4838,6 +5020,8 @@ def start_remote_job_thread(
         use_existing_remote_dataset=use_existing_remote_dataset,
         training_args=training_args or {},
         command_override=command_override,
+        remote_run_key=remote_run_key,
+        post_train_config=post_train_config or {},
         log_callback=on_log,
         stage_callback=on_stage,
         cancel_checker=lambda: bool(job.get("cancel_requested")),
@@ -4849,6 +5033,7 @@ def start_remote_job_thread(
       job["remote_pid"] = result.get("remote_pid", "")
       job["remote_tmux_session"] = result.get("remote_tmux_session", job.get("remote_tmux_session", ""))
       job["remote_tmux_attach_command"] = result.get("remote_tmux_attach_command", job.get("remote_tmux_attach_command", ""))
+      job["remote_run_key"] = result.get("remote_run_key", job.get("remote_run_key", ""))
       job["tmux_available"] = result.get("tmux_available", True)
       job["tmux_install"] = result.get("tmux_install", job.get("tmux_install", {}))
       job["remote_job_dir"] = result.get("remote_job_dir", "")
@@ -5788,7 +5973,18 @@ class ApiHandler(SimpleHTTPRequestHandler):
         return
 
       command_override = str(payload.get("command_override", "")).strip()
-      job_tmux_session = build_remote_tmux_session_name(family=family, job_id=job_id)
+      job_created_at = time.time()
+      remote_run_key = unique_remote_run_key(
+        build_remote_run_key(dataset_name or remote_dataset_id or session_id, family, job_created_at),
+        job_id,
+      )
+      post_train_config = post_train_config_for_adapter(
+        definition,
+        {},
+        validated_remote["python"],
+        format_commands=False,
+      )
+      job_tmux_session = build_remote_tmux_session_name(family=family, job_id=job_id, run_key=remote_run_key)
       job = {
         "id": job_id,
         "status": "queued",
@@ -5798,7 +5994,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
         "requested_operation": operation,
         "command": command_override or command_template,
         "command_override": command_override,
-        "created_at": time.time(),
+        "created_at": job_created_at,
         "workspace": workspace_for_template,
         "output_dir": resolved_output_dir,
         "session_id": session_id,
@@ -5810,6 +6006,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
         "repo_path": definition.get("repo_path", ""),
         "cwd": definition.get("default_cwd", ""),
         "remote": sanitize_remote_config(validated_remote),
+        "remote_run_key": remote_run_key,
         "execution_backend": "tmux",
         "remote_tmux_session": job_tmux_session,
         "remote_tmux_attach_command": build_remote_tmux_attach_command(validated_remote, job_tmux_session),
@@ -5851,6 +6048,8 @@ class ApiHandler(SimpleHTTPRequestHandler):
         use_existing_remote_dataset=use_existing_remote_dataset,
         training_args=_training_format_args(payload),
         command_override=command_override,
+        remote_run_key=remote_run_key,
+        post_train_config=post_train_config,
       )
       json_response(
         self,

@@ -8,6 +8,7 @@ import threading
 import os
 import re
 import time
+from datetime import datetime, timezone
 from fnmatch import fnmatch
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Dict
@@ -49,6 +50,18 @@ ALGORITHM_EVAL_REQUIREMENTS: Dict[str, Dict[str, Any]] = {
     "train_eval_arg": "--eval",
     "cli_supports_eval": True,
     "reason": "training/test evaluation uses held-out test cameras",
+  },
+  "gaussianpro": {
+    "needs_eval_for_metrics": True,
+    "train_eval_arg": "--eval",
+    "cli_supports_eval": True,
+    "reason": "render.py and metrics.py need held-out test cameras for PSNR/SSIM/LPIPS",
+  },
+  "atomgs": {
+    "needs_eval_for_metrics": True,
+    "train_eval_arg": "--eval",
+    "cli_supports_eval": True,
+    "reason": "render.py and metrics.py need held-out test cameras for PSNR/SSIM/LPIPS",
   },
   "gaussian-splatting-lightning": {
     "needs_eval_for_metrics": True,
@@ -103,18 +116,11 @@ def apply_training_eval_arg(family: str, command: str, *, user_disabled_eval: bo
   return f"{command} {eval_arg}"
 
 
-def should_run_post_train_eval(family: str, command: str) -> bool:
-  family_key = str(family or "").strip().lower()
-  if family_key not in {
-    "megs2",
-    "reduced-3dgs",
-    "scaffold-gs",
-    "hac-plus-plus",
-    "contextgs",
-    "gaussian-splatting-lightning",
-  }:
+def should_run_post_train_eval(command: str, post_train: Dict[str, Any] | None = None) -> bool:
+  if not looks_like_training_command(command):
     return False
-  return looks_like_training_command(command)
+  config = post_train if isinstance(post_train, dict) else {}
+  return bool(config.get("train_produces_eval") or config.get("run_render") or config.get("run_metrics"))
 
 
 class RemoteExecutionError(RuntimeError):
@@ -572,7 +578,21 @@ def build_remote_paths(
   session_id: str,
   family: str,
   job_id: str,
+  dataset_name: str = "",
+  started_at: float | int | str | None = None,
+  run_key: str = "",
 ) -> Dict[str, str]:
+  canonical_run_key = str(run_key or "").strip()
+  if not canonical_run_key and (dataset_name or started_at is not None):
+    canonical_run_key = build_remote_run_key(dataset_name or session_id or job_id, family, started_at)
+  if canonical_run_key:
+    workspace_dir = str(PurePosixPath(workspace_root) / "runs" / canonical_run_key / "workspace")
+    output_dir = str(PurePosixPath(output_root) / "runs" / canonical_run_key / "output")
+    return {
+      "workspace_dir": workspace_dir,
+      "output_dir": output_dir,
+      "run_key": canonical_run_key,
+    }
   workspace_dir = str(PurePosixPath(workspace_root) / session_id / family / job_id / "workspace")
   output_dir = str(PurePosixPath(output_root) / session_id / family / job_id / "output")
   return {
@@ -585,11 +605,55 @@ def _quote(value: str) -> str:
   return shlex.quote(str(value))
 
 
-def build_remote_tmux_session_name(*, family: str, job_id: str) -> str:
-  raw = f"wgsc-{family}-{job_id}".strip("-")
+def _canonical_slug(value: str, *, fallback: str, max_length: int = 48, lower: bool = True) -> str:
+  text = str(value or "").strip()
+  if lower:
+    text = text.lower()
+  normalized = re.sub(r"[^A-Za-z0-9_.-]+", "-", text)
+  normalized = re.sub(r"[-_.]{2,}", "-", normalized).strip("-_.")
+  return (normalized[:max_length].strip("-_.") or fallback)
+
+
+def _remote_run_timestamp(started_at: float | int | str | None = None) -> str:
+  if started_at is None or started_at == "":
+    dt = datetime.now(timezone.utc)
+  elif isinstance(started_at, (int, float)):
+    dt = datetime.fromtimestamp(float(started_at), timezone.utc)
+  else:
+    raw = str(started_at).strip()
+    try:
+      dt = datetime.fromtimestamp(float(raw), timezone.utc)
+    except Exception:
+      try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(timezone.utc)
+      except Exception:
+        dt = datetime.now(timezone.utc)
+  return dt.strftime("%Y%m%dT%H%M%SZ")
+
+
+def build_remote_run_key(dataset_name_or_id: str, family: str, started_at: float | int | str | None = None) -> str:
+  dataset_slug = _canonical_slug(dataset_name_or_id, fallback="dataset", max_length=48)
+  algorithm_slug = _canonical_slug(family, fallback="algorithm", max_length=32)
+  return f"{dataset_slug}-{algorithm_slug}-{_remote_run_timestamp(started_at)}"
+
+
+def build_remote_tmux_session_name(*, family: str = "", job_id: str = "", run_key: str = "") -> str:
+  if run_key:
+    normalized_key = _canonical_slug(run_key, fallback="remote-job", max_length=120, lower=False)
+    raw = f"wgsc-{normalized_key}".strip("-")
+  else:
+    raw = f"wgsc-{family}-{job_id}".strip("-")
   normalized = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw).strip("-")
   normalized = re.sub(r"-{2,}", "-", normalized)
-  return (normalized or "wgsc-remote-job")[:80]
+  if len(normalized) <= 80:
+    return normalized or "wgsc-remote-job"
+  parts = normalized.split("-")
+  timestamp_index = next((index for index, part in enumerate(parts) if re.fullmatch(r"\d{8}T\d{6}Z", part)), -1)
+  if timestamp_index > 1:
+    suffix = "-".join(parts[timestamp_index - 1:])
+    prefix_limit = max(8, 80 - len(suffix) - 1)
+    return f"{normalized[:prefix_limit].strip('-')}-{suffix}"[:80]
+  return normalized[:80].strip("-") or "wgsc-remote-job"
 
 
 def build_remote_tmux_attach_command(remote_config: Dict[str, Any], tmux_session: str) -> str:
@@ -1207,7 +1271,7 @@ def check_remote_output_download(
       allow_agent=False,
     )
     sftp = client.open_sftp()
-    marker = _verify_remote_result_marker(
+    marker = _verify_or_recover_remote_result_marker(
       sftp,
       remote_output_dir=remote_output_dir,
       remote_status_path=remote_status_path,
@@ -1256,7 +1320,7 @@ def download_remote_output_directory(
       allow_agent=False,
     )
     sftp = client.open_sftp()
-    marker = _verify_remote_result_marker(
+    marker = _verify_or_recover_remote_result_marker(
       sftp,
       remote_output_dir=remote_output_dir,
       remote_status_path=remote_status_path,
@@ -1314,6 +1378,54 @@ def _read_remote_text_file(sftp, remote_path: str) -> str:
     return ""
 
 
+def _remote_path_exists(sftp, remote_path: str) -> bool:
+  try:
+    sftp.stat(remote_path)
+    return True
+  except Exception:
+    return False
+
+
+def _write_remote_json_marker(sftp, remote_path: str, payload: Dict[str, Any]) -> None:
+  tmp_path = f"{remote_path}.tmp.{int(time.time() * 1000)}"
+  _write_remote_text(sftp, tmp_path, json.dumps(payload, ensure_ascii=False, indent=2))
+  try:
+    sftp.rename(tmp_path, remote_path)
+  except Exception:
+    _write_remote_text(sftp, remote_path, json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def _recover_missing_status_marker(
+  sftp,
+  *,
+  remote_status_path: str,
+  remote_log_path: str,
+  remote_output_dir: str,
+  expected_job_id: str = "",
+  expected_family: str = "",
+  status: str = "running",
+  stage: str = "executing_remote_command",
+  return_code: Any = "",
+  message: str = "Remote status marker was recovered from job sidecar files.",
+) -> None:
+  try:
+    payload: Dict[str, Any] = {
+      "job_id": str(expected_job_id or ""),
+      "family": str(expected_family or ""),
+      "status": status,
+      "stage": stage,
+      "message": message,
+      "remote_log_path": remote_log_path,
+      "remote_output_dir": remote_output_dir,
+      "updated_at": time.time(),
+    }
+    if return_code not in ("", None):
+      payload["return_code"] = return_code
+    _write_remote_json_marker(sftp, remote_status_path, payload)
+  except Exception:
+    pass
+
+
 def _read_remote_log_delta(sftp, remote_path: str, cursor: int) -> Dict[str, Any]:
   try:
     stat_result = sftp.stat(remote_path)
@@ -1344,6 +1456,88 @@ def _read_remote_log_delta(sftp, remote_path: str, cursor: int) -> Dict[str, Any
     "text": text,
     "available": True,
   }
+
+
+def _remote_exit_code_path_from_status_path(remote_status_path: str) -> str:
+  if not str(remote_status_path or "").strip():
+    return ""
+  return str(PurePosixPath(remote_status_path).parent / "exit_code")
+
+
+def _status_from_remote_return_code(return_code: int) -> str:
+  if return_code == 0:
+    return "completed"
+  if return_code == 130:
+    return "canceled"
+  return "failed"
+
+
+def _downloadable_remote_status(status: str) -> bool:
+  return status in {
+    "completed",
+    "partial_success",
+    "training_success_render_failed",
+    "training_success_metrics_failed",
+    "training_success_postprocess_failed",
+  }
+
+
+def _remote_output_has_result_evidence(sftp, remote_output_dir: str) -> bool:
+  for relative in ("result.json", "scene_manifest.json", "point_cloud.ply", "point_cloud"):
+    if _remote_path_exists(sftp, str(PurePosixPath(remote_output_dir) / relative)):
+      return True
+  try:
+    return bool(sftp.listdir_attr(str(PurePosixPath(remote_output_dir))))
+  except Exception:
+    return False
+
+
+def _verify_or_recover_remote_result_marker(
+  sftp,
+  *,
+  remote_output_dir: str,
+  remote_status_path: str = "",
+  expected_job_id: str = "",
+  expected_family: str = "",
+  expected_remote_output_dir: str = "",
+) -> Dict[str, Any]:
+  try:
+    return _verify_remote_result_marker(
+      sftp,
+      remote_output_dir=remote_output_dir,
+      remote_status_path=remote_status_path,
+      expected_job_id=expected_job_id,
+      expected_family=expected_family,
+      expected_remote_output_dir=expected_remote_output_dir,
+    )
+  except RemoteExecutionError as exc:
+    if exc.code_hint != "WGSC-JOB-RESULTS-MARKER-MISSING":
+      raise
+    marker_path = _remote_result_marker_path(remote_output_dir, remote_status_path)
+    exit_code_text = _read_remote_text_file(sftp, _remote_exit_code_path_from_status_path(marker_path)).strip()
+    if exit_code_text != "0" or not _remote_output_has_result_evidence(sftp, remote_output_dir):
+      raise
+    payload = {
+      "job_id": str(expected_job_id or ""),
+      "family": str(expected_family or ""),
+      "status": "completed",
+      "stage": "completed",
+      "return_code": 0,
+      "message": "Remote status marker was recovered before result download.",
+      "remote_log_path": str(PurePosixPath(marker_path).parent / "runtime.log"),
+      "remote_output_dir": str(PurePosixPath(expected_remote_output_dir or remote_output_dir)),
+      "train_status": "success",
+      "updated_at": time.time(),
+    }
+    _write_remote_json_marker(sftp, marker_path, payload)
+    return _verify_remote_result_marker(
+      sftp,
+      remote_output_dir=remote_output_dir,
+      remote_status_path=marker_path,
+      expected_job_id=expected_job_id,
+      expected_family=expected_family,
+      expected_remote_output_dir=expected_remote_output_dir,
+    )
 
 
 def _remote_sparse_test_script(workspace_dir: str) -> str:
@@ -1473,6 +1667,36 @@ def sanitize_formatted_command(command_template: str, formatted_command: str, fo
     return shlex.join(cleaned)
   except AttributeError:
     return " ".join(shlex.quote(t) for t in cleaned)
+
+
+def _format_remote_command_template(command_template: str, format_args: Dict[str, Any], python_bin: str) -> str:
+  command = command_template.format(**format_args)
+  try:
+    command = sanitize_formatted_command(command_template, command, format_args)
+  except Exception:
+    pass
+  if command.lstrip().startswith("python "):
+    command = f"{python_bin}{command.lstrip()[len('python') :]}"
+  return command
+
+
+def _prepare_post_train_config(
+  post_train_config: Dict[str, Any] | None,
+  format_args: Dict[str, Any],
+  python_bin: str,
+  family: str,
+) -> Dict[str, Any]:
+  config = dict(post_train_config or {})
+  family_key = str(family or "").strip().lower()
+  if config.get("run_render") and not str(config.get("render_command", "")).strip():
+    template = str(config.get("render_template", "") or "").strip()
+    if template and family_key != "gaussian-splatting-lightning":
+      config["render_command"] = _format_remote_command_template(template, format_args, python_bin)
+  if config.get("run_metrics") and not str(config.get("metrics_command", "")).strip():
+    template = str(config.get("metrics_template", "") or "").strip()
+    if template:
+      config["metrics_command"] = _format_remote_command_template(template, format_args, python_bin)
+  return config
 
 
 def _normalize_dataset_id(dataset_name: str, job_id: str) -> str:
@@ -1678,6 +1902,7 @@ def key_id(value):
 def collect_json_metrics(payload):
   psnrs = []
   ssims = []
+  lpipss = []
   def walk(obj, key=""):
     if isinstance(obj, dict):
       for child_key, child_value in obj.items():
@@ -1695,10 +1920,13 @@ def collect_json_metrics(payload):
       psnrs.append(value)
     if normalized == "ssim":
       ssims.append(value)
+    if normalized == "lpips":
+      lpipss.append(value)
   walk(payload)
   return (
     sum(psnrs) / len(psnrs) if psnrs else None,
     sum(ssims) / len(ssims) if ssims else None,
+    sum(lpipss) / len(lpipss) if lpipss else None,
   )
 
 def read_json(path):
@@ -1714,18 +1942,19 @@ def csv_metrics(path):
     with open(path, "r", encoding="utf-8", newline="") as handle:
       rows = list(csv.reader(handle))
   except Exception:
-    return None, None
+    return None, None, None
   if not rows:
-    return None, None
+    return None, None, None
   header = rows[0]
   data_rows = rows[1:]
   selected = next((row for row in data_rows if row and str(row[0]).strip().upper() == "MEAN"), None)
   if selected is None and data_rows:
     selected = data_rows[-1]
   if selected is None:
-    return None, None
+    return None, None, None
   psnr = None
   ssim = None
+  lpips = None
   for index, name in enumerate(header):
     if index >= len(selected):
       continue
@@ -1737,13 +1966,15 @@ def csv_metrics(path):
       psnr = value
     if normalized.endswith("ssim") and "msssim" not in normalized:
       ssim = value
-  return psnr, ssim
+    if normalized == "lpips":
+      lpips = value
+  return psnr, ssim, lpips
 
 payload = read_json(target)
-psnr, ssim = collect_json_metrics(payload)
+psnr, ssim, lpips = collect_json_metrics(payload)
 source = "result.json" if payload else ""
 
-if psnr is None or ssim is None:
+if psnr is None or ssim is None or lpips is None:
   candidates = []
   for path in root.rglob("results.json"):
     try:
@@ -1752,17 +1983,18 @@ if psnr is None or ssim is None:
       pass
   candidates.sort(key=lambda item: (item[0], str(item[1])), reverse=True)
   for _, path in candidates:
-    candidate_psnr, candidate_ssim = collect_json_metrics(read_json(path))
-    if candidate_psnr is not None or candidate_ssim is not None:
+    candidate_psnr, candidate_ssim, candidate_lpips = collect_json_metrics(read_json(path))
+    if candidate_psnr is not None or candidate_ssim is not None or candidate_lpips is not None:
       psnr = psnr if psnr is not None else candidate_psnr
       ssim = ssim if ssim is not None else candidate_ssim
+      lpips = lpips if lpips is not None else candidate_lpips
       try:
         source = str(path.relative_to(root))
       except Exception:
         source = str(path)
       break
 
-if psnr is None or ssim is None:
+if psnr is None or ssim is None or lpips is None:
   candidates = []
   metric_dir = root / "metrics"
   if metric_dir.exists():
@@ -1773,10 +2005,11 @@ if psnr is None or ssim is None:
         pass
   candidates.sort(key=lambda item: (item[0], str(item[1])), reverse=True)
   for _, path in candidates:
-    candidate_psnr, candidate_ssim = csv_metrics(path)
-    if candidate_psnr is not None or candidate_ssim is not None:
+    candidate_psnr, candidate_ssim, candidate_lpips = csv_metrics(path)
+    if candidate_psnr is not None or candidate_ssim is not None or candidate_lpips is not None:
       psnr = psnr if psnr is not None else candidate_psnr
       ssim = ssim if ssim is not None else candidate_ssim
+      lpips = lpips if lpips is not None else candidate_lpips
       try:
         source = str(path.relative_to(root))
       except Exception:
@@ -1790,12 +2023,15 @@ if psnr is not None:
 if ssim is not None:
   payload["ssim"] = ssim
   payload["SSIM"] = ssim
-if psnr is not None or ssim is not None:
+if lpips is not None:
+  payload["lpips"] = lpips
+  payload["LPIPS"] = lpips
+if psnr is not None or ssim is not None or lpips is not None:
   payload["source"] = source
   payload["generated_at"] = time.time()
   with open(target, "w", encoding="utf-8") as handle:
     json.dump(payload, handle, ensure_ascii=False, indent=2)
-if psnr is not None and ssim is not None:
+if psnr is not None and ssim is not None and lpips is not None:
   sys.exit(0)
 if target.exists():
   sys.exit(2)
@@ -1805,11 +2041,23 @@ PY
 '''
 
 
-def _remote_post_train_eval_block(enabled: bool) -> str:
+def _remote_post_train_eval_block(enabled: bool, post_train: Dict[str, Any] | None = None) -> str:
   if not enabled:
     return ""
+  config = post_train if isinstance(post_train, dict) else {}
+  run_render = "1" if config.get("run_render") and not config.get("train_produces_eval") else "0"
+  run_metrics = "1" if config.get("run_metrics") and not config.get("train_produces_eval") else "0"
+  render_command = _quote(str(config.get("render_command", "") or ""))
+  metrics_command = _quote(str(config.get("metrics_command", "") or ""))
   return r'''
-  cd "$REMOTE_REPO_DIR" || finish_with "partial_success" "post_train_render_or_metrics" "65" "Unable to enter remote repository for render/metrics."
+  POST_TRAIN_RUN_RENDER=''' + _quote(run_render) + r'''
+  POST_TRAIN_RUN_METRICS=''' + _quote(run_metrics) + r'''
+  POST_TRAIN_RENDER_COMMAND=''' + render_command + r'''
+  POST_TRAIN_METRICS_COMMAND=''' + metrics_command + r'''
+  if command -v wgsc_activate_env >/dev/null 2>&1; then
+    wgsc_activate_env
+  fi
+  cd "$REMOTE_REPO_DIR" || finish_with "failed" "render" "65" "Unable to enter remote repository for render/metrics."
   EVAL_OUTPUT_DIR="$OUTPUT_DIR"
   if [ "$FAMILY" = "gaussian-splatting-lightning" ]; then
     EVAL_OUTPUT_DIR="$(resolve_gspl_output_dir)"
@@ -1818,76 +2066,93 @@ def _remote_post_train_eval_block(enabled: bool) -> str:
       RENDER_STATUS="failed"
       METRICS_STATUS="skipped"
       RESULT_JSON_EXISTS="false"
-      PARTIAL_SUCCESS="true"
-      FAILURE_STAGE="post_train_render_or_metrics"
-      write_status "partial_success" "post_train_render_or_metrics" "67" "Unable to locate GSLightning experiment output dir for render/metrics."
-      finish_with "partial_success" "post_train_render_or_metrics" "67" "Unable to locate GSLightning experiment output dir for render/metrics."
+      FAILURE_STAGE="render"
+      write_status "failed" "render" "67" "Unable to locate GSLightning experiment output dir for render/metrics."
+      finish_with "failed" "render" "67" "Unable to locate GSLightning experiment output dir for render/metrics."
     fi
   fi
 
-  write_status "running" "post_train_render" "" "Training completed; running render stage."
-  case "$FAMILY" in
-    "gaussian-splatting-lightning")
-      latest_ckpt="$(latest_gspl_checkpoint "$EVAL_OUTPUT_DIR")"
-      if [ -z "$latest_ckpt" ]; then
-        render_rc=68
-      else
-        gspl_name="$(resolve_gspl_explicit_name)"
-        if [ -n "$gspl_name" ]; then
-          "$PYTHON_BIN" main.py validate --data.path "$REMOTE_DATASET_WORKSPACE" --output "$OUTPUT_DIR" -n "$gspl_name" --ckpt_path "$latest_ckpt" --save_val
-        else
-          "$PYTHON_BIN" main.py validate --data.path "$REMOTE_DATASET_WORKSPACE" --output "$OUTPUT_DIR" --ckpt_path "$latest_ckpt" --save_val
-        fi
-        render_rc=$?
-      fi
-      ;;
-    "hac-plus-plus")
-      "$PYTHON_BIN" render.py -s "$REMOTE_DATASET_WORKSPACE" -m "$EVAL_OUTPUT_DIR"
+  if [ "$POST_TRAIN_RUN_RENDER" = "1" ]; then
+    write_status "running" "render" "" "Training completed; running render stage."
+    if [ -n "$POST_TRAIN_RENDER_COMMAND" ]; then
+      eval "$POST_TRAIN_RENDER_COMMAND"
       render_rc=$?
-      ;;
-    "contextgs")
-      "$PYTHON_BIN" test.py -s "$REMOTE_DATASET_WORKSPACE" -m "$EVAL_OUTPUT_DIR"
-      render_rc=$?
-      ;;
-    *)
-      "$PYTHON_BIN" render.py -m "$EVAL_OUTPUT_DIR" --skip_train
-      render_rc=$?
-      ;;
-  esac
-  if [ "$render_rc" -ne 0 ]; then
-    RENDER_STATUS="failed"
-    METRICS_STATUS="skipped"
-    RESULT_JSON_EXISTS="false"
-    PARTIAL_SUCCESS="true"
-    FAILURE_STAGE="post_train_render_or_metrics"
-    write_status "partial_success" "post_train_render_or_metrics" "$render_rc" "Training succeeded, but render failed; result.json is missing because render/metrics pipeline did not complete."
-    finish_with "partial_success" "post_train_render_or_metrics" "$render_rc" "Training succeeded, but render failed; result.json is missing because render/metrics pipeline did not complete."
-  fi
-  RENDER_STATUS="success"
-
-  write_status "running" "post_train_metrics" "" "Render completed; running metrics stage."
-  case "$FAMILY" in
-    "gaussian-splatting-lightning"|"hac-plus-plus"|"contextgs")
-      metrics_rc=0
-      ;;
-    *)
-      if [ -f metrics.py ]; then
-        "$PYTHON_BIN" metrics.py -m "$EVAL_OUTPUT_DIR"
-        metrics_rc=$?
-      else
-        metrics_rc=69
-      fi
-      ;;
-  esac
-  if [ "$metrics_rc" -ne 0 ]; then
-    METRICS_STATUS="failed"
-    RESULT_JSON_EXISTS="false"
-    PARTIAL_SUCCESS="true"
-    FAILURE_STAGE="post_train_render_or_metrics"
-    write_status "partial_success" "post_train_render_or_metrics" "$metrics_rc" "Training/render succeeded, but metrics failed; result.json is missing because render/metrics pipeline did not complete."
-    finish_with "partial_success" "post_train_render_or_metrics" "$metrics_rc" "Training/render succeeded, but metrics failed; result.json is missing because render/metrics pipeline did not complete."
+    else
+      case "$FAMILY" in
+        "gaussian-splatting-lightning")
+          latest_ckpt="$(latest_gspl_checkpoint "$EVAL_OUTPUT_DIR")"
+          if [ -z "$latest_ckpt" ]; then
+            render_rc=68
+          else
+            gspl_name="$(resolve_gspl_explicit_name)"
+            if [ -n "$gspl_name" ]; then
+              "$PYTHON_BIN" main.py validate --data.path "$REMOTE_DATASET_WORKSPACE" --output "$OUTPUT_DIR" -n "$gspl_name" --ckpt_path "$latest_ckpt" --save_val
+            else
+              "$PYTHON_BIN" main.py validate --data.path "$REMOTE_DATASET_WORKSPACE" --output "$OUTPUT_DIR" --ckpt_path "$latest_ckpt" --save_val
+            fi
+            render_rc=$?
+          fi
+          ;;
+        "hac-plus-plus")
+          "$PYTHON_BIN" render.py -s "$REMOTE_DATASET_WORKSPACE" -m "$EVAL_OUTPUT_DIR"
+          render_rc=$?
+          ;;
+        "contextgs")
+          "$PYTHON_BIN" test.py -s "$REMOTE_DATASET_WORKSPACE" -m "$EVAL_OUTPUT_DIR"
+          render_rc=$?
+          ;;
+        *)
+          "$PYTHON_BIN" render.py -m "$EVAL_OUTPUT_DIR" --skip_train
+          render_rc=$?
+          ;;
+      esac
+    fi
+    if [ "$render_rc" -ne 0 ]; then
+      RENDER_STATUS="failed"
+      METRICS_STATUS="skipped"
+      RESULT_JSON_EXISTS="false"
+      FAILURE_STAGE="render"
+      write_status "failed" "render" "$render_rc" "Training succeeded, but render failed."
+      finish_with "failed" "render" "$render_rc" "Training succeeded, but render failed."
+    fi
+    RENDER_STATUS="success"
   fi
 
+  if [ "$POST_TRAIN_RUN_METRICS" = "1" ]; then
+    write_status "running" "metrics" "" "Render completed; running metrics stage."
+    if command -v wgsc_activate_env >/dev/null 2>&1; then
+      wgsc_activate_env
+    fi
+    cd "$REMOTE_REPO_DIR" || finish_with "failed" "metrics" "65" "Unable to enter remote repository for metrics."
+    if [ -n "$POST_TRAIN_METRICS_COMMAND" ]; then
+      eval "$POST_TRAIN_METRICS_COMMAND"
+      metrics_rc=$?
+    else
+      case "$FAMILY" in
+        "gaussian-splatting-lightning"|"hac-plus-plus"|"contextgs")
+          metrics_rc=0
+          ;;
+        *)
+          if [ -f metrics.py ]; then
+            "$PYTHON_BIN" metrics.py -m "$EVAL_OUTPUT_DIR"
+            metrics_rc=$?
+          else
+            metrics_rc=69
+          fi
+          ;;
+      esac
+    fi
+    if [ "$metrics_rc" -ne 0 ]; then
+      METRICS_STATUS="failed"
+      RESULT_JSON_EXISTS="false"
+      FAILURE_STAGE="metrics"
+      write_status "failed" "metrics" "$metrics_rc" "Training/render succeeded, but metrics failed."
+      finish_with "failed" "metrics" "$metrics_rc" "Training/render succeeded, but metrics failed."
+    fi
+    METRICS_STATUS="success"
+  fi
+
+  write_status "running" "postprocess" "" "Checking result.json and canonical metrics."
   write_canonical_result_json "$EVAL_OUTPUT_DIR"
   canonical_rc=$?
   if [ -f "$EVAL_OUTPUT_DIR/result.json" ]; then
@@ -1898,14 +2163,13 @@ def _remote_post_train_eval_block(enabled: bool) -> str:
     RESULT_JSON_PATH=""
   fi
   if [ "$canonical_rc" -ne 0 ]; then
-    METRICS_STATUS="failed"
-    PARTIAL_SUCCESS="true"
-    FAILURE_STAGE="post_train_render_or_metrics"
-    write_status "partial_success" "post_train_render_or_metrics" "$canonical_rc" "result.json missing because render/metrics pipeline did not complete."
-    finish_with "partial_success" "post_train_render_or_metrics" "$canonical_rc" "result.json missing because render/metrics pipeline did not complete."
+    POSTPROCESS_STATUS="failed"
+    FAILURE_STAGE="postprocess"
+    write_status "failed" "postprocess" "$canonical_rc" "result.json missing because result processing did not complete."
+    finish_with "failed" "postprocess" "$canonical_rc" "result.json missing because result processing did not complete."
   fi
-  METRICS_STATUS="success"
-  write_status "running" "post_train_metrics_completed" "" "Render and metrics completed; result.json is available."
+  POSTPROCESS_STATUS="success"
+  write_status "running" "postprocess_completed" "" "Result processing completed; result.json is available."
 '''
 
 
@@ -1922,6 +2186,7 @@ def _build_remote_detached_run_script(
   resolved_dataset_id: str,
   resolved_dataset_name: str,
   use_existing_remote_dataset: bool,
+  post_train_config: Dict[str, Any] | None = None,
 ) -> str:
   auto_colmap = bool(auto_colmap) and not bool(use_existing_remote_dataset)
   colmap_block = ""
@@ -1964,10 +2229,24 @@ fi"""
       'fi; }'
     )
     environment_lines.append(activate_cmd)
+  activate_body = "\n".join(environment_lines[1:]) if len(environment_lines) > 1 else ":"
   training_lines = [*environment_lines, remote_command]
   training_body = "\n".join(training_lines)
   post_train_helpers = _remote_post_train_helper_functions()
-  post_train_eval_block = _remote_post_train_eval_block(should_run_post_train_eval(family, remote_command))
+  post_train = _prepare_post_train_config(
+    post_train_config if isinstance(post_train_config, dict) else {},
+    {
+      "input_path": "",
+      "output_dir": remote_paths["output_dir"],
+      "workspace": remote_workspace_for_command,
+      "checkpoint_path": remote_paths["output_dir"],
+      "repo_path": validated["repo_path"],
+      "source": remote_workspace_for_command,
+    },
+    validated["python"],
+    family,
+  )
+  post_train_eval_block = _remote_post_train_eval_block(should_run_post_train_eval(remote_command, post_train), post_train)
 
   post_train_export_block = ""
   if str(family or "").strip().lower() == "gaussian-splatting-lightning":
@@ -1991,14 +2270,13 @@ fi"""
   (
 {export_body}
   )
-  export_rc=$?
-  if [ "$export_rc" -ne 0 ]; then
-    POSTPROCESS_STATUS="failed"
-    PARTIAL_SUCCESS="true"
-    FAILURE_STAGE="ckpt2ply"
-    write_status "partial_success" "ckpt2ply" "$export_rc" "GSLightning checkpoint to PLY export failed."
-    finish_with "partial_success" "ckpt2ply" "$export_rc" "GSLightning checkpoint to PLY export failed."
-  fi"""
+	  export_rc=$?
+	  if [ "$export_rc" -ne 0 ]; then
+	    POSTPROCESS_STATUS="failed"
+	    FAILURE_STAGE="postprocess"
+	    write_status "failed" "postprocess" "$export_rc" "GSLightning checkpoint to PLY export failed."
+	    finish_with "failed" "postprocess" "$export_rc" "GSLightning checkpoint to PLY export failed."
+	  fi"""
 
   return f"""#!/usr/bin/env bash
 set +e
@@ -2022,11 +2300,10 @@ USE_EXISTING_REMOTE_DATASET={_quote("1" if use_existing_remote_dataset else "0")
 TRAIN_STATUS="pending"
 RENDER_STATUS="skipped"
 METRICS_STATUS="skipped"
-POSTPROCESS_STATUS="skipped"
-RESULT_JSON_EXISTS="false"
-RESULT_JSON_PATH=""
-PARTIAL_SUCCESS="false"
-FAILURE_STAGE=""
+	POSTPROCESS_STATUS="skipped"
+	RESULT_JSON_EXISTS="false"
+	RESULT_JSON_PATH=""
+	FAILURE_STAGE=""
 
 mkdir -p "$JOB_DIR" "$OUTPUT_DIR"
 echo "$$" > "$PID_FILE"
@@ -2051,12 +2328,11 @@ write_status() {{
   WGSC_REMOTE_COMMAND="$REMOTE_COMMAND_TEXT" \\
   WGSC_TRAIN_STATUS="$TRAIN_STATUS" \\
   WGSC_RENDER_STATUS="$RENDER_STATUS" \\
-  WGSC_METRICS_STATUS="$METRICS_STATUS" \\
-  WGSC_POSTPROCESS_STATUS="$POSTPROCESS_STATUS" \\
-  WGSC_RESULT_JSON_EXISTS="$RESULT_JSON_EXISTS" \\
-  WGSC_RESULT_JSON_PATH="$RESULT_JSON_PATH" \\
-  WGSC_PARTIAL_SUCCESS="$PARTIAL_SUCCESS" \\
-  WGSC_FAILURE_STAGE="$FAILURE_STAGE" \\
+	  WGSC_METRICS_STATUS="$METRICS_STATUS" \\
+	  WGSC_POSTPROCESS_STATUS="$POSTPROCESS_STATUS" \\
+	  WGSC_RESULT_JSON_EXISTS="$RESULT_JSON_EXISTS" \\
+	  WGSC_RESULT_JSON_PATH="$RESULT_JSON_PATH" \\
+	  WGSC_FAILURE_STAGE="$FAILURE_STAGE" \\
   "$PYTHON_BIN" - "$STATUS_FILE" <<'PY'
 import json
 import os
@@ -2080,11 +2356,10 @@ payload = {{
   "train_status": os.environ.get("WGSC_TRAIN_STATUS", ""),
   "render_status": os.environ.get("WGSC_RENDER_STATUS", ""),
   "metrics_status": os.environ.get("WGSC_METRICS_STATUS", ""),
-  "postprocess_status": os.environ.get("WGSC_POSTPROCESS_STATUS", ""),
-  "result_json_exists": os.environ.get("WGSC_RESULT_JSON_EXISTS", "").lower() == "true",
-  "result_path": os.environ.get("WGSC_RESULT_JSON_PATH", ""),
-  "partial_success": os.environ.get("WGSC_PARTIAL_SUCCESS", "").lower() == "true",
-  "failure_stage": os.environ.get("WGSC_FAILURE_STAGE", ""),
+	  "postprocess_status": os.environ.get("WGSC_POSTPROCESS_STATUS", ""),
+	  "result_json_exists": os.environ.get("WGSC_RESULT_JSON_EXISTS", "").lower() == "true",
+	  "result_path": os.environ.get("WGSC_RESULT_JSON_PATH", ""),
+	  "failure_stage": os.environ.get("WGSC_FAILURE_STAGE", ""),
   "updated_at": time.time(),
 }}
 return_code = os.environ.get("WGSC_RETURN_CODE", "")
@@ -2094,9 +2369,52 @@ if return_code not in ("", None):
   except Exception:
     payload["return_code"] = return_code
 os.makedirs(os.path.dirname(status_path), exist_ok=True)
-with open(status_path, "w", encoding="utf-8") as handle:
+tmp_path = f"{{status_path}}.tmp.{{os.getpid()}}"
+with open(tmp_path, "w", encoding="utf-8") as handle:
   json.dump(payload, handle, ensure_ascii=False, indent=2)
+os.replace(tmp_path, status_path)
 PY
+}}
+
+start_heartbeat() {{
+  stop_heartbeat
+  (
+    while true; do
+      sleep 30
+      "$PYTHON_BIN" - "$STATUS_FILE" <<'PY' || true
+import json
+import os
+import sys
+import time
+
+status_path = sys.argv[1]
+try:
+  with open(status_path, "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+except Exception:
+  payload = {{}}
+if str(payload.get("status", "")).lower() in ("completed", "failed", "canceled"):
+  sys.exit(0)
+payload["updated_at"] = time.time()
+payload.setdefault("status", "running")
+payload.setdefault("stage", "executing_remote_command")
+os.makedirs(os.path.dirname(status_path), exist_ok=True)
+tmp_path = f"{{status_path}}.tmp.heartbeat.{{os.getpid()}}"
+with open(tmp_path, "w", encoding="utf-8") as handle:
+  json.dump(payload, handle, ensure_ascii=False, indent=2)
+os.replace(tmp_path, status_path)
+PY
+    done
+  ) &
+  HEARTBEAT_PID="$!"
+}}
+
+stop_heartbeat() {{
+  if [ -n "${{HEARTBEAT_PID:-}}" ]; then
+    kill "$HEARTBEAT_PID" >/dev/null 2>&1 || true
+    wait "$HEARTBEAT_PID" >/dev/null 2>&1 || true
+    HEARTBEAT_PID=""
+  fi
 }}
 
 finish_with() {{
@@ -2104,6 +2422,7 @@ finish_with() {{
   local stage="$2"
   local return_code="$3"
   local message="${{4:-}}"
+  stop_heartbeat
   echo "$return_code" > "$EXIT_CODE_FILE"
   write_status "$status" "$stage" "$return_code" "$message"
   exit "$return_code"
@@ -2111,16 +2430,22 @@ finish_with() {{
 
 {post_train_helpers}
 
+wgsc_activate_env() {{
+{activate_body}
+}}
+
 echo "[Web-GSC] Tmux remote job started at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 write_status "running" "remote_detached_running" "" "Remote tmux job is running. It is safe to close the web page."
 
 {colmap_block}
 
 write_status "running" "executing_remote_command" "" "Running remote training command."
+start_heartbeat
 (
 {training_body}
 )
 train_rc=$?
+stop_heartbeat
 if [ "$train_rc" -eq 0 ]; then
   TRAIN_STATUS="success"
 {post_train_export_block}
@@ -2133,10 +2458,21 @@ finish_with "failed" "failed" "$train_rc" "Remote training failed."
 
 
 def _build_remote_detached_start_command(remote_job_paths: Dict[str, str]) -> str:
+  starting_status = json.dumps({
+    "status": "starting",
+    "stage": "remote_detached_starting",
+    "message": "Remote detached job is starting.",
+    "remote_log_path": remote_job_paths["runtime_log"],
+    "remote_output_dir": str(PurePosixPath(remote_job_paths["job_dir"]).parent),
+    "updated_at": 0,
+  }, ensure_ascii=False)
   return (
     f"mkdir -p {_quote(remote_job_paths['job_dir'])}"
     f" && rm -f {_quote(remote_job_paths['pid_file'])} {_quote(remote_job_paths['launcher_pid_file'])} "
-    f"{_quote(remote_job_paths['exit_code_file'])} {_quote(remote_job_paths['status_file'])}"
+    f"{_quote(remote_job_paths['exit_code_file'])}"
+    f" && status_tmp={_quote(remote_job_paths['status_file'] + '.tmp.start')}-$$"
+    f" && printf '%s\\n' {_quote(starting_status)} > \"$status_tmp\""
+    f" && mv -f \"$status_tmp\" {_quote(remote_job_paths['status_file'])}"
     f" && chmod +x {_quote(remote_job_paths['run_script'])}"
     f" && (cd {_quote(remote_job_paths['job_dir'])}"
     f" && (setsid nohup bash {_quote(remote_job_paths['run_script'])} >> {_quote(remote_job_paths['runtime_log'])} 2>&1 < /dev/null & echo $! > {_quote(remote_job_paths['launcher_pid_file'])}))"
@@ -2145,6 +2481,15 @@ def _build_remote_detached_start_command(remote_job_paths: Dict[str, str]) -> st
 
 
 def _build_remote_tmux_start_command(remote_job_paths: Dict[str, str], tmux_session: str) -> str:
+  starting_status = json.dumps({
+    "status": "starting",
+    "stage": "remote_detached_starting",
+    "message": "Remote tmux job is starting.",
+    "remote_log_path": remote_job_paths["runtime_log"],
+    "remote_tmux_session": tmux_session,
+    "remote_output_dir": str(PurePosixPath(remote_job_paths["job_dir"]).parent),
+    "updated_at": 0,
+  }, ensure_ascii=False)
   launcher_script = f"""tmux set-window-option remain-on-exit on >/dev/null 2>&1 || true
 echo "[Tmux] Session {tmux_session} started at $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a {_quote(remote_job_paths['runtime_log'])}
 set -o pipefail
@@ -2157,8 +2502,11 @@ exit "$run_rc"
   return (
     f"mkdir -p {_quote(remote_job_paths['job_dir'])}"
     f" && rm -f {_quote(remote_job_paths['pid_file'])} {_quote(remote_job_paths['launcher_pid_file'])} "
-    f"{_quote(remote_job_paths['exit_code_file'])} {_quote(remote_job_paths['status_file'])}"
+    f"{_quote(remote_job_paths['exit_code_file'])}"
     f" && : > {_quote(remote_job_paths['runtime_log'])}"
+    f" && status_tmp={_quote(remote_job_paths['status_file'] + '.tmp.start')}-$$"
+    f" && printf '%s\\n' {_quote(starting_status)} > \"$status_tmp\""
+    f" && mv -f \"$status_tmp\" {_quote(remote_job_paths['status_file'])}"
     f" && chmod +x {_quote(remote_job_paths['run_script'])}"
     f" && if tmux has-session -t {_quote(tmux_session)} 2>/dev/null; then tmux kill-session -t {_quote(tmux_session)}; fi"
     f" && tmux new-session -d -s {_quote(tmux_session)} -c {_quote(remote_job_paths['job_dir'])} {_quote(tmux_shell_command)}"
@@ -2186,6 +2534,8 @@ def start_remote_algorithm_detached(
   use_existing_remote_dataset: bool = False,
   training_args: Dict[str, Any] | None = None,
   command_override: str = "",
+  remote_run_key: str = "",
+  post_train_config: Dict[str, Any] | None = None,
   log_callback: Callable[[str, str], None] | None = None,
   stage_callback: Callable[[str], None] | None = None,
   cancel_checker: Callable[[], bool] | None = None,
@@ -2201,17 +2551,6 @@ def start_remote_algorithm_detached(
 
   output_dir = Path(local_output_dir).expanduser().resolve()
   output_dir.mkdir(parents=True, exist_ok=True)
-
-  remote_paths = build_remote_paths(
-    workspace_root=validated["workspace_root"],
-    output_root=validated["output_root"],
-    session_id=session_id,
-    family=family,
-    job_id=job_id,
-  )
-  remote_job_paths = _remote_job_paths(remote_paths["output_dir"])
-  remote_tmux_session = build_remote_tmux_session_name(family=family, job_id=job_id)
-  remote_tmux_attach_command = build_remote_tmux_attach_command(validated, remote_tmux_session)
 
   resolved_dataset_id = str(remote_dataset_id or "").strip()
   resolved_dataset_name = str(dataset_name or "").strip() or resolved_dataset_id
@@ -2239,6 +2578,23 @@ def start_remote_algorithm_detached(
       PurePosixPath(validated["workspace_root"]) / "datasets" / family / resolved_dataset_id / "workspace"
     )
 
+  run_key = str(remote_run_key or "").strip() or build_remote_run_key(
+    resolved_dataset_name or resolved_dataset_id or session_id or job_id,
+    family,
+    time.time(),
+  )
+  remote_paths = build_remote_paths(
+    workspace_root=validated["workspace_root"],
+    output_root=validated["output_root"],
+    session_id=session_id,
+    family=family,
+    job_id=job_id,
+    run_key=run_key,
+  )
+  remote_job_paths = _remote_job_paths(remote_paths["output_dir"])
+  remote_tmux_session = build_remote_tmux_session_name(family=family, job_id=job_id, run_key=run_key)
+  remote_tmux_attach_command = build_remote_tmux_attach_command(validated, remote_tmux_session)
+
   format_args = {
     "input_path": input_path,
     "output_dir": remote_paths["output_dir"],
@@ -2264,6 +2620,12 @@ def start_remote_algorithm_detached(
 
   if remote_command.lstrip().startswith("python "):
     remote_command = f"{validated['python']}{remote_command.lstrip()[len('python') :]}"
+  prepared_post_train_config = _prepare_post_train_config(
+    post_train_config,
+    format_args,
+    validated["python"],
+    family,
+  )
 
   paramiko = _load_paramiko()
   client = paramiko.SSHClient()
@@ -2354,6 +2716,7 @@ def start_remote_algorithm_detached(
       resolved_dataset_id=resolved_dataset_id,
       resolved_dataset_name=resolved_dataset_name,
       use_existing_remote_dataset=use_existing_remote_dataset,
+      post_train_config=prepared_post_train_config,
     )
     _write_remote_text(sftp, remote_job_paths["run_script"], run_script)
     start_command = _build_remote_tmux_start_command(remote_job_paths, remote_tmux_session)
@@ -2395,6 +2758,7 @@ def start_remote_algorithm_detached(
       "remote_tmux_attach_command": remote_tmux_attach_command,
       "tmux_available": True,
       "tmux_install": tmux_install,
+      "remote_run_key": run_key,
       "remote_workspace_dir": remote_workspace_for_command,
       "remote_output_dir": remote_paths["output_dir"],
       "remote_job_dir": remote_job_paths["job_dir"],
@@ -2450,14 +2814,161 @@ def poll_remote_detached_job(
       allow_agent=False,
     )
     sftp = client.open_sftp()
-    status_payload = _read_remote_json_file_strict(sftp, remote_status_path)
+    status_read_error: Exception | None = None
+    try:
+      status_payload = _read_remote_json_file_strict(sftp, remote_status_path)
+    except Exception as exc:
+      status_read_error = exc
+      status_payload = {}
     log_delta = _read_remote_log_delta(sftp, remote_log_path, log_cursor)
+
+    if status_read_error is not None:
+      exit_code_text = _read_remote_text_file(sftp, _remote_exit_code_path_from_status_path(remote_status_path)).strip()
+      if exit_code_text:
+        try:
+          return_code: Any = int(exit_code_text)
+        except Exception:
+          return_code = exit_code_text
+        status = _status_from_remote_return_code(return_code) if isinstance(return_code, int) else "failed"
+        _recover_missing_status_marker(
+          sftp,
+          remote_status_path=remote_status_path,
+          remote_log_path=remote_log_path,
+          remote_output_dir=remote_output_dir,
+          expected_job_id=expected_job_id,
+          expected_family=expected_family,
+          status=status,
+          stage=status,
+          return_code=return_code,
+          message="Remote status marker was recovered from exit_code.",
+        )
+        download_info: Dict[str, Any] = {}
+        if download_output and _downloadable_remote_status(status):
+          download_info = _download_directory(
+            sftp,
+            remote_output_dir,
+            Path(local_output_dir).expanduser().resolve(),
+            progress_callback=download_progress_callback,
+          )
+        return {
+          "ok": True,
+          "status": status,
+          "stage": status,
+          "return_code": return_code,
+          "remote_pid": "",
+          "remote_tmux_session": "",
+          "message": "Remote status marker was unavailable; recovered terminal state from exit_code.",
+          "remote_log_path": remote_log_path,
+          "remote_output_dir": remote_output_dir,
+          "remote_dataset_id": "",
+          "remote_dataset_name": "",
+          "remote_dataset_workspace": "",
+          "remote_command": "",
+          "train_status": "success" if status == "completed" else "",
+          "render_status": "",
+          "metrics_status": "",
+          "postprocess_status": "",
+          "result_json_exists": False,
+          "result_path": "",
+          "partial_success": False,
+          "failure_stage": "result_marker" if status == "failed" else "",
+          "updated_at": time.time(),
+          "log_text": log_delta["text"],
+          "log_cursor": log_delta["cursor"],
+          "log_available": log_delta["available"],
+          "download": download_info,
+          "status_fallback": "exit_code",
+        }
+      if log_delta["available"]:
+        _recover_missing_status_marker(
+          sftp,
+          remote_status_path=remote_status_path,
+          remote_log_path=remote_log_path,
+          remote_output_dir=remote_output_dir,
+          expected_job_id=expected_job_id,
+          expected_family=expected_family,
+          status="running",
+          stage="executing_remote_command",
+          message="Remote status marker was recovered from runtime.log.",
+        )
+        return {
+          "ok": True,
+          "status": "running",
+          "stage": "executing_remote_command",
+          "return_code": "",
+          "remote_pid": "",
+          "remote_tmux_session": "",
+          "message": f"Remote status marker unavailable; continuing from runtime log: {status_read_error}",
+          "remote_log_path": remote_log_path,
+          "remote_output_dir": remote_output_dir,
+          "remote_dataset_id": "",
+          "remote_dataset_name": "",
+          "remote_dataset_workspace": "",
+          "remote_command": "",
+          "train_status": "",
+          "render_status": "",
+          "metrics_status": "",
+          "postprocess_status": "",
+          "result_json_exists": False,
+          "result_path": "",
+          "partial_success": False,
+          "failure_stage": "",
+          "updated_at": time.time(),
+          "log_text": log_delta["text"],
+          "log_cursor": log_delta["cursor"],
+          "log_available": log_delta["available"],
+          "download": {},
+          "status_fallback": "runtime_log",
+        }
+      job_dir = str(PurePosixPath(remote_status_path).parent)
+      if _remote_path_exists(sftp, job_dir):
+        _recover_missing_status_marker(
+          sftp,
+          remote_status_path=remote_status_path,
+          remote_log_path=remote_log_path,
+          remote_output_dir=remote_output_dir,
+          expected_job_id=expected_job_id,
+          expected_family=expected_family,
+          status="running",
+          stage="executing_remote_command",
+          message="Remote status marker was recovered from existing job directory.",
+        )
+        return {
+          "ok": True,
+          "status": "running",
+          "stage": "executing_remote_command",
+          "return_code": "",
+          "remote_pid": "",
+          "remote_tmux_session": "",
+          "message": f"Remote status marker unavailable; continuing from job directory: {status_read_error}",
+          "remote_log_path": remote_log_path,
+          "remote_output_dir": remote_output_dir,
+          "remote_dataset_id": "",
+          "remote_dataset_name": "",
+          "remote_dataset_workspace": "",
+          "remote_command": "",
+          "train_status": "",
+          "render_status": "",
+          "metrics_status": "",
+          "postprocess_status": "",
+          "result_json_exists": False,
+          "result_path": "",
+          "partial_success": False,
+          "failure_stage": "",
+          "updated_at": time.time(),
+          "log_text": "",
+          "log_cursor": log_delta["cursor"],
+          "log_available": False,
+          "download": {},
+          "status_fallback": "job_dir",
+        }
+      raise status_read_error
 
     status = str(status_payload.get("status") or "running")
     stage = str(status_payload.get("stage") or "remote_detached_running")
     return_code = status_payload.get("return_code")
     download_info: Dict[str, Any] = {}
-    if download_output and status in {"completed", "partial_success", "training_success_render_failed", "training_success_metrics_failed", "training_success_postprocess_failed"}:
+    if download_output and _downloadable_remote_status(status):
       marker_job_id = str(status_payload.get("job_id", "")).strip()
       marker_family = str(status_payload.get("family", "")).strip()
       if expected_job_id and marker_job_id != str(expected_job_id).strip():
@@ -2608,7 +3119,25 @@ def _build_remote_repair_metrics_script(
 ) -> str:
   remote_job_paths = _remote_job_paths(remote_output_dir)
   helpers = _remote_post_train_helper_functions()
-  eval_block = _remote_post_train_eval_block(True)
+  eval_block = _remote_post_train_eval_block(True, {"run_render": True, "run_metrics": True})
+  activate_cmd = str(validated.get("activate_cmd", "")).strip()
+  activate_lines = []
+  if activate_cmd:
+    activate_lines.append("[ -f ~/.bash_profile ] && source ~/.bash_profile 2>/dev/null || true")
+    activate_lines.append("[ -f ~/.bashrc ] && source ~/.bashrc 2>/dev/null || true")
+    activate_lines.append(
+      '{ if command -v conda >/dev/null 2>&1; then '
+      'eval "$(conda shell.bash hook)" || true; '
+      'elif [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then '
+      'source "$HOME/miniconda3/etc/profile.d/conda.sh" || true; '
+      'elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then '
+      'source "$HOME/anaconda3/etc/profile.d/conda.sh" || true; '
+      'elif [ -f "/opt/conda/etc/profile.d/conda.sh" ]; then '
+      'source "/opt/conda/etc/profile.d/conda.sh" || true; '
+      'fi; }'
+    )
+    activate_lines.append(activate_cmd)
+  activate_body = "\n".join(activate_lines) if activate_lines else ":"
   return f"""#!/usr/bin/env bash
 set +e
 
@@ -2702,8 +3231,10 @@ if return_code not in ("", None):
   except Exception:
     payload["return_code"] = return_code
 os.makedirs(os.path.dirname(status_path), exist_ok=True)
-with open(status_path, "w", encoding="utf-8") as handle:
+tmp_path = f"{{status_path}}.tmp.{{os.getpid()}}"
+with open(tmp_path, "w", encoding="utf-8") as handle:
   json.dump(payload, handle, ensure_ascii=False, indent=2)
+os.replace(tmp_path, status_path)
 PY
 }}
 
@@ -2718,6 +3249,10 @@ finish_with() {{
 }}
 
 {helpers}
+
+wgsc_activate_env() {{
+{activate_body}
+}}
 
 echo "[Repair] Starting render/metrics repair at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 write_status "running" "repair_metrics" "" "Repairing render/metrics for partial-success job."

@@ -48,6 +48,7 @@ const RENDER_FORMAT_LABELS = {
 const ANALYSIS_METRICS = [
   { key: "psnr", field: "psnr", label: "PSNR(dB)" },
   { key: "ssim", field: "ssim", label: "SSIM" },
+  { key: "lpips", field: "lpips", label: "LPIPS" },
   { key: "sizeMb", field: "size_mb", label: "Size(MB)", staticSummary: true },
 ];
 
@@ -444,6 +445,7 @@ function analysisMetricScore(path, key) {
     if (id.endsWith("ssim") && !id.includes("msssim")) return 70;
     return 0;
   }
+  if (key === "lpips") return metricHasToken(path, "lpips") ? 100 : 0;
   if (key === "sizeMb") {
     const isComponentSize = /(feat|feature|offset|opacity|scaling|rotation|mask|anchor)/.test(id);
     if (["ttlsizemb", "totalsizemb", "totalmodelsize", "totalmodelsizeinmb"].includes(id)) return 140;
@@ -495,7 +497,7 @@ function formatAnalysisNumber(value, key) {
   if (value == null || value === "") return "-";
   const number = Number(value);
   if (!Number.isFinite(number)) return summarize(value, 32);
-  const digits = key === "ssim" ? 4 : number >= 100 ? 1 : 2;
+  const digits = key === "ssim" || key === "lpips" ? 4 : number >= 100 ? 1 : 2;
   return number.toFixed(digits).replace(/\.?0+$/, "");
 }
 
@@ -517,6 +519,7 @@ function analysisMetricSource(job, rows = []) {
     psnr: metrics.psnr_db ?? metrics.psnr,
     psnr_db: metrics.psnr_db ?? metrics.psnr,
     ssim: metrics.ssim,
+    lpips: metrics.lpips,
     sizeMb: metrics.size_mb ?? job?.size_mb,
   };
 }
@@ -531,15 +534,21 @@ function analysisMetricItems(job, rows = []) {
       rawValue = mappedSource === "artifact:result.json" ? (source.psnr_db ?? source.psnr ?? "") : "";
     } else if (metric.key === "ssim") {
       rawValue = mappedSource === "artifact:result.json" ? (source.ssim ?? "") : "";
+    } else if (metric.key === "lpips") {
+      rawValue = mappedSource === "artifact:result.json" ? (source.lpips ?? "") : "";
     } else if (metric.key === "sizeMb") {
       rawValue = String(mappedSource || "").startsWith("artifact:") ? (source.size_mb ?? source.sizeMb ?? "") : "";
+    }
+    if (rawValue === "" && !mappedSource) {
+      const inferred = extractAnalysisMetric(source, metric.key);
+      rawValue = inferred.raw || inferred.value || "";
     }
     return {
       ...metric,
       value: formatAnalysisNumber(rawValue, metric.key),
       raw: rawValue,
       numeric: Number(rawValue),
-      source: mappedSource,
+      source: mappedSource || extractAnalysisMetric(source, metric.key).source,
     };
   });
 }
@@ -1980,7 +1989,7 @@ function renderAnalysisPage() {
       <div class="panel-head">
         <div>
           <h2>Training Metrics Analysis</h2>
-          <p class="panel-copy">Parse job data into PSNR(dB), SSIM, and Size(MB).</p>
+          <p class="panel-copy">Parse job data into PSNR(dB), SSIM, LPIPS, and Size(MB).</p>
         </div>
         <div class="button-row">
           <button data-action="load-analysis" type="button" ${job ? "" : "disabled"}>Load Metrics</button>
@@ -2017,7 +2026,7 @@ function renderMetricsTable(rows, job) {
   return `
     <div class="table-wrap">
       <table class="analysis-table">
-        <thead><tr><th>Time</th><th>PSNR(dB)</th><th>SSIM</th><th>Size(MB)</th></tr></thead>
+        <thead><tr><th>Time</th><th>PSNR(dB)</th><th>SSIM</th><th>LPIPS</th><th>Size(MB)</th></tr></thead>
         <tbody>
           ${hasSummary ? `
             <tr class="analysis-summary-row">
@@ -3113,7 +3122,7 @@ function drawMetricsChart() {
   const rows = state.metricsRows
     .map((row) => ({
       row,
-      values: Object.fromEntries(ANALYSIS_METRICS.map((metric) => [metric.key, ""])),
+      values: Object.fromEntries(ANALYSIS_METRICS.map((metric) => [metric.key, extractAnalysisMetric(row, metric.key).value])),
     }))
     .filter((item) => ANALYSIS_METRICS.some((metric) => Number.isFinite(Number(item.values[metric.key]))));
   if (!rows.length) {
@@ -3124,6 +3133,7 @@ function drawMetricsChart() {
   const series = [
     { key: "psnr", label: "PSNR(dB)", color: "#2f7dff" },
     { key: "ssim", label: "SSIM", color: "#ffb44c" },
+    { key: "lpips", label: "LPIPS", color: "#43c58b" },
     { key: "sizeMb", label: "Size(MB)", color: "#ff5570" },
   ];
   ctx.strokeStyle = "rgba(142,164,197,0.2)";

@@ -144,6 +144,8 @@ function defaultState() {
     renderMode: "ply",
     selectedJobId: "",
     jobsDatasetFilter: "",
+    jobsAlgorithmFilter: "",
+    jobsCompletedOnly: false,
     jobsSortOrder: "created_desc",
     quickPlyPath: "",
     loadedPly: null,
@@ -844,15 +846,28 @@ function jobDatasetOptions() {
   return [...new Set(jobs.map(jobDatasetLabel).filter((item) => item && item !== "-"))].sort();
 }
 
+function jobAlgorithmOptions() {
+  return [...new Set(jobs.map((job) => String(job.algorithm_family || "").trim()).filter(Boolean))].sort();
+}
+
 function visibleJobs() {
-  const selected = String(state.jobsDatasetFilter || "").trim();
-  const filtered = selected ? jobs.filter((job) => jobDatasetLabel(job) === selected) : jobs;
+  const dataset = String(state.jobsDatasetFilter || "").trim();
+  const algorithm = String(state.jobsAlgorithmFilter || "").trim();
+  const filtered = jobs.filter((job) => {
+    if (dataset && jobDatasetLabel(job) !== dataset) return false;
+    if (algorithm && String(job.algorithm_family || "").trim() !== algorithm) return false;
+    if (state.jobsCompletedOnly && String(job.status || "").toLowerCase() !== "completed") return false;
+    return true;
+  });
   return sortedJobsList(filtered);
 }
 
 function syncJobFilters() {
   if (state.jobsDatasetFilter && !jobDatasetOptions().includes(state.jobsDatasetFilter)) {
     state.jobsDatasetFilter = "";
+  }
+  if (state.jobsAlgorithmFilter && !jobAlgorithmOptions().includes(state.jobsAlgorithmFilter)) {
+    state.jobsAlgorithmFilter = "";
   }
 }
 
@@ -1770,13 +1785,20 @@ function canSubmitRemoteJob() {
 }
 
 function renderJobListControls() {
-  const options = jobDatasetOptions();
+  const datasetOptions = jobDatasetOptions();
+  const algorithmOptions = jobAlgorithmOptions();
   return `
     <div class="form-grid compact-form">
       <label>Dataset
         <select data-bind="jobsDatasetFilter">
           <option value="">All</option>
-          ${options.map((item) => `<option value="${escapeHtml(item)}" ${state.jobsDatasetFilter === item ? "selected" : ""}>${escapeHtml(item)}</option>`).join("")}
+          ${datasetOptions.map((item) => `<option value="${escapeHtml(item)}" ${state.jobsDatasetFilter === item ? "selected" : ""}>${escapeHtml(item)}</option>`).join("")}
+        </select>
+      </label>
+      <label>Algorithm
+        <select data-bind="jobsAlgorithmFilter">
+          <option value="">All</option>
+          ${algorithmOptions.map((item) => `<option value="${escapeHtml(item)}" ${state.jobsAlgorithmFilter === item ? "selected" : ""}>${escapeHtml(item)}</option>`).join("")}
         </select>
       </label>
       <label>Sort by
@@ -1784,6 +1806,9 @@ function renderJobListControls() {
           <option value="created_desc" ${state.jobsSortOrder !== "created_asc" ? "selected" : ""}>Newest first</option>
           <option value="created_asc" ${state.jobsSortOrder === "created_asc" ? "selected" : ""}>Oldest first</option>
         </select>
+      </label>
+      <label>Completed
+        <span><input data-bind="jobsCompletedOnly" type="checkbox" ${state.jobsCompletedOnly ? "checked" : ""} /> Completed only</span>
       </label>
     </div>
   `;
@@ -2225,7 +2250,7 @@ function handleChange(event) {
       render();
       afterRender();
     }
-    if (node.dataset.bind === "jobsDatasetFilter" || node.dataset.bind === "jobsSortOrder") {
+    if (["jobsDatasetFilter", "jobsAlgorithmFilter", "jobsCompletedOnly", "jobsSortOrder"].includes(node.dataset.bind)) {
       render();
       afterRender();
     }

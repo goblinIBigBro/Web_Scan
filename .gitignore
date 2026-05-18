@@ -11,6 +11,24 @@
 !/web/
 !/web/**
 
+# 保留 8 个算法项目的 setup_env.sh
+!/AtomGS-main/
+!/AtomGS-main/setup_env.sh
+!/CompGS-main/
+!/CompGS-main/setup_env.sh
+!/ContextGS-main/
+!/ContextGS-main/setup_env.sh
+!/gaussian-splatting-lightning-main/
+!/gaussian-splatting-lightning-main/setup_env.sh
+!/GaussianPro-version1.0/
+!/GaussianPro-version1.0/setup_env.sh
+!/HAC-plus-main/
+!/HAC-plus-main/setup_env.sh
+!/MEGS-2-main/
+!/MEGS-2-main/setup_env.sh
+!/reduced-3dgs-main/
+!/reduced-3dgs-main/setup_env.sh
+
 # 忽略 web 里的数据、缓存、日志和备份
 /web/_backup/
 /web/generated/

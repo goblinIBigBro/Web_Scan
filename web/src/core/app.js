@@ -1575,8 +1575,6 @@ function renderProcessedResult() {
 }
 
 function renderAlgorithmPage() {
-  const adapter = selectedAlgorithm();
-  const ops = supportedOperations(adapter);
   const canSubmit = canSubmitRemoteJob();
   return `
     <section class="panel">
@@ -1597,16 +1595,8 @@ function renderAlgorithmPage() {
                   ${algorithms.map((item) => `<option value="${escapeHtml(item.family)}" ${state.algorithmFamily === item.family ? "selected" : ""}>${escapeHtml(item.label || item.family)}</option>`).join("")}
                 </select>
               </label>
-              <label>Operation
-                <select data-bind="operation">
-                  ${ops.map((op) => `<option value="${escapeHtml(op)}" ${state.operation === op ? "selected" : ""}>${escapeHtml(op)}</option>`).join("")}
-                </select>
-              </label>
               <label>Local Result Output Directory
                 <input data-bind="outputDir" value="${escapeHtml(state.outputDir)}" placeholder="${escapeHtml(outputDirForPayload())}" />
-              </label>
-              <label>Checkpoint Path
-                <input data-bind="checkpointPath" value="${escapeHtml(state.checkpointPath)}" placeholder="Only required by some templates" />
               </label>
             </div>
             ${renderTrainingFields()}
@@ -1669,7 +1659,7 @@ function renderRemoteExecutionSummary() {
 function renderTrainingFields() {
   return `
     <details class="panel pad">
-      <summary>Training Parameters and Advanced Fields</summary>
+      <summary>Detailed Parameters</summary>
       <div class="form-grid" style="margin-top: 14px;">
         ${Object.entries(DEFAULT_TRAINING).map(([key]) => `
           <label>${escapeHtml(key)}
@@ -1677,6 +1667,14 @@ function renderTrainingFields() {
           </label>
         `).join("")}
       </div>
+      <details class="nested-detail">
+        <summary>Checkpoint</summary>
+        <div class="form-grid" style="margin-top: 12px;">
+          <label class="wide">Checkpoint Path
+            <input data-bind="checkpointPath" value="${escapeHtml(state.checkpointPath)}" placeholder="Only required by some templates" />
+          </label>
+        </div>
+      </details>
     </details>
   `;
 }
@@ -1831,12 +1829,12 @@ function renderJobsTable(items, options = {}) {
             <tr>
               <td>
                 <strong>${escapeHtml(job.algorithm_family || "-")}</strong>
-                <p class="panel-copy">${escapeHtml(job.operation || "-")} · ${escapeHtml(summarize(job.id, 18))}</p>
+                <p class="panel-copy">${escapeHtml(summarize(job.id, 18))}</p>
               </td>
               <td>
                 <span class="badge ${statusClass(job.status)}">${escapeHtml(job.status || "-")}</span>
                 ${job.safe_to_close_web && !isTerminal(job.status) ? `<span class="badge ok">Safe to close page</span>` : ""}
-                <p class="panel-copy">${escapeHtml(job.remote_stage || job.operation || "-")}</p>
+                <p class="panel-copy">${escapeHtml(job.remote_stage || "-")}</p>
                 ${renderRemoteDownloadStatus(job)}
                 ${renderRemoteServerMatchWarning(job, { details: false })}
                 ${job.monitor_state === "needs_remote_config" ? `<p class="panel-copy">Waiting for remote reattach.</p>` : ""}
@@ -2332,9 +2330,7 @@ function setDataSource(source) {
 
 function normalizeOperation() {
   const ops = supportedOperations();
-  if (!ops.includes(state.operation)) {
-    state.operation = ops[0] || "train";
-  }
+  state.operation = ops.includes("train") ? "train" : (ops[0] || "train");
 }
 
 function invalidateRemoteState() {
@@ -3241,7 +3237,7 @@ function openConfirmModal(preview) {
         <p>Review the paths and remote command below. Confirming will submit the remote training job.</p>
         <div class="command-box grid">
           <p class="panel-copy">Dataset: ${escapeHtml(preview.dataset_name || datasetNameForPayload())}</p>
-          <p class="panel-copy">Operation: ${escapeHtml(preview.algorithm_family)} / ${escapeHtml(preview.operation)}</p>
+          <p class="panel-copy">Algorithm: ${escapeHtml(preview.algorithm_family)}</p>
           <p class="panel-copy">Local Output: ${escapeHtml(preview.local_output_dir)}</p>
           <p class="panel-copy">Remote Workspace: ${escapeHtml(preview.remote_workspace)}</p>
           <p class="panel-copy">Remote Output: ${escapeHtml(preview.remote_output_dir)}</p>

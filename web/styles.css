@@ -636,6 +636,18 @@ pre {
   grid-column: 1 / -1;
 }
 
+.nested-detail {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid rgba(112, 155, 255, 0.14);
+}
+
+.nested-detail summary {
+  cursor: pointer;
+  color: var(--soft);
+  font-weight: 700;
+}
+
 .algorithm-list,
 .dataset-list,
 .job-list {

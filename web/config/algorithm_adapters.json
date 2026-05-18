@@ -254,11 +254,11 @@
       "operations": {
         "train": {
           "enabled": true,
-          "template": "python train.py -s {workspace} -m {output_dir} --eval"
+          "template": "python train.py -s {workspace} -m {output_dir} --eval --iterations {iterations}"
         },
         "render": {
           "enabled": true,
-          "template": "python render.py -m {output_dir}"
+          "template": "python render.py -m {output_dir} -s {workspace} --iteration {iterations}"
         },
         "metrics": {
           "enabled": true,

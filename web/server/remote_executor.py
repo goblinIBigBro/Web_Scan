@@ -1688,6 +1688,8 @@ def _prepare_post_train_config(
 ) -> Dict[str, Any]:
   config = dict(post_train_config or {})
   family_key = str(family or "").strip().lower()
+  if not str(config.get("iteration", "")).strip():
+    config["iteration"] = str(format_args.get("iterations") or "30000")
   if config.get("run_render") and not str(config.get("render_command", "")).strip():
     template = str(config.get("render_template", "") or "").strip()
     if template and family_key != "gaussian-splatting-lightning":
@@ -1864,6 +1866,149 @@ except Exception:
 if items:
   items.sort(key=lambda item: (item[0], str(item[1])), reverse=True)
   print(items[0][1])
+PY
+}
+
+resolve_model_iteration() {
+  "$PYTHON_BIN" - "$1" "$2" <<'PY'
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+requested = str(sys.argv[2] or "").strip()
+if requested and requested != "-1":
+  print(requested)
+  raise SystemExit(0)
+
+candidates = []
+point_cloud_dir = root / "point_cloud"
+try:
+  for child in point_cloud_dir.iterdir():
+    if not child.is_dir() or not child.name.startswith("iteration_"):
+      continue
+    try:
+      iteration = int(child.name.split("_")[-1])
+    except Exception:
+      continue
+    if (child / "point_cloud.ply").is_file():
+      candidates.append(iteration)
+except Exception:
+  pass
+
+if candidates:
+  print(max(candidates))
+PY
+}
+
+ensure_3dgs_cfg_args() {
+  "$PYTHON_BIN" - "$1" "$2" "$3" "$4" <<'PY'
+from argparse import Namespace
+from pathlib import Path
+import os
+import shlex
+import sys
+
+model_arg = str(sys.argv[1] or "").strip()
+source_arg = str(sys.argv[2] or "").strip()
+command_text = str(sys.argv[3] or "")
+iteration_arg = str(sys.argv[4] or "").strip()
+
+try:
+  command_tokens = shlex.split(command_text)
+except Exception:
+  command_tokens = []
+
+def cli_value(*names):
+  for index, token in enumerate(command_tokens):
+    for name in names:
+      if token == name and index + 1 < len(command_tokens):
+        return command_tokens[index + 1]
+      if token.startswith(name + "="):
+        return token.split("=", 1)[1]
+  return ""
+
+def cli_flag(*names):
+  return any(token in names for token in command_tokens)
+
+model_value = model_arg or cli_value("-m", "--model_path")
+if not model_value:
+  print("[Reduced-3DGS] Unable to determine model_path. render.py needs -m pointing at the trained output directory.", file=sys.stderr)
+  raise SystemExit(70)
+
+model_dir = Path(model_value).expanduser()
+if not model_dir.is_dir():
+  print(
+    f"[Reduced-3DGS] model_path does not exist: {model_dir}. "
+    "-m must point to the output directory containing point_cloud and cfg_args.",
+    file=sys.stderr,
+  )
+  raise SystemExit(70)
+
+point_cloud_dir = model_dir / "point_cloud"
+if not point_cloud_dir.is_dir():
+  print(
+    f"[Reduced-3DGS] Missing point_cloud directory under {model_dir}. "
+    "Do not pass the parent run directory as -m; pass the real output directory.",
+    file=sys.stderr,
+  )
+  raise SystemExit(71)
+
+def latest_iteration():
+  candidates = []
+  for child in point_cloud_dir.iterdir():
+    if not child.is_dir() or not child.name.startswith("iteration_"):
+      continue
+    try:
+      iteration = int(child.name.split("_")[-1])
+    except Exception:
+      continue
+    if (child / "point_cloud.ply").is_file():
+      candidates.append(iteration)
+  return str(max(candidates)) if candidates else ""
+
+iteration = iteration_arg if iteration_arg and iteration_arg != "-1" else ""
+iteration = iteration or cli_value("--iteration") or cli_value("--iterations") or latest_iteration()
+if not iteration:
+  print(f"[Reduced-3DGS] No point_cloud/iteration_*/point_cloud.ply found under {model_dir}.", file=sys.stderr)
+  raise SystemExit(71)
+
+point_cloud_path = point_cloud_dir / f"iteration_{iteration}" / "point_cloud.ply"
+if not point_cloud_path.is_file():
+  print(f"[Reduced-3DGS] Missing trained point cloud: {point_cloud_path}", file=sys.stderr)
+  raise SystemExit(71)
+
+cfg_path = model_dir / "cfg_args"
+if cfg_path.is_file():
+  print(f"[Reduced-3DGS] cfg_args exists: {cfg_path}")
+  raise SystemExit(0)
+
+source_value = source_arg or cli_value("-s", "--source_path")
+if not source_value:
+  print(
+    f"[Reduced-3DGS] Missing cfg_args at {cfg_path} and source_path could not be inferred. "
+    "Run render.py with -s/--source_path so cfg_args can be regenerated.",
+    file=sys.stderr,
+  )
+  raise SystemExit(72)
+
+def int_value(value, default):
+  try:
+    return int(value)
+  except Exception:
+    return default
+
+values = {
+  "sh_degree": int_value(cli_value("--sh_degree"), 3),
+  "source_path": os.path.abspath(source_value),
+  "model_path": os.path.abspath(str(model_dir)),
+  "images": cli_value("--images") or "images",
+  "resolution": int_value(cli_value("--resolution"), -1),
+  "white_background": cli_flag("--white_background"),
+  "data_device": cli_value("--data_device") or "cuda",
+  "eval": True,
+}
+cfg_path.write_text(str(Namespace(**values)), encoding="utf-8")
+print(f"[Reduced-3DGS] Created missing cfg_args: {cfg_path}")
 PY
 }
 
@@ -2049,11 +2194,13 @@ def _remote_post_train_eval_block(enabled: bool, post_train: Dict[str, Any] | No
   run_metrics = "1" if config.get("run_metrics") and not config.get("train_produces_eval") else "0"
   render_command = _quote(str(config.get("render_command", "") or ""))
   metrics_command = _quote(str(config.get("metrics_command", "") or ""))
+  iteration = _quote(str(config.get("iteration") or "30000"))
   return r'''
   POST_TRAIN_RUN_RENDER=''' + _quote(run_render) + r'''
   POST_TRAIN_RUN_METRICS=''' + _quote(run_metrics) + r'''
   POST_TRAIN_RENDER_COMMAND=''' + render_command + r'''
   POST_TRAIN_METRICS_COMMAND=''' + metrics_command + r'''
+  POST_TRAIN_ITERATION=''' + iteration + r'''
   if command -v wgsc_activate_env >/dev/null 2>&1; then
     wgsc_activate_env
   fi
@@ -2069,6 +2216,23 @@ def _remote_post_train_eval_block(enabled: bool, post_train: Dict[str, Any] | No
       FAILURE_STAGE="render"
       write_status "failed" "render" "67" "Unable to locate GSLightning experiment output dir for render/metrics."
       finish_with "failed" "render" "67" "Unable to locate GSLightning experiment output dir for render/metrics."
+    fi
+  fi
+
+  if [ "$FAMILY" = "reduced-3dgs" ] && { [ "$POST_TRAIN_RUN_RENDER" = "1" ] || [ "$POST_TRAIN_RUN_METRICS" = "1" ]; }; then
+    ensure_3dgs_cfg_args "$EVAL_OUTPUT_DIR" "$REMOTE_DATASET_WORKSPACE" "$REMOTE_COMMAND_TEXT" "$POST_TRAIN_ITERATION"
+    cfg_rc=$?
+    if [ "$cfg_rc" -ne 0 ]; then
+      RENDER_STATUS="failed"
+      METRICS_STATUS="skipped"
+      RESULT_JSON_EXISTS="false"
+      FAILURE_STAGE="render"
+      write_status "failed" "render" "$cfg_rc" "Reduced-3DGS output is missing cfg_args or point_cloud; render.py needs -m output and -s source_path."
+      finish_with "failed" "render" "$cfg_rc" "Reduced-3DGS output is missing cfg_args or point_cloud; pass -s/--source_path and ensure -m points at the real output directory."
+    fi
+    resolved_iteration="$(resolve_model_iteration "$EVAL_OUTPUT_DIR" "$POST_TRAIN_ITERATION")"
+    if [ -n "$resolved_iteration" ]; then
+      POST_TRAIN_ITERATION="$resolved_iteration"
     fi
   fi
 
@@ -2099,6 +2263,10 @@ def _remote_post_train_eval_block(enabled: bool, post_train: Dict[str, Any] | No
           ;;
         "contextgs")
           "$PYTHON_BIN" test.py -s "$REMOTE_DATASET_WORKSPACE" -m "$EVAL_OUTPUT_DIR"
+          render_rc=$?
+          ;;
+        "reduced-3dgs")
+          "$PYTHON_BIN" render.py -m "$EVAL_OUTPUT_DIR" -s "$REMOTE_DATASET_WORKSPACE" --iteration "$POST_TRAIN_ITERATION"
           render_rc=$?
           ;;
         *)

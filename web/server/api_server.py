@@ -3328,6 +3328,7 @@ def post_train_config_for_adapter(
   metrics_template = str((operations.get("metrics", {}) or {}).get("template", "") or "")
   render_command = str(explicit.get("render_command", "") or "").strip()
   metrics_command = str(explicit.get("metrics_command", "") or "").strip()
+  iteration = str(explicit.get("iteration", "") or format_args.get("iterations") or "30000")
 
   if format_commands and run_render and not render_command and family != "gaussian-splatting-lightning" and operations.get("render", {}).get("enabled"):
     render_command = format_remote_operation_command(adapter, "render", format_args, python_bin)
@@ -3342,6 +3343,7 @@ def post_train_config_for_adapter(
     "metrics_template": metrics_template,
     "render_command": render_command,
     "metrics_command": metrics_command,
+    "iteration": iteration,
   }
 
 

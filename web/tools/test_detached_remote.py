@@ -626,6 +626,64 @@ def test_training_eval_arg_injection_is_family_aware() -> None:
   ).count("--eval") == 1
 
 
+def test_reduced_3dgs_post_train_cfg_args_contract() -> None:
+  config_path = Path(api_server.WEB_DIR) / "config" / "algorithm_adapters.json"
+  config = json.loads(config_path.read_text(encoding="utf-8"))
+  adapter = next(item for item in config["adapters"] if item["family"] == "reduced-3dgs")
+
+  assert "--iterations {iterations}" in adapter["operations"]["train"]["template"]
+  assert adapter["operations"]["render"]["template"] == "python render.py -m {output_dir} -s {workspace} --iteration {iterations}"
+
+  format_args = {
+    "input_path": "",
+    "output_dir": "/remote/output/reduced-3dgs",
+    "workspace": "/remote/dataset/reduced-3dgs",
+    "checkpoint_path": "/remote/output/reduced-3dgs",
+    "repo_path": "/remote/reduced-3dgs",
+    "source": "/remote/dataset/reduced-3dgs",
+    "iterations": 30000,
+  }
+  post_train = api_server.post_train_config_for_adapter(adapter, format_args, "python3")
+  assert post_train["render_command"] == (
+    "python3 render.py -m /remote/output/reduced-3dgs "
+    "-s /remote/dataset/reduced-3dgs --iteration 30000"
+  )
+  assert post_train["metrics_command"] == "python3 metrics.py -m /remote/output/reduced-3dgs"
+  assert post_train["iteration"] == "30000"
+
+  validated = {
+    "python": "python3",
+    "repo_path": "/remote/reduced-3dgs",
+    "activate_cmd": "source /opt/env/bin/activate",
+  }
+  remote_paths = {
+    "workspace_dir": "/remote/workspace/reduced-3dgs",
+    "output_dir": "/remote/output/reduced-3dgs",
+  }
+  script = _build_remote_detached_run_script(
+    validated=validated,
+    job_id="job-reduced",
+    family="reduced-3dgs",
+    remote_paths=remote_paths,
+    remote_job_paths=_remote_job_paths(remote_paths["output_dir"]),
+    remote_workspace_for_command="/remote/dataset/reduced-3dgs",
+    remote_command="python3 train.py -s /remote/dataset/reduced-3dgs -m /remote/output/reduced-3dgs --eval --iterations 30000",
+    auto_colmap=False,
+    resolved_dataset_id="dataset",
+    resolved_dataset_name="Dataset",
+    use_existing_remote_dataset=True,
+    post_train_config=post_train,
+  )
+  assert "ensure_3dgs_cfg_args" in script
+  assert "resolve_model_iteration" in script
+  assert "POST_TRAIN_ITERATION=30000" in script
+  assert (
+    "POST_TRAIN_RENDER_COMMAND='python3 render.py -m /remote/output/reduced-3dgs "
+    "-s /remote/dataset/reduced-3dgs --iteration 30000'"
+  ) in script
+  assert "POST_TRAIN_METRICS_COMMAND='python3 metrics.py -m /remote/output/reduced-3dgs'" in script
+
+
 def test_atomgs_gaussianpro_adapters_and_post_train_contract() -> None:
   config_path = Path(api_server.WEB_DIR) / "config" / "algorithm_adapters.json"
   config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -1306,6 +1364,7 @@ def main() -> None:
   test_remote_download_skips_project_checkpoint_artifacts()
   test_gaussian_splatting_lightning_train_exports_ply()
   test_training_eval_arg_injection_is_family_aware()
+  test_reduced_3dgs_post_train_cfg_args_contract()
   test_atomgs_gaussianpro_adapters_and_post_train_contract()
   test_ply_header_classifier_selects_viewer_format()
   test_gaussian_splatting_lightning_prefers_exported_gaussian_ply()

@@ -17,6 +17,28 @@
 
 ---
 
+## 🖼️ Web界面截图
+
+以下截图来自 [`web照片/`](web照片/) 目录，展示 Web-GSC 从数据准备、远程训练到结果查看和指标分析的主要界面。
+
+| 总览工作台 | 数据源配置 |
+|---|---|
+| ![Web-GSC总览工作台](<web照片/截屏2026-05-19 13.38.15.png>) | ![远程数据源与连接配置](<web照片/截屏2026-05-19 13.38.29.png>) |
+
+| 新图片上传 | 远程训练命令预览 |
+|---|---|
+| ![新图片上传和相机采集](<web照片/截屏2026-05-19 13.38.44.png>) | ![算法训练配置与远程预检](<web照片/截屏2026-05-19 13.38.59.png>) |
+
+| 日志与指标 | 交互式结果浏览 |
+|---|---|
+| ![训练日志和实时指标](<web照片/截屏2026-05-19 13.39.06.png>) | ![3D结果浏览器](<web照片/截屏2026-05-19 13.39.29.png>) |
+
+| 训练指标分析 |
+|---|
+| ![PSNR、SSIM、LPIPS与模型大小分析](<web照片/截屏2026-05-19 13.39.37.png>) |
+
+---
+
 ## 🧬 集成算法
 
 | 算法 | 功能 | 性质 |
@@ -84,6 +106,34 @@ Web_Scan/
     ├── change.md                        # 更新日志
     └── REMOTE_SETUP_IMPLEMENTATION_REPORT.md  # 配置完成报告
 ```
+
+---
+
+## 🧩 运行环境
+
+### 本地Web服务环境
+
+| 项目 | 要求 |
+|------|------|
+| **操作系统** | macOS / Linux / Windows + WSL |
+| **Python** | Python 3.8+（推荐 Python 3.10+；旧算法兼容环境可使用 Python 3.7.13） |
+| **浏览器** | Chrome / Edge / Safari / Firefox 现代版本 |
+| **基础依赖** | `flask`、`paramiko`、`numpy` |
+| **可选工具** | `COLMAP`（图片建模）、`ImageMagick`/`magick`（图片处理）、`nvidia-smi`（GPU状态检查） |
+| **默认端口** | `127.0.0.1:8080` |
+
+本地只运行 Web 管理界面、上传、任务编排和结果查看时，不强制要求本机具备 NVIDIA GPU。若需要在本机直接训练或运行算法，则需要安装匹配 CUDA 的 PyTorch 与对应算法依赖。
+
+### 远程训练环境
+
+| 场景 | 推荐环境 |
+|------|---------|
+| **HAC++ / FCGS / ContextGS / CompGS / GaussianPro / AtomGS / GSLightning** | Linux + NVIDIA GPU，Python 3.10+，PyTorch 2.2+，CUDA 11.8+ |
+| **Scaffold-GS / 部分旧版算法环境** | Linux + NVIDIA GPU，Python 3.7.13，PyTorch 1.12.1，CUDA 11.x |
+| **远程执行工具** | SSH/SFTP 可访问，推荐安装 `tmux`、`xvfb-run`，可选 `VirtualGL`/`vglrun` |
+| **存储** | 建议 SSD，至少 50GB 可用空间；大场景或多任务建议 500GB+ |
+
+不同算法的完整环境检查清单请参考 [`web/project_md/REMOTE_SETUP_INDEX.md`](web/project_md/REMOTE_SETUP_INDEX.md)。
 
 ---
 

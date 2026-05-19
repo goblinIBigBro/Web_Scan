@@ -66,6 +66,7 @@ from web.tools.export_scene_package import build_scene_package
 JOBS: Dict[str, Dict[str, Any]] = {}
 JOB_LOG_LOCKS: Dict[str, threading.Lock] = {}
 RESULT_DOWNLOAD_LOCK = threading.Lock()
+REMOTE_MONITOR_START_LOCK = threading.Lock()
 MAX_JOB_HISTORY = 300
 MAX_PROCESS_FRAME_COMPLETED_HISTORY = 80
 MAX_METRICS_HISTORY = 5000
@@ -3351,11 +3352,11 @@ def unique_remote_run_key(base_run_key: str, job_id: str) -> str:
   run_key = str(base_run_key or "").strip()
   if not run_key:
     return ""
-  if not any(str(job.get("remote_run_key", "")).strip() == run_key for job in JOBS.values()):
+  if not any(str(job.get("remote_run_key", "")).strip() == run_key for job in list(JOBS.values())):
     return run_key
   suffix = str(job_id or "").strip().replace("_", "-")[:8].strip("-") or uuid.uuid4().hex[:8]
   candidate = f"{run_key}-{suffix}"
-  if not any(str(job.get("remote_run_key", "")).strip() == candidate for job in JOBS.values()):
+  if not any(str(job.get("remote_run_key", "")).strip() == candidate for job in list(JOBS.values())):
     return candidate
   return f"{run_key}-{uuid.uuid4().hex[:8]}"
 
@@ -3855,7 +3856,7 @@ def _annotate_datasets_with_training_coverage(
   coverage_by_id_family: Dict[str, Dict[str, set[str]]] = {}
   coverage_by_path: Dict[str, Dict[str, set[str]]] = {}
 
-  for raw_job in JOBS.values():
+  for raw_job in list(JOBS.values()):
     job = enrich_job(raw_job)
     if str(job.get("operation", "")).strip() != "remote_train":
       continue
@@ -3944,7 +3945,7 @@ def _annotate_datasets_with_training_coverage(
 
 
 def prune_job_history() -> None:
-  ordered_jobs = sorted(JOBS.values(), key=lambda item: item.get("created_at", 0), reverse=True)
+  ordered_jobs = sorted(list(JOBS.values()), key=lambda item: item.get("created_at", 0), reverse=True)
   keep_ids: set[str] = set()
   completed_process_frame_count = 0
 
@@ -4414,7 +4415,7 @@ def output_dir_has_pending_remote_download(directory: Path) -> bool:
     resolved = directory.resolve()
   except OSError:
     return False
-  for job in JOBS.values():
+  for job in list(JOBS.values()):
     if not is_remote_download_pending(job):
       continue
     output_dir = str(job.get("output_dir") or "").strip()
@@ -4600,10 +4601,11 @@ def apply_remote_poll_result(job: Dict[str, Any], poll_result: Dict[str, Any]) -
 
 
 def start_remote_monitor_thread(job: Dict[str, Any], remote_config: Dict[str, Any]) -> None:
-  if job.get("_monitoring"):
-    return
-  job["_monitoring"] = True
-  job["_remote_config"] = dict(remote_config)
+  with REMOTE_MONITOR_START_LOCK:
+    if job.get("_monitoring"):
+      return
+    job["_monitoring"] = True
+    job["_remote_config"] = dict(remote_config)
 
   def monitor() -> None:
     consecutive_failures = 0
@@ -4718,7 +4720,7 @@ def unfinished_flow_jobs(*, session_id: str, capture_id: str, selected_job_id: s
     return []
   return [
     job
-    for job in JOBS.values()
+    for job in list(JOBS.values())
     if not is_job_terminal(job)
     and job_matches_flow(job, session_id=session_id, capture_id=capture_id, selected_job_id=selected_job_id)
   ]
@@ -5132,7 +5134,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
       return
     if parsed.path == "/api/jobs":
       ordered_jobs = sorted(
-        (enrich_job(job) for job in JOBS.values()),
+        (enrich_job(job) for job in list(JOBS.values())),
         key=lambda item: (
           -float(item.get("created_at") or 0),
           str(item.get("dataset") or ""),

@@ -2469,18 +2469,17 @@ async function autoReattachDetachedJobs() {
   await Promise.all(candidates.map(async (job) => {
     const key = reattachKey(job);
     if (reattachInFlight.has(key) || reattachLimitReached(job)) return;
+    const attempts = reattachFailureCount(job) + 1;
+    reattachFailures.set(key, attempts);
     reattachInFlight.add(key);
     try {
       const data = await reattachRemoteJob(state.apiBaseUrl, job.id, state.remoteConfig);
-      reattachFailures.delete(key);
       const updated = data.job;
       if (updated?.id) {
         jobs = jobs.map((item) => item.id === updated.id ? updated : item);
         showToast(`Reattached remote monitor: ${updated.id}`);
       }
     } catch {
-      const attempts = reattachFailureCount(job) + 1;
-      reattachFailures.set(key, attempts);
       if (attempts >= MAX_REATTACH_ATTEMPTS) {
         showToast(`Auto reattach stopped after ${MAX_REATTACH_ATTEMPTS} failed attempts: ${job.id}`);
       }

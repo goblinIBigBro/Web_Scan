@@ -36,6 +36,7 @@ const root = document.getElementById("app-root");
 const STATE_KEY = "gaussvision-workbench-state-v1";
 const REMOTE_KEY = "gaussvision-remote-config-v1";
 const MAX_LOG_CHARS = 180_000;
+const MAX_REATTACH_ATTEMPTS = 5;
 const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"]);
 const MODEL_EXTENSIONS = new Set([".ply"]);
 const RENDER_FORMAT_LABELS = {
@@ -120,7 +121,7 @@ let pendingActionKey = "";
 let pressedActionKey = "";
 let pressTimer = null;
 const reattachInFlight = new Set();
-const reattachAttempted = new Set();
+const reattachFailures = new Map();
 
 const state = loadState();
 
@@ -1402,10 +1403,6 @@ function renderCameraUploadCard(uploadDisabled) {
         <button data-action="stop-camera" type="button">Stop</button>
       </div>
       <button class="primary upload-main-button" data-action="upload-camera-frame" type="button" ${uploadDisabled}>Upload Camera Frame</button>
-      <div>
-        <p class="eyebrow">Result Echo</p>
-        ${renderProcessedResult()}
-      </div>
     </section>
   `;
 }
@@ -1566,12 +1563,6 @@ function renderDatasetCard(dataset) {
       <button data-action="use-dataset" data-dataset-id="${escapeHtml(dataset.id || "")}" type="button">Use This Dataset</button>
     </article>
   `;
-}
-
-function renderProcessedResult() {
-  const job = getJob();
-  if (job) return renderResultSurface(job, { tall: false });
-  return renderResultSurface(null, { tall: false, emptyText: "Waiting for upload or training results." });
 }
 
 function renderAlgorithmPage() {
@@ -1837,7 +1828,7 @@ function renderJobsTable(items, options = {}) {
                 <p class="panel-copy">${escapeHtml(job.remote_stage || "-")}</p>
                 ${renderRemoteDownloadStatus(job)}
                 ${renderRemoteServerMatchWarning(job, { details: false })}
-                ${job.monitor_state === "needs_remote_config" ? `<p class="panel-copy">Waiting for remote reattach.</p>` : ""}
+                ${needsRemoteReattach(job) ? renderReattachStatus(job) : ""}
               </td>
               <td>${escapeHtml(summarize(jobDatasetLabel(job), 36))}</td>
               <td>${escapeHtml(formatTimestamp(job.created_at))}</td>
@@ -1877,7 +1868,7 @@ function renderLogPanel() {
           <p class="panel-copy">${escapeHtml(job.id)} · ${escapeHtml(job.status || "-")}</p>
           ${job.safe_to_close_web && !isTerminal(job.status) ? `<p class="status-dot ok">Safe to close page · remote training keeps running.</p>` : ""}
           ${renderRemoteDownloadStatus(job, { paths: true })}
-          ${job.monitor_state === "needs_remote_config" ? `<p class="status-dot warn">Remote tmux monitor needs reattach with the saved remote config.</p>` : ""}
+          ${needsRemoteReattach(job) ? renderReattachStatus(job, "status-dot warn") : ""}
         </div>
         <div class="button-row">
           <a class="button-link ${downloadsEnabled ? "" : "disabled"}" href="${downloadsEnabled ? escapeHtml(logUrl) : "#"}" download>Download Logs</a>
@@ -2337,7 +2328,7 @@ function invalidateRemoteState() {
   state.sshChecked = false;
   state.lastPreview = null;
   state.lastError = null;
-  reattachAttempted.clear();
+  reattachFailures.clear();
 }
 
 async function refreshAll(actionKey = "") {
@@ -2447,22 +2438,52 @@ function needsRemoteReattach(job) {
   return ["needs_remote_config", "disconnected"].includes(monitorState) || ["detached"].includes(status);
 }
 
+function reattachKey(job) {
+  const remote = state.remoteConfig || {};
+  return [
+    job?.id || "",
+    String(remote.host || "").trim(),
+    String(remote.username || "").trim(),
+  ].join(":");
+}
+
+function reattachFailureCount(job) {
+  return reattachFailures.get(reattachKey(job)) || 0;
+}
+
+function reattachLimitReached(job) {
+  return reattachFailureCount(job) >= MAX_REATTACH_ATTEMPTS;
+}
+
+function renderReattachStatus(job, className = "panel-copy") {
+  if (reattachLimitReached(job)) {
+    return `<p class="${className}">Auto reattach stopped after ${MAX_REATTACH_ATTEMPTS} failed attempts. Check SSH or remote tmux manually.</p>`;
+  }
+  return `<p class="${className}">Remote tmux monitor needs reattach with the saved remote config.</p>`;
+}
+
 async function autoReattachDetachedJobs() {
+  if (!state.sshChecked) return;
   if (!remoteConfigReadyForReattach()) return;
   const candidates = jobs.filter(needsRemoteReattach);
   await Promise.all(candidates.map(async (job) => {
-    const key = `${job.id}:${state.remoteConfig.host}:${state.remoteConfig.username}`;
-    if (reattachInFlight.has(key) || reattachAttempted.has(key)) return;
+    const key = reattachKey(job);
+    if (reattachInFlight.has(key) || reattachLimitReached(job)) return;
     reattachInFlight.add(key);
     try {
       const data = await reattachRemoteJob(state.apiBaseUrl, job.id, state.remoteConfig);
+      reattachFailures.delete(key);
       const updated = data.job;
       if (updated?.id) {
         jobs = jobs.map((item) => item.id === updated.id ? updated : item);
         showToast(`Reattached remote monitor: ${updated.id}`);
       }
     } catch {
-      reattachAttempted.add(key);
+      const attempts = reattachFailureCount(job) + 1;
+      reattachFailures.set(key, attempts);
+      if (attempts >= MAX_REATTACH_ATTEMPTS) {
+        showToast(`Auto reattach stopped after ${MAX_REATTACH_ATTEMPTS} failed attempts: ${job.id}`);
+      }
     } finally {
       reattachInFlight.delete(key);
     }
@@ -2525,7 +2546,7 @@ function resetClientStateForUploadTraining() {
   });
   environmentReport = null;
   discoveredResults = [];
-  reattachAttempted.clear();
+  reattachFailures.clear();
   reattachInFlight.clear();
   persistState();
 }
@@ -2818,6 +2839,7 @@ async function checkRemote() {
   state.remoteReport = data.result;
   state.sshChecked = true;
   state.lastPreview = null;
+  reattachFailures.clear();
   await refreshFlowData(false);
   showToast("Remote precheck passed.");
 }
